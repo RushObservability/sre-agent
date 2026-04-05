@@ -11,6 +11,15 @@ pub struct WorkingMemory {
     pub ruled_out: Vec<String>,            // max 10
     pub recent_tool_calls: Vec<CallSignature>, // for repeat detection
     pub consecutive_empty_results: u32,    // dead-end detection
+    /// Hypotheses we explored and ruled out (LRU, max 5). Used to discourage
+    /// re-exploring dead ends across escalation rounds.
+    pub failed_hypotheses: Vec<String>,
+    /// Dead-end escalation level.
+    ///   0 = initial investigation
+    ///   1 = nudged to try alternative tool categories
+    ///   2 = nudged to check dependency graph / widen window
+    ///   3+ = force preliminary report
+    pub escalation_level: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -58,6 +67,14 @@ impl WorkingMemory {
         Self::remember(&mut self.ruled_out, item, 10);
     }
 
+    /// Record a hypothesis that was explored but ruled out. LRU-capped at 5.
+    pub fn add_failed_hypothesis(&mut self, item: String) {
+        if item.is_empty() {
+            return;
+        }
+        Self::remember(&mut self.failed_hypotheses, item, 5);
+    }
+
     /// Check if this exact tool call was made recently (exact dup).
     pub fn is_repeat_call(&self, sig: &CallSignature) -> bool {
         self.recent_tool_calls.iter().any(|c| c == sig)
@@ -92,6 +109,23 @@ impl WorkingMemory {
             for r in &self.ruled_out {
                 out.push_str(&format!("- {r}\n"));
             }
+        }
+        if !self.failed_hypotheses.is_empty() {
+            out.push_str("**Previously ruled out (don't revisit):**\n");
+            for h in &self.failed_hypotheses {
+                out.push_str(&format!("- {h}\n"));
+            }
+        }
+        if self.escalation_level > 0 {
+            let stage_hint = match self.escalation_level {
+                1 => " (already tried alternative tool categories — now must check dependency graph)",
+                2 => " (already widened scope — now must produce a preliminary report with open questions)",
+                _ => " (must emit a preliminary report with explicit open questions)",
+            };
+            out.push_str(&format!(
+                "**Escalation level:** {}{}\n",
+                self.escalation_level, stage_hint
+            ));
         }
         out
     }
@@ -334,6 +368,49 @@ mod tests {
         assert_eq!(m.confirmed_facts.len(), 10);
         assert!(m.confirmed_facts.contains(&"fact-14".to_string()));
         assert!(!m.confirmed_facts.contains(&"fact-0".to_string()));
+    }
+
+    #[test]
+    fn failed_hypotheses_lru_caps_at_5() {
+        let mut m = WorkingMemory::new("t".to_string());
+        for i in 0..8 {
+            m.add_failed_hypothesis(format!("h-{i}"));
+        }
+        assert_eq!(m.failed_hypotheses.len(), 5);
+        assert!(m.failed_hypotheses.contains(&"h-7".to_string()));
+        assert!(!m.failed_hypotheses.contains(&"h-0".to_string()));
+    }
+
+    #[test]
+    fn empty_failed_hypothesis_not_added() {
+        let mut m = WorkingMemory::new("t".to_string());
+        m.add_failed_hypothesis(String::new());
+        assert!(m.failed_hypotheses.is_empty());
+    }
+
+    #[test]
+    fn prompt_block_renders_failed_hypotheses_when_present() {
+        let mut m = WorkingMemory::new("t".to_string());
+        m.add_failed_hypothesis("checkout db slow query".to_string());
+        let block = m.to_prompt_block();
+        assert!(block.contains("Previously ruled out"));
+        assert!(block.contains("checkout db slow query"));
+    }
+
+    #[test]
+    fn prompt_block_renders_escalation_level_when_non_zero() {
+        let mut m = WorkingMemory::new("t".to_string());
+        m.escalation_level = 2;
+        let block = m.to_prompt_block();
+        assert!(block.contains("Escalation level"));
+        assert!(block.contains('2'));
+    }
+
+    #[test]
+    fn prompt_block_omits_escalation_when_zero() {
+        let m = WorkingMemory::new("t".to_string());
+        let block = m.to_prompt_block();
+        assert!(!block.contains("Escalation level"));
     }
 
     // ── Repeat call detection ──

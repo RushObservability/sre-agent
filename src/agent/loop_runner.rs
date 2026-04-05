@@ -3,10 +3,11 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 
 use super::memory::{CallSignature, WorkingMemory, clip_tool_result, extract_facts_from_tool_result, normalize_args};
-use super::stream::AgentEvent;
+use super::stream::{AgentEvent, ReportKind};
 use super::tools::{ToolContext, ToolRegistry};
 
-/// Maximum real tool-executing rounds.
+/// Maximum real tool-executing rounds. The model should never hear about this
+/// number — it exists purely as a backstop against runaway loops.
 const MAX_TOOL_STEPS: u32 = 25;
 
 /// Max total LLM calls. Includes parse-failure retries, so gives slack
@@ -15,8 +16,23 @@ const MAX_TOOL_STEPS: u32 = 25;
 /// dual-counter pattern.
 const MAX_ATTEMPTS: u32 = 35;
 
-/// How many consecutive empty/no-data tool results before forcing a summary.
+/// How many consecutive empty/no-data tool results before escalating.
 const DEAD_END_THRESHOLD: u32 = 4;
+
+/// Decide whether a given investigation state represents a final or
+/// preliminary report. A final report requires an unescalated run with at
+/// least one confirmed fact and at least one suspect service. Anything less
+/// rigorous is surfaced as preliminary so the user knows to follow up.
+fn decide_report_kind(memory: &WorkingMemory) -> ReportKind {
+    if memory.escalation_level < 2
+        && !memory.confirmed_facts.is_empty()
+        && !memory.suspect_services.is_empty()
+    {
+        ReportKind::Final
+    } else {
+        ReportKind::Preliminary
+    }
+}
 
 /// Configuration for the LLM client used by the agent loop.
 /// Decoupled from env vars so tests can point at a mock server.
@@ -114,17 +130,6 @@ pub async fn run_with_config(
             Some(registry.definitions())
         };
 
-        if force_summary && !force_final {
-            // Dead-end detected — inject a nudge message
-            turn_messages.push(serde_json::json!({
-                "role": "system",
-                "content": "Multiple tool calls have returned no data or been repeats. \
-                           Stop gathering signals and produce your final investigation report with \
-                           what you have, noting any remaining uncertainty. Structure: Root Cause, \
-                           Evidence, Impact, Timeline, Recommended Actions.",
-            }));
-        }
-
         let mut body = serde_json::json!({
             "model": model,
             "messages": turn_messages,
@@ -162,17 +167,25 @@ pub async fn run_with_config(
                 messages.push(serde_json::json!({
                     "role": "system",
                     "content": "Previous response was empty. Either call a tool to gather more \
-                               evidence or produce a final investigation report.",
+                               evidence or produce a structured investigation report.",
                 }));
                 continue;
             }
             // Final answer
-            let _ = tx.send(AgentEvent::Summary { text: content.clone() }).await;
-            let _ = tx.send(AgentEvent::Done {
-                rounds: tool_steps + 1,
-                prompt_tokens: total_prompt,
-                completion_tokens: total_completion,
-            }).await;
+            let kind = decide_report_kind(&memory);
+            let _ = tx
+                .send(AgentEvent::Summary {
+                    text: content.clone(),
+                    kind,
+                })
+                .await;
+            let _ = tx
+                .send(AgentEvent::Done {
+                    rounds: tool_steps + 1,
+                    prompt_tokens: total_prompt,
+                    completion_tokens: total_completion,
+                })
+                .await;
             return Ok(());
         }
 
@@ -263,9 +276,44 @@ pub async fn run_with_config(
             }));
         }
 
-        // Dead-end detection: too many empty results in a row
+        // Dead-end detection: too many empty/no-data results in a row.
+        // Instead of immediately forcing a summary we escalate through three
+        // levels, nudging the model toward progressively broader alternative
+        // strategies. Only level 3+ actually withholds tools and forces a
+        // preliminary report.
         if memory.consecutive_empty_results >= DEAD_END_THRESHOLD {
-            force_summary = true;
+            memory.consecutive_empty_results = 0; // reset counter
+            memory.escalation_level += 1;
+
+            let nudge = match memory.escalation_level {
+                1 => "Multiple recent tool calls returned no data. Do NOT give up. Try a \
+                      DIFFERENT tool category than the one you've been using. If you've been \
+                      searching logs, try query_traces or query_metrics. If you've been \
+                      checking one service, check its upstream or downstream dependencies \
+                      via service_dependencies.",
+                2 => "You've tried alternative tool categories without finding the signal. \
+                      Do NOT give up. Check the service dependency graph — the root cause \
+                      is often in an upstream or downstream service, not the one originally \
+                      reported. Use service_dependencies then investigate each adjacent \
+                      service. Also try widening your time window.",
+                _ => "You have thoroughly explored multiple angles. Before producing a \
+                      final conclusion, you MUST enumerate what you've ruled out and what \
+                      specific questions remain open. Produce a PRELIMINARY findings report \
+                      with explicit open questions, not a 'cannot determine' surrender. \
+                      The user may follow up to refine further — give them specific things \
+                      to ask about.",
+            };
+
+            // Inject the nudge as a system message for the next LLM call.
+            messages.push(serde_json::json!({
+                "role": "system",
+                "content": nudge,
+            }));
+
+            // Only force summary at level 3+
+            if memory.escalation_level >= 3 {
+                force_summary = true;
+            }
         }
 
         // Only count as a real tool step if we actually did work (not just repeat errors)
@@ -274,25 +322,38 @@ pub async fn run_with_config(
         }
     }
 
-    // Budget exhausted without a final answer — send a last message to elicit a summary
+    // Budget exhausted without a final answer — emit a preliminary report so
+    // the user sees what we learned and can follow up. This branch should be
+    // rare because the escalation ladder above usually forces an earlier
+    // summary, but we still need a safety net for runaway loops.
     let termination_reason = if attempts >= MAX_ATTEMPTS && tool_steps < MAX_TOOL_STEPS {
         "Too many parse failures or repeat calls"
     } else {
-        "Reached maximum tool call budget"
+        "Exhausted internal investigation budget"
     };
 
-    let _ = tx.send(AgentEvent::Summary {
-        text: format!(
-            "## Investigation Terminated\n\n**Reason**: {}\n\n{}",
-            termination_reason,
-            memory.to_prompt_block()
-        ),
-    }).await;
-    let _ = tx.send(AgentEvent::Done {
-        rounds: tool_steps,
-        prompt_tokens: total_prompt,
-        completion_tokens: total_completion,
-    }).await;
+    let text = format!(
+        "## Preliminary Investigation Report\n\n**Status**: {}\n\n{}\n\n\
+         The investigation has not produced a confirmed root cause. Follow up with a\n\
+         more specific question or an additional angle (upstream service, widened time\n\
+         window, different signal source) to continue from this state.",
+        termination_reason,
+        memory.to_prompt_block()
+    );
+
+    let _ = tx
+        .send(AgentEvent::Summary {
+            text,
+            kind: ReportKind::Preliminary,
+        })
+        .await;
+    let _ = tx
+        .send(AgentEvent::Done {
+            rounds: tool_steps,
+            prompt_tokens: total_prompt,
+            completion_tokens: total_completion,
+        })
+        .await;
 
     Ok(())
 }

@@ -1,0 +1,58 @@
+[package]
+name = "sre-agent"
+version = "0.1.0"
+edition = "2024"
+description = "AI-powered SRE investigation agent for the Wide observability platform"
+
+[lib]
+name = "sre_agent"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sre-agent"
+path = "src/main.rs"
+
+[dependencies]
+# Web server
+axum = { version = "0.8", features = ["macros"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+futures-util = "0.3"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# ClickHouse client (for log/trace/metric queries)
+clickhouse = { version = "0.13", features = ["time", "uuid"] }
+
+# SQLite (for anomaly events/rules + deploy markers + settings)
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+# Kubernetes client (for argocd + kube tools)
+kube = { version = "0.98", features = ["client", "runtime", "derive"] }
+k8s-openapi = { version = "0.24", features = ["v1_32"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# HTTP client (for LLM calls)
+reqwest = { version = "0.12", features = ["json"] }
+
+# Utilities
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+dotenvy = "0.15"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

@@ -273,13 +273,13 @@ impl Tool for GetArgocdApp {
 
         // Images
         let images = status.pointer("/summary/images").and_then(|v| v.as_array());
-        if let Some(imgs) = images {
-            if !imgs.is_empty() {
-                out.push_str(&format!("\nImages ({}):\n", imgs.len()));
-                for img in imgs.iter().take(10) {
-                    if let Some(s) = img.as_str() {
-                        out.push_str(&format!("  {s}\n"));
-                    }
+        if let Some(imgs) = images
+            && !imgs.is_empty()
+        {
+            out.push_str(&format!("\nImages ({}):\n", imgs.len()));
+            for img in imgs.iter().take(10) {
+                if let Some(s) = img.as_str() {
+                    out.push_str(&format!("  {s}\n"));
                 }
             }
         }

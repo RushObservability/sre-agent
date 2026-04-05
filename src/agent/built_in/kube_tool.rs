@@ -583,48 +583,49 @@ fn format_deployment(data: &Value, out: &mut String) {
 
 fn format_generic(data: &Value, out: &mut String) {
     // Show status section if present
-    if let Some(status) = data.get("status") {
-        if status.is_object() && !status.as_object().unwrap().is_empty() {
-            // Conditions
-            if let Some(conditions) = status["conditions"].as_array() {
-                out.push_str("\nConditions:\n");
-                for c in conditions {
-                    let ctype = c["type"].as_str().unwrap_or("?");
-                    let cstatus = c["status"].as_str().unwrap_or("?");
-                    let reason = c["reason"].as_str().unwrap_or("");
-                    let msg = c["message"].as_str().unwrap_or("");
-                    out.push_str(&format!("  {ctype}={cstatus}"));
-                    if !reason.is_empty() {
-                        out.push_str(&format!(" ({reason})"));
-                    }
-                    if !msg.is_empty() {
-                        out.push_str(&format!(
-                            ": {}",
-                            if msg.len() > 200 { &msg[..200] } else { msg }
-                        ));
-                    }
-                    out.push('\n');
+    if let Some(status) = data.get("status")
+        && status.is_object()
+        && !status.as_object().unwrap().is_empty()
+    {
+        // Conditions
+        if let Some(conditions) = status["conditions"].as_array() {
+            out.push_str("\nConditions:\n");
+            for c in conditions {
+                let ctype = c["type"].as_str().unwrap_or("?");
+                let cstatus = c["status"].as_str().unwrap_or("?");
+                let reason = c["reason"].as_str().unwrap_or("");
+                let msg = c["message"].as_str().unwrap_or("");
+                out.push_str(&format!("  {ctype}={cstatus}"));
+                if !reason.is_empty() {
+                    out.push_str(&format!(" ({reason})"));
                 }
+                if !msg.is_empty() {
+                    out.push_str(&format!(
+                        ": {}",
+                        if msg.len() > 200 { &msg[..200] } else { msg }
+                    ));
+                }
+                out.push('\n');
             }
+        }
 
-            // Phase
-            if let Some(phase) = status["phase"].as_str() {
-                out.push_str(&format!("Phase: {phase}\n"));
-            }
+        // Phase
+        if let Some(phase) = status["phase"].as_str() {
+            out.push_str(&format!("Phase: {phase}\n"));
         }
     }
 
     // Show spec highlights for services
-    if let Some(spec) = data.get("spec") {
-        if let Some(ports) = spec["ports"].as_array() {
-            out.push_str("\nPorts:\n");
-            for p in ports {
-                let name = p["name"].as_str().unwrap_or("?");
-                let port = p["port"].as_u64().unwrap_or(0);
-                let target = p["targetPort"].as_u64().unwrap_or(0);
-                let proto = p["protocol"].as_str().unwrap_or("TCP");
-                out.push_str(&format!("  {name}: {port}->{target}/{proto}\n"));
-            }
+    if let Some(spec) = data.get("spec")
+        && let Some(ports) = spec["ports"].as_array()
+    {
+        out.push_str("\nPorts:\n");
+        for p in ports {
+            let name = p["name"].as_str().unwrap_or("?");
+            let port = p["port"].as_u64().unwrap_or(0);
+            let target = p["targetPort"].as_u64().unwrap_or(0);
+            let proto = p["protocol"].as_str().unwrap_or("TCP");
+            out.push_str(&format!("  {name}: {port}->{target}/{proto}\n"));
         }
     }
 }

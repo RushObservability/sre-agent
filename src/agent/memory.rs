@@ -188,15 +188,15 @@ pub fn extract_facts_from_tool_result(
     let mut out = ExtractedFacts::default();
 
     // Service extraction from args
-    if let Some(svc) = args.get("service").and_then(|v| v.as_str()) {
-        if !svc.is_empty() {
-            out.services.insert(svc.to_string());
-        }
+    if let Some(svc) = args.get("service").and_then(|v| v.as_str())
+        && !svc.is_empty()
+    {
+        out.services.insert(svc.to_string());
     }
-    if let Some(svc) = args.get("service_name").and_then(|v| v.as_str()) {
-        if !svc.is_empty() {
-            out.services.insert(svc.to_string());
-        }
+    if let Some(svc) = args.get("service_name").and_then(|v| v.as_str())
+        && !svc.is_empty()
+    {
+        out.services.insert(svc.to_string());
     }
 
     // Detect empty/no-data results
@@ -214,17 +214,17 @@ pub fn extract_facts_from_tool_result(
     match tool_name {
         "search_logs" => {
             // Extract "Found N log entries" and top error patterns
-            if let Some(first_line) = result.lines().next() {
-                if first_line.contains("Found") {
-                    out.summary = Some(first_line.to_string());
-                }
+            if let Some(first_line) = result.lines().next()
+                && first_line.contains("Found")
+            {
+                out.summary = Some(first_line.to_string());
             }
         }
         "query_traces" => {
-            if let Some(first_line) = result.lines().next() {
-                if first_line.contains("Found") {
-                    out.summary = Some(first_line.to_string());
-                }
+            if let Some(first_line) = result.lines().next()
+                && first_line.contains("Found")
+            {
+                out.summary = Some(first_line.to_string());
             }
         }
         "query_metrics" => {

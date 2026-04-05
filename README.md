@@ -75,7 +75,7 @@ make docker-push
 | `CLICKHOUSE_DATABASE` | `observability` | ClickHouse database name |
 | `CLICKHOUSE_USER` | `default` | ClickHouse user |
 | `CLICKHOUSE_PASSWORD` | `` | ClickHouse password |
-| `WIDE_CONFIG_DB` | `./wide_config.db` | Local SQLite path for anomaly events / deploy markers |
+| `RUSH_CONFIG_DB` | `./rush_config.db` | Local SQLite path for anomaly events / deploy markers |
 | `QUERY_API_URL` | _(unset)_ | URL of `rush-api` for fetching custom skills over HTTP. When set, the agent reads `custom_skills` from rush-api (single source of truth) instead of the local DB. |
 | `LLM_BASE_URL` | `https://api.openai.com` | OpenAI-compatible LLM endpoint |
 | `LLM_API_KEY` | (required) | LLM API key |

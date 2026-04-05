@@ -2,7 +2,8 @@
 name = "sre-agent"
 version = "0.1.0"
 edition = "2024"
-description = "AI-powered SRE investigation agent for the Wide observability platform"
+description = "AI-powered SRE investigation agent for the Rush Observability platform"
+license-file = "LICENSE"
 
 [lib]
 name = "sre_agent"

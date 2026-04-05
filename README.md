@@ -1,15 +1,24 @@
 # sre-agent
 
-AI-powered SRE investigation agent for the Wide observability platform.
+AI-powered SRE investigation agent for **[Rush Observability](https://github.com/RushObservability)**.
 
 The agent receives investigation requests (either an anomaly event or a free-form question), forms hypotheses, and autonomously queries traces, logs, metrics, Kubernetes resources, ArgoCD state, and deploy history to identify the root cause of an incident.
 
+> **sre-agent is not a standalone product.** It is one of three services that make up a Rush Observability deployment and must run alongside the others:
+>
+> - **[`rush-api`](https://github.com/RushObservability)** — the query, ingest, and config backend. Owns the `custom_skills` table and serves it to sre-agent over HTTP.
+> - **`rush-frontend`** — the web UI where users trigger investigations and view streaming results.
+> - **`sre-agent`** — this service; does the actual investigation loop.
+>
+> sre-agent talks to `rush-api` over the in-cluster service URL for custom skills, and is reached by the frontend via its own `/investigate` endpoint. All three are deployed together by the [`rushobservability` Helm chart](https://github.com/RushObservability).
+
 ## Architecture
 
-The agent is a standalone HTTP service that streams investigation progress over Server-Sent Events (SSE). It reads from:
+The agent is an HTTP service that streams investigation progress over Server-Sent Events (SSE). It reads from:
 
-- **ClickHouse** — for traces, logs, and metrics (via the Wide observability schema)
-- **SQLite** — for anomaly events/rules, deploy markers, and settings (shared with query-api)
+- **ClickHouse** — for traces, logs, and metrics (via the Rush Observability schema)
+- **rush-api over HTTP** — for user-authored custom skills (`GET /api/v1/custom-skills`), so `rush-api` remains the single source of truth and the two services never share a volume
+- **Local SQLite** — for anomaly events/rules, deploy markers, and settings (per-pod; populated by the agent itself)
 - **Kubernetes API** — for ArgoCD Applications and core K8s resources (via in-cluster ServiceAccount)
 - **LLM API** — OpenAI-compatible chat completions endpoint
 
@@ -42,12 +51,14 @@ The agent is a standalone HTTP service that streams investigation progress over 
 
 ## Development
 
+sre-agent is usually run together with `rush-api` and `rush-frontend`. For a full local stack, use the `docker-compose` / Helm setup in the main Rush Observability repo. To iterate on just the agent:
+
 ```bash
-# Run locally (requires CLICKHOUSE_URL, LLM_API_KEY, shared SQLite file)
+# Run locally — requires ClickHouse, rush-api, and an LLM API key.
 export CLICKHOUSE_URL=http://localhost:8123
+export QUERY_API_URL=http://localhost:8080   # URL of rush-api; used to fetch custom skills
 export LLM_API_KEY=sk-...
 export LLM_MODEL=gpt-4o
-export WIDE_CONFIG_DB=/path/to/wide_config.db
 make run
 
 # Build and push the Docker image
@@ -64,7 +75,8 @@ make docker-push
 | `CLICKHOUSE_DATABASE` | `observability` | ClickHouse database name |
 | `CLICKHOUSE_USER` | `default` | ClickHouse user |
 | `CLICKHOUSE_PASSWORD` | `` | ClickHouse password |
-| `WIDE_CONFIG_DB` | `./wide_config.db` | SQLite config database path (shared with query-api) |
+| `WIDE_CONFIG_DB` | `./wide_config.db` | Local SQLite path for anomaly events / deploy markers |
+| `QUERY_API_URL` | _(unset)_ | URL of `rush-api` for fetching custom skills over HTTP. When set, the agent reads `custom_skills` from rush-api (single source of truth) instead of the local DB. |
 | `LLM_BASE_URL` | `https://api.openai.com` | OpenAI-compatible LLM endpoint |
 | `LLM_API_KEY` | (required) | LLM API key |
 | `LLM_MODEL` | `gpt-4o` | Model name |

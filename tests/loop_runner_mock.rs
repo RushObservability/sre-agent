@@ -75,7 +75,11 @@ fn build_stream_body(script: &Script) -> String {
     let mut out = String::new();
 
     match script {
-        Script::ToolCall { name, args, call_id } => {
+        Script::ToolCall {
+            name,
+            args,
+            call_id,
+        } => {
             // Chunk 1: tool_call with name
             let c1 = json!({
                 "choices": [{
@@ -139,7 +143,9 @@ fn build_stream_body(script: &Script) -> String {
 }
 
 /// Spawn the mock server on an ephemeral port and return its base URL + shutdown handle.
-async fn start_mock(scripts: Vec<Script>) -> (String, tokio::task::JoinHandle<()>, Arc<Mutex<usize>>) {
+async fn start_mock(
+    scripts: Vec<Script>,
+) -> (String, tokio::task::JoinHandle<()>, Arc<Mutex<usize>>) {
     let call_count = Arc::new(Mutex::new(0usize));
     let state = MockState {
         scripts: Arc::new(Mutex::new(scripts)),
@@ -200,7 +206,11 @@ fn make_ctx() -> ToolContext {
     let config_db = Arc::new(sre_agent::config_db::ConfigDb::open(":memory:").unwrap());
     let skill_store = Arc::new(sre_agent::agent::skill_store::SkillStore::load(&config_db));
     ToolContext {
-        state: sre_agent::AppState { ch, config_db, query_api_url: None },
+        state: sre_agent::AppState {
+            ch,
+            config_db,
+            query_api_url: None,
+        },
         skill_store,
     }
 }
@@ -277,9 +287,7 @@ async fn loop_executes_tool_call_then_finalizes() {
             args: json!({"service": "api"}),
             call_id: "call_1".to_string(),
         },
-        Script::Final(
-            "## Root Cause\n5 errors found in api service logs.".to_string(),
-        ),
+        Script::Final("## Root Cause\n5 errors found in api service logs.".to_string()),
     ];
     let (base_url, _server, call_count) = start_mock(scripts).await;
 
@@ -317,7 +325,9 @@ async fn loop_executes_tool_call_then_finalizes() {
     let has_tool_result = events.iter().any(
         |e| matches!(e, AgentEvent::ToolResult { data, .. } if data.contains("Found 5 log entries")),
     );
-    let has_summary = events.iter().any(|e| matches!(e, AgentEvent::Summary { .. }));
+    let has_summary = events
+        .iter()
+        .any(|e| matches!(e, AgentEvent::Summary { .. }));
 
     assert!(has_tool_call, "expected search_logs tool_call event");
     assert!(has_tool_result, "expected tool_result with fake data");
@@ -411,5 +421,8 @@ async fn empty_response_triggers_retry_without_burning_tool_budget() {
     let has_summary = events
         .iter()
         .any(|e| matches!(e, AgentEvent::Summary { text, .. } if text.contains("Recovered")));
-    assert!(has_summary, "loop should have recovered and produced summary");
+    assert!(
+        has_summary,
+        "loop should have recovered and produced summary"
+    );
 }

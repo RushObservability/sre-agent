@@ -14,7 +14,9 @@ struct MetricRow {
 
 #[async_trait::async_trait]
 impl Tool for QueryMetrics {
-    fn name(&self) -> &str { "query_metrics" }
+    fn name(&self) -> &str {
+        "query_metrics"
+    }
 
     fn description(&self) -> &str {
         "Query time-series metrics. Can query request rates, error rates, and latency percentiles \
@@ -52,28 +54,42 @@ impl Tool for QueryMetrics {
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String> {
         let service = args.get("service").and_then(|v| v.as_str()).unwrap_or("");
-        let metric = args.get("metric").and_then(|v| v.as_str()).unwrap_or("request_rate");
-        let metric_name = args.get("metric_name").and_then(|v| v.as_str()).unwrap_or("");
+        let metric = args
+            .get("metric")
+            .and_then(|v| v.as_str())
+            .unwrap_or("request_rate");
+        let metric_name = args
+            .get("metric_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let around = args.get("around").and_then(|v| v.as_str()).unwrap_or("");
         let minutes = args.get("minutes").and_then(|v| v.as_u64()).unwrap_or(30);
 
         // Normalize ISO timestamp for ClickHouse: strip Z, replace T with space
         let ch_ts = if !around.is_empty() {
-            around.replace('\'', "''").replace('T', " ").trim_end_matches('Z').to_string()
+            around
+                .replace('\'', "''")
+                .replace('T', " ")
+                .trim_end_matches('Z')
+                .to_string()
         } else {
             String::new()
         };
 
         // Build time filter for wide_events (DateTime64 timestamp column)
         let time_filter = if !around.is_empty() {
-            format!("timestamp >= toDateTime64('{ch_ts}', 9) - INTERVAL 5 MINUTE AND timestamp <= toDateTime64('{ch_ts}', 9) + INTERVAL 5 MINUTE")
+            format!(
+                "timestamp >= toDateTime64('{ch_ts}', 9) - INTERVAL 5 MINUTE AND timestamp <= toDateTime64('{ch_ts}', 9) + INTERVAL 5 MINUTE"
+            )
         } else {
             format!("timestamp >= now() - INTERVAL {minutes} MINUTE")
         };
 
         // Build time filter for otel_metrics tables (TimeUnix column)
         let otel_time_filter = if !around.is_empty() {
-            format!("TimeUnix >= toDateTime64('{ch_ts}', 9) - INTERVAL 5 MINUTE AND TimeUnix <= toDateTime64('{ch_ts}', 9) + INTERVAL 5 MINUTE")
+            format!(
+                "TimeUnix >= toDateTime64('{ch_ts}', 9) - INTERVAL 5 MINUTE AND TimeUnix <= toDateTime64('{ch_ts}', 9) + INTERVAL 5 MINUTE"
+            )
         } else {
             format!("TimeUnix >= now() - INTERVAL {minutes} MINUTE")
         };

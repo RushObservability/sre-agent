@@ -29,6 +29,12 @@ pub struct ToolRegistry {
     order: Vec<String>,
 }
 
+impl Default for ToolRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ToolRegistry {
     pub fn new() -> Self {
         Self {
@@ -110,7 +116,11 @@ mod tests {
         let config_db = Arc::new(ConfigDb::open(":memory:").unwrap());
         let skill_store = Arc::new(crate::agent::skill_store::SkillStore::load(&config_db));
         ToolContext {
-            state: crate::AppState { ch, config_db, query_api_url: None },
+            state: crate::AppState {
+                ch,
+                config_db,
+                query_api_url: None,
+            },
             skill_store,
         }
     }

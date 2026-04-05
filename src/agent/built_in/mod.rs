@@ -1,14 +1,14 @@
-mod traces;
+mod anomalies;
+mod argocd_tool;
+mod deploys;
+mod kube_tool;
 mod logs;
 mod metrics;
 mod services;
-mod deploys;
-mod anomalies;
 mod skills_tool;
-mod argocd_tool;
-mod kube_tool;
+mod traces;
 
-use crate::agent::tools::{ToolRegistry, Tool};
+use crate::agent::tools::{Tool, ToolRegistry};
 use std::sync::Arc;
 
 /// Register all built-in tools.

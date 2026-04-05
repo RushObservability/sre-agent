@@ -78,10 +78,7 @@ impl SkillStore {
     ///
     /// `query_api_url` should be the base URL, e.g. `http://rush-o11y-query-api:8080`.
     /// When `None`, this is equivalent to [`SkillStore::load`].
-    pub async fn load_unified(
-        config_db: &Arc<ConfigDb>,
-        query_api_url: Option<&str>,
-    ) -> Self {
+    pub async fn load_unified(config_db: &Arc<ConfigDb>, query_api_url: Option<&str>) -> Self {
         let mut store = Self::with_built_ins();
 
         // Prefer HTTP fetch if a query-api URL is configured. This is the path
@@ -236,10 +233,7 @@ impl SkillStore {
 /// Short per-request timeout so a slow or unreachable query-api never stalls an
 /// investigation — the caller logs the error and proceeds with built-ins only.
 async fn fetch_custom_skills_http(base_url: &str) -> anyhow::Result<Vec<CustomSkill>> {
-    let url = format!(
-        "{}/api/v1/custom-skills",
-        base_url.trim_end_matches('/')
-    );
+    let url = format!("{}/api/v1/custom-skills", base_url.trim_end_matches('/'));
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
         .build()?;

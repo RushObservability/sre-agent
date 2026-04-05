@@ -6,11 +6,11 @@ use std::collections::HashSet;
 #[derive(Debug, Default)]
 pub struct WorkingMemory {
     pub task: String,
-    pub suspect_services: Vec<String>,     // LRU, max 8
-    pub confirmed_facts: Vec<String>,      // max 10
-    pub ruled_out: Vec<String>,            // max 10
+    pub suspect_services: Vec<String>,         // LRU, max 8
+    pub confirmed_facts: Vec<String>,          // max 10
+    pub ruled_out: Vec<String>,                // max 10
     pub recent_tool_calls: Vec<CallSignature>, // for repeat detection
-    pub consecutive_empty_results: u32,    // dead-end detection
+    pub consecutive_empty_results: u32,        // dead-end detection
     /// Hypotheses we explored and ruled out (LRU, max 5). Used to discourage
     /// re-exploring dead ends across escalation rounds.
     pub failed_hypotheses: Vec<String>,
@@ -96,7 +96,10 @@ impl WorkingMemory {
             out.push_str(&format!("**Task**: {}\n", self.task));
         }
         if !self.suspect_services.is_empty() {
-            out.push_str(&format!("**Suspect services**: {}\n", self.suspect_services.join(", ")));
+            out.push_str(&format!(
+                "**Suspect services**: {}\n",
+                self.suspect_services.join(", ")
+            ));
         }
         if !self.confirmed_facts.is_empty() {
             out.push_str("**Confirmed facts**:\n");
@@ -118,8 +121,12 @@ impl WorkingMemory {
         }
         if self.escalation_level > 0 {
             let stage_hint = match self.escalation_level {
-                1 => " (already tried alternative tool categories — now must check dependency graph)",
-                2 => " (already widened scope — now must produce a preliminary report with open questions)",
+                1 => {
+                    " (already tried alternative tool categories — now must check dependency graph)"
+                }
+                2 => {
+                    " (already widened scope — now must produce a preliminary report with open questions)"
+                }
                 _ => " (must emit a preliminary report with explicit open questions)",
             };
             out.push_str(&format!(
@@ -173,7 +180,11 @@ pub fn normalize_args(args: &serde_json::Value) -> String {
 
 /// Extract signal-worthy facts from a tool result for working memory.
 /// Returns (suspect_services, facts) tuples to add.
-pub fn extract_facts_from_tool_result(tool_name: &str, args: &serde_json::Value, result: &str) -> ExtractedFacts {
+pub fn extract_facts_from_tool_result(
+    tool_name: &str,
+    args: &serde_json::Value,
+    result: &str,
+) -> ExtractedFacts {
     let mut out = ExtractedFacts::default();
 
     // Service extraction from args
@@ -219,7 +230,10 @@ pub fn extract_facts_from_tool_result(tool_name: &str, args: &serde_json::Value,
         "query_metrics" => {
             // Metrics output has "Latest=X Avg=Y Min=Z Max=W"
             for line in result.lines().take(5) {
-                if line.contains("Latest=") || line.contains("error_rate") || line.contains("latency") {
+                if line.contains("Latest=")
+                    || line.contains("error_rate")
+                    || line.contains("latency")
+                {
                     out.summary = Some(line.trim().to_string());
                     break;
                 }
@@ -517,7 +531,8 @@ mod tests {
     #[test]
     fn extract_facts_metrics_summary() {
         let args = json!({"service": "api", "metric": "error_rate"});
-        let result = "api error_rate (last 30m, 30 data points):\nLatest=0.05 Avg=0.03 Min=0.01 Max=0.08\n";
+        let result =
+            "api error_rate (last 30m, 30 data points):\nLatest=0.05 Avg=0.03 Min=0.01 Max=0.08\n";
         let facts = extract_facts_from_tool_result("query_metrics", &args, result);
         assert!(facts.services.contains("api"));
         // Summary grabs the first matching line — either the header ("error_rate")
@@ -543,7 +558,11 @@ mod tests {
         let result = "pod/my-pod\nPhase: Running\nContainers (1):\n  app: ready=false restarts=12\n    WAITING: CrashLoopBackOff — back-off 5m restarting\n";
         let facts = extract_facts_from_tool_result("kube_describe", &args, result);
         let summary = facts.summary.unwrap();
-        assert!(summary.contains("Phase:") || summary.contains("CrashLoop") || summary.contains("WAITING"));
+        assert!(
+            summary.contains("Phase:")
+                || summary.contains("CrashLoop")
+                || summary.contains("WAITING")
+        );
     }
 
     // ── clip_tool_result ──

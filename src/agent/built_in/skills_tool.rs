@@ -103,7 +103,11 @@ mod tests {
         let config_db = Arc::new(ConfigDb::open(":memory:").unwrap());
         let skill_store = Arc::new(SkillStore::load(&config_db));
         ToolContext {
-            state: crate::AppState { ch, config_db, query_api_url: None },
+            state: crate::AppState {
+                ch,
+                config_db,
+                query_api_url: None,
+            },
             skill_store,
         }
     }

@@ -7,6 +7,7 @@ use serde_json::{Value, json};
 pub struct QueryTraces;
 
 #[derive(Debug, Row, Deserialize)]
+#[allow(dead_code)] // fields populated by ClickHouse row deserialization
 struct TraceRow {
     trace_id: String,
     span_id: String,
@@ -21,7 +22,9 @@ struct TraceRow {
 
 #[async_trait::async_trait]
 impl Tool for QueryTraces {
-    fn name(&self) -> &str { "query_traces" }
+    fn name(&self) -> &str {
+        "query_traces"
+    }
 
     fn description(&self) -> &str {
         "Search recent traces/spans. Returns matching spans with service, status, duration, and path. \
@@ -62,18 +65,24 @@ impl Tool for QueryTraces {
         let status = args.get("status").and_then(|v| v.as_str()).unwrap_or("");
         let around = args.get("around").and_then(|v| v.as_str()).unwrap_or("");
         let minutes = args.get("minutes").and_then(|v| v.as_u64()).unwrap_or(15);
-        let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(20).min(100);
+        let limit = args
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(20)
+            .min(100);
 
         let mut conditions = if !around.is_empty() {
-            let ts = around.replace('\'', "''").replace('T', " ").trim_end_matches('Z').to_string();
+            let ts = around
+                .replace('\'', "''")
+                .replace('T', " ")
+                .trim_end_matches('Z')
+                .to_string();
             vec![
                 format!("timestamp >= toDateTime64('{ts}', 9) - INTERVAL 5 MINUTE"),
                 format!("timestamp <= toDateTime64('{ts}', 9) + INTERVAL 5 MINUTE"),
             ]
         } else {
-            vec![
-                format!("timestamp >= now() - INTERVAL {minutes} MINUTE"),
-            ]
+            vec![format!("timestamp >= now() - INTERVAL {minutes} MINUTE")]
         };
         if !service.is_empty() {
             conditions.push(format!("service_name = '{}'", service.replace('\'', "''")));
@@ -103,21 +112,31 @@ impl Tool for QueryTraces {
 
         // Summarize
         let total = rows.len();
-        let errors = rows.iter().filter(|r| r.status == "STATUS_CODE_ERROR").count();
-        let mut svc_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-        let mut path_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let errors = rows
+            .iter()
+            .filter(|r| r.status == "STATUS_CODE_ERROR")
+            .count();
+        let mut svc_counts: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        let mut path_counts: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
         let mut durations: Vec<u64> = Vec::new();
 
         for r in &rows {
             *svc_counts.entry(r.service_name.clone()).or_default() += 1;
             if !r.http_path.is_empty() {
-                *path_counts.entry(format!("{} {}", r.http_method, r.http_path)).or_default() += 1;
+                *path_counts
+                    .entry(format!("{} {}", r.http_method, r.http_path))
+                    .or_default() += 1;
             }
             durations.push(r.duration_ns);
         }
         durations.sort();
         let p50 = durations.get(durations.len() / 2).copied().unwrap_or(0);
-        let p99 = durations.get(durations.len() * 99 / 100).copied().unwrap_or(0);
+        let p99 = durations
+            .get(durations.len() * 99 / 100)
+            .copied()
+            .unwrap_or(0);
 
         let time_desc = if !around.is_empty() {
             format!("±5m around {around}")
@@ -125,7 +144,11 @@ impl Tool for QueryTraces {
             format!("last {minutes}m")
         };
         let mut out = format!("Found {total} spans ({errors} errors) ({time_desc}).\n");
-        out.push_str(&format!("Latency: p50={:.1}ms p99={:.1}ms\n", p50 as f64 / 1e6, p99 as f64 / 1e6));
+        out.push_str(&format!(
+            "Latency: p50={:.1}ms p99={:.1}ms\n",
+            p50 as f64 / 1e6,
+            p99 as f64 / 1e6
+        ));
 
         if !path_counts.is_empty() {
             out.push_str("\nTop paths:\n");
@@ -137,7 +160,8 @@ impl Tool for QueryTraces {
         }
 
         // Show a few sample error spans
-        let error_samples: Vec<&TraceRow> = rows.iter()
+        let error_samples: Vec<&TraceRow> = rows
+            .iter()
             .filter(|r| r.status == "STATUS_CODE_ERROR")
             .take(5)
             .collect();
@@ -164,6 +188,7 @@ impl Tool for QueryTraces {
 pub struct GetTrace;
 
 #[derive(Debug, Row, Deserialize)]
+#[allow(dead_code)] // fields populated by ClickHouse row deserialization
 struct SpanRow {
     span_id: String,
     parent_span_id: String,
@@ -179,7 +204,9 @@ struct SpanRow {
 
 #[async_trait::async_trait]
 impl Tool for GetTrace {
-    fn name(&self) -> &str { "get_trace" }
+    fn name(&self) -> &str {
+        "get_trace"
+    }
 
     fn description(&self) -> &str {
         "Get all spans for a specific trace ID. Shows the full request flow across services."
@@ -199,7 +226,8 @@ impl Tool for GetTrace {
     }
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String> {
-        let trace_id = args.get("trace_id")
+        let trace_id = args
+            .get("trace_id")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("trace_id is required"))?;
 
@@ -221,14 +249,22 @@ impl Tool for GetTrace {
 
         let mut out = format!("Trace {trace_id}: {} spans\n\n", rows.len());
         for s in &rows {
-            let indent = if s.parent_span_id.is_empty() { "" } else { "  " };
+            let indent = if s.parent_span_id.is_empty() {
+                ""
+            } else {
+                "  "
+            };
             out.push_str(&format!(
                 "{indent}[{ts}] {svc} {method} {path} → {status} {code} ({dur:.1}ms)\n",
                 ts = s.ts_str,
                 svc = s.service_name,
                 method = s.http_method,
                 path = s.http_path,
-                status = if s.status == "STATUS_CODE_ERROR" { "ERROR" } else { "OK" },
+                status = if s.status == "STATUS_CODE_ERROR" {
+                    "ERROR"
+                } else {
+                    "OK"
+                },
                 code = s.http_status_code,
                 dur = s.duration_ns as f64 / 1e6,
             ));

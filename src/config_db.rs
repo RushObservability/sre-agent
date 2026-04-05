@@ -1,4 +1,4 @@
-//! Read-only SQLite adapter over the shared `wide_config.db` file.
+//! Read-only SQLite adapter over the shared `rush_config.db` file.
 //!
 //! The agent does NOT migrate or write to this database — query-api owns the
 //! schema. The agent opens the file read-only and exposes only the methods

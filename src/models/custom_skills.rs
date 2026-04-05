@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 /// User-defined investigation skill. The sre-agent reads these from the
-/// shared `wide_config.db` (owned and written by query-api) and exposes them
+/// shared `rush_config.db` (owned and written by query-api) and exposes them
 /// via the `load_skill` tool to LLM investigation loops.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CustomSkill {

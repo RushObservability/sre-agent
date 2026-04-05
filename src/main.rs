@@ -65,7 +65,7 @@ async fn main() -> anyhow::Result<()> {
         .with_option("max_execution_time", "30");
 
     let config_db_path =
-        std::env::var("WIDE_CONFIG_DB").unwrap_or_else(|_| "./wide_config.db".to_string());
+        std::env::var("RUSH_CONFIG_DB").unwrap_or_else(|_| "./rush_config.db".to_string());
     let config_db = Arc::new(ConfigDb::open(&config_db_path)?);
     tracing::info!("sre-agent config db opened at {config_db_path}");
 

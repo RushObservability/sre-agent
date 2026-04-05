@@ -1,5 +1,15 @@
 use serde::Serialize;
 
+/// Whether an investigation report is a final root-cause analysis or a
+/// preliminary set of findings with open questions for the user to follow
+/// up on.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ReportKind {
+    Final,
+    Preliminary,
+}
+
 /// Events sent over the SSE stream during an investigation.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type")]
@@ -14,7 +24,11 @@ pub enum AgentEvent {
     #[serde(rename = "tool_result")]
     ToolResult { name: String, data: String },
     #[serde(rename = "summary")]
-    Summary { text: String },
+    Summary {
+        text: String,
+        #[serde(rename = "kind")]
+        kind: ReportKind,
+    },
     #[serde(rename = "error")]
     Error { message: String },
     #[serde(rename = "done")]
@@ -99,7 +113,18 @@ mod tests {
     fn summary_event() {
         let out = as_string(AgentEvent::Summary {
             text: "## Root Cause\nfoo".into(),
+            kind: ReportKind::Final,
         });
         assert!(out.contains(r#""type":"summary""#));
+        assert!(out.contains(r#""kind":"final""#));
+    }
+
+    #[test]
+    fn summary_event_preliminary_serializes_kind() {
+        let out = as_string(AgentEvent::Summary {
+            text: "## Preliminary Findings".into(),
+            kind: ReportKind::Preliminary,
+        });
+        assert!(out.contains(r#""kind":"preliminary""#));
     }
 }

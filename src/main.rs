@@ -15,6 +15,7 @@ use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
 
+use sre_agent::agent::skill_store::SkillStore;
 use sre_agent::agent::stream::AgentEvent;
 use sre_agent::agent::tools::{ToolContext, ToolRegistry};
 use sre_agent::config_db::ConfigDb;
@@ -28,6 +29,13 @@ struct InvestigateRequest {
     question: String,
     #[serde(default)]
     additional_context: String,
+    /// For follow-up turns: the full prior conversation (system + user +
+    /// assistant + tool messages) from a previous investigation. If present
+    /// and non-empty, these are used as the starting message list INSTEAD of
+    /// building a fresh system+user prompt. The new user prompt (derived from
+    /// `question` and `additional_context`) is appended at the end.
+    #[serde(default)]
+    prior_messages: Vec<serde_json::Value>,
 }
 
 #[tokio::main]
@@ -60,7 +68,24 @@ async fn main() -> anyhow::Result<()> {
     let config_db = Arc::new(ConfigDb::open(&config_db_path)?);
     tracing::info!("sre-agent config db opened at {config_db_path}");
 
-    let state = AppState { ch, config_db };
+    // Optional: URL of the query-api used to fetch custom skills. When set, the
+    // agent reads custom_skills from query-api over HTTP instead of from the
+    // local SQLite file. In the cluster, query-api owns the custom_skills
+    // table; sre-agent is a read-only consumer.
+    let query_api_url = std::env::var("QUERY_API_URL")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
+    if let Some(url) = &query_api_url {
+        tracing::info!("sre-agent will fetch custom skills from query-api at {url}");
+    } else {
+        tracing::info!("QUERY_API_URL not set; custom skills will read from local config_db");
+    }
+
+    let state = AppState {
+        ch,
+        config_db,
+        query_api_url,
+    };
 
     let port: u16 = std::env::var("SRE_AGENT_PORT")
         .ok()
@@ -91,19 +116,25 @@ async fn investigate(
     State(state): State<AppState>,
     Json(req): Json<InvestigateRequest>,
 ) -> Result<Response, (StatusCode, String)> {
-    if req.event_id.is_empty() && req.question.is_empty() {
+    let is_follow_up = !req.prior_messages.is_empty();
+
+    if req.event_id.is_empty() && req.question.is_empty() && !is_follow_up {
         return Err((
             StatusCode::BAD_REQUEST,
-            "provide event_id or question".to_string(),
+            "provide event_id, question, or prior_messages".to_string(),
         ));
     }
 
-    // Build initial messages
-    let system_msg = serde_json::json!({
-        "role": "system",
-        "content": agent::prompt::system_prompt(),
-    });
+    // Build (or load) the unified skill store for this investigation. Fresh
+    // per request so newly-authored custom skills are picked up without a
+    // server restart. Prefers HTTP fetch from query-api (single source of
+    // truth) when QUERY_API_URL is configured; falls back to the local
+    // config_db otherwise.
+    let skill_store = Arc::new(
+        SkillStore::load_unified(&state.config_db, state.query_api_url.as_deref()).await,
+    );
 
+    // Build the user turn that starts or continues the investigation.
     let user_content = if !req.event_id.is_empty() {
         // Load anomaly context
         let event = state
@@ -125,22 +156,47 @@ async fn investigate(
             ));
         }
         ctx
-    } else {
+    } else if !req.question.is_empty() {
         agent::prompt::question_context(&req.question, &req.additional_context)
+    } else {
+        // Pure follow-up with only prior_messages and no new question — this
+        // is unusual but permitted; the harness will try to make progress on
+        // the existing conversation.
+        "Continue the investigation.".to_string()
     };
 
-    let user_msg = serde_json::json!({
-        "role": "user",
-        "content": user_content,
-    });
-
-    let messages = vec![system_msg, user_msg];
+    // Construct the starting message list. For follow-ups, we preserve the
+    // prior conversation exactly (including the system prompt it already
+    // contains) and append the new user turn. For fresh investigations, we
+    // build a system prompt with the current skill catalog and a single user
+    // message.
+    let messages: Vec<serde_json::Value> = if is_follow_up {
+        let mut msgs = req.prior_messages.clone();
+        msgs.push(serde_json::json!({
+            "role": "user",
+            "content": user_content,
+        }));
+        msgs
+    } else {
+        let system_msg = serde_json::json!({
+            "role": "system",
+            "content": agent::prompt::system_prompt(&skill_store.catalog()),
+        });
+        let user_msg = serde_json::json!({
+            "role": "user",
+            "content": user_content,
+        });
+        vec![system_msg, user_msg]
+    };
 
     // Set up tool registry
     let mut registry = ToolRegistry::new();
     agent::built_in::register_all(&mut registry);
 
-    let tool_ctx = ToolContext { state: state.clone() };
+    let tool_ctx = ToolContext {
+        state: state.clone(),
+        skill_store,
+    };
 
     // Create a channel for SSE events
     let (tx, rx) = mpsc::channel::<AgentEvent>(64);

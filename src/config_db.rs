@@ -9,6 +9,7 @@ use rusqlite::{Connection, params};
 use std::sync::Mutex;
 
 use crate::models::anomaly::{AnomalyEvent, AnomalyRule, DeployMarker};
+use crate::models::custom_skills::CustomSkill;
 
 pub struct ConfigDb {
     conn: Mutex<Connection>,
@@ -72,6 +73,18 @@ impl ConfigDb {
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS custom_skills (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                title TEXT NOT NULL,
+                description TEXT NOT NULL,
+                content TEXT NOT NULL,
+                allowed_tools TEXT NOT NULL DEFAULT '[]',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_by TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+                updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
             );
             "#,
         )?;
@@ -258,6 +271,67 @@ impl ConfigDb {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare("SELECT value FROM settings WHERE key = ?1")?;
         let mut rows = stmt.query_map(params![key], |row| row.get::<_, String>(0))?;
+        Ok(rows.next().transpose()?)
+    }
+
+    // ── Custom skills (read-only) ──
+
+    /// List only enabled custom skills, ordered by name.
+    pub fn list_enabled_custom_skills(&self) -> anyhow::Result<Vec<CustomSkill>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, title, description, content, allowed_tools, enabled, \
+             created_by, created_at, updated_at FROM custom_skills WHERE enabled = 1 \
+             ORDER BY name ASC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                let allowed_tools_json: String = row.get(5)?;
+                let enabled_int: i64 = row.get(6)?;
+                Ok(CustomSkill {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    title: row.get(2)?,
+                    description: row.get(3)?,
+                    content: row.get(4)?,
+                    allowed_tools: serde_json::from_str(&allowed_tools_json)
+                        .unwrap_or_else(|_| Vec::new()),
+                    enabled: enabled_int != 0,
+                    created_by: row.get(7)?,
+                    created_at: row.get(8)?,
+                    updated_at: row.get(9)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Fetch a single custom skill by its unique `name`. Returns regardless
+    /// of `enabled` status so callers can surface a clear error when an
+    /// explicitly requested skill has been disabled.
+    pub fn get_custom_skill_by_name(&self, name: &str) -> anyhow::Result<Option<CustomSkill>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, title, description, content, allowed_tools, enabled, \
+             created_by, created_at, updated_at FROM custom_skills WHERE name = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![name], |row| {
+            let allowed_tools_json: String = row.get(5)?;
+            let enabled_int: i64 = row.get(6)?;
+            Ok(CustomSkill {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                title: row.get(2)?,
+                description: row.get(3)?,
+                content: row.get(4)?,
+                allowed_tools: serde_json::from_str(&allowed_tools_json)
+                    .unwrap_or_else(|_| Vec::new()),
+                enabled: enabled_int != 0,
+                created_by: row.get(7)?,
+                created_at: row.get(8)?,
+                updated_at: row.get(9)?,
+            })
+        })?;
         Ok(rows.next().transpose()?)
     }
 }

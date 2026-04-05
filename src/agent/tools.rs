@@ -1,4 +1,5 @@
 use crate::AppState;
+use crate::agent::skill_store::SkillStore;
 use anyhow::Result;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -7,6 +8,10 @@ use std::sync::Arc;
 /// Context passed to every tool execution.
 pub struct ToolContext {
     pub state: AppState,
+    /// Unified view of built-in and custom investigation skills for this run.
+    /// Built fresh per investigation so edits to custom skills are picked up
+    /// on the next invocation.
+    pub skill_store: Arc<SkillStore>,
 }
 
 /// A tool the agent can invoke.
@@ -103,8 +108,10 @@ mod tests {
     fn test_ctx() -> ToolContext {
         let ch = clickhouse::Client::default().with_url("http://localhost:8123");
         let config_db = Arc::new(ConfigDb::open(":memory:").unwrap());
+        let skill_store = Arc::new(crate::agent::skill_store::SkillStore::load(&config_db));
         ToolContext {
-            state: crate::AppState { ch, config_db },
+            state: crate::AppState { ch, config_db, query_api_url: None },
+            skill_store,
         }
     }
 

@@ -198,8 +198,10 @@ impl Tool for FakeTool {
 fn make_ctx() -> ToolContext {
     let ch = clickhouse::Client::default().with_url("http://localhost:8123");
     let config_db = Arc::new(sre_agent::config_db::ConfigDb::open(":memory:").unwrap());
+    let skill_store = Arc::new(sre_agent::agent::skill_store::SkillStore::load(&config_db));
     ToolContext {
-        state: sre_agent::AppState { ch, config_db },
+        state: sre_agent::AppState { ch, config_db, query_api_url: None },
+        skill_store,
     }
 }
 
@@ -261,7 +263,7 @@ async fn loop_completes_with_single_final_answer() {
     // Should have Summary + Done events
     let has_summary = events
         .iter()
-        .any(|e| matches!(e, AgentEvent::Summary { text } if text.contains("Root Cause")));
+        .any(|e| matches!(e, AgentEvent::Summary { text, .. } if text.contains("Root Cause")));
     let has_done = events.iter().any(|e| matches!(e, AgentEvent::Done { .. }));
     assert!(has_summary, "expected Summary event with root cause");
     assert!(has_done, "expected Done event");
@@ -408,6 +410,6 @@ async fn empty_response_triggers_retry_without_burning_tool_budget() {
     let events = collect_events(&mut rx).await;
     let has_summary = events
         .iter()
-        .any(|e| matches!(e, AgentEvent::Summary { text } if text.contains("Recovered")));
+        .any(|e| matches!(e, AgentEvent::Summary { text, .. } if text.contains("Recovered")));
     assert!(has_summary, "loop should have recovered and produced summary");
 }

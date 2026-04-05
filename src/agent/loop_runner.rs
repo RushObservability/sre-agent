@@ -2,7 +2,9 @@ use anyhow::Result;
 use serde_json::Value;
 use tokio::sync::mpsc;
 
-use super::memory::{CallSignature, WorkingMemory, clip_tool_result, extract_facts_from_tool_result, normalize_args};
+use super::memory::{
+    CallSignature, WorkingMemory, clip_tool_result, extract_facts_from_tool_result, normalize_args,
+};
 use super::stream::{AgentEvent, ReportKind};
 use super::tools::{ToolContext, ToolRegistry};
 
@@ -151,8 +153,15 @@ pub async fn run_with_config(
         if !resp.status().is_success() {
             let status = resp.status();
             let err_body = resp.text().await.unwrap_or_default();
-            let msg = format!("LLM returned {status}: {}", &err_body[..err_body.len().min(500)]);
-            let _ = tx.send(AgentEvent::Error { message: msg.clone() }).await;
+            let msg = format!(
+                "LLM returned {status}: {}",
+                &err_body[..err_body.len().min(500)]
+            );
+            let _ = tx
+                .send(AgentEvent::Error {
+                    message: msg.clone(),
+                })
+                .await;
             return Err(anyhow::anyhow!(msg));
         }
 
@@ -190,16 +199,19 @@ pub async fn run_with_config(
         }
 
         // Record assistant message with tool calls
-        let tc_value: Vec<Value> = tool_calls.iter().map(|tc| {
-            serde_json::json!({
-                "id": tc.id,
-                "type": "function",
-                "function": {
-                    "name": tc.name,
-                    "arguments": tc.arguments,
-                }
+        let tc_value: Vec<Value> = tool_calls
+            .iter()
+            .map(|tc| {
+                serde_json::json!({
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.name,
+                        "arguments": tc.arguments,
+                    }
+                })
             })
-        }).collect();
+            .collect();
 
         let mut assistant_msg = serde_json::json!({
             "role": "assistant",
@@ -215,10 +227,12 @@ pub async fn run_with_config(
         for tc in &tool_calls {
             let args: Value = serde_json::from_str(&tc.arguments).unwrap_or(Value::Null);
 
-            let _ = tx.send(AgentEvent::ToolCall {
-                name: tc.name.clone(),
-                args: args.clone(),
-            }).await;
+            let _ = tx
+                .send(AgentEvent::ToolCall {
+                    name: tc.name.clone(),
+                    args: args.clone(),
+                })
+                .await;
 
             // Repeat-call detection — return structured error, don't execute
             let sig = CallSignature {
@@ -264,10 +278,12 @@ pub async fn run_with_config(
                 }
             }
 
-            let _ = tx.send(AgentEvent::ToolResult {
-                name: tc.name.clone(),
-                data: result.clone(),
-            }).await;
+            let _ = tx
+                .send(AgentEvent::ToolResult {
+                    name: tc.name.clone(),
+                    data: result.clone(),
+                })
+                .await;
 
             messages.push(serde_json::json!({
                 "role": "tool",
@@ -286,22 +302,28 @@ pub async fn run_with_config(
             memory.escalation_level += 1;
 
             let nudge = match memory.escalation_level {
-                1 => "Multiple recent tool calls returned no data. Do NOT give up. Try a \
+                1 => {
+                    "Multiple recent tool calls returned no data. Do NOT give up. Try a \
                       DIFFERENT tool category than the one you've been using. If you've been \
                       searching logs, try query_traces or query_metrics. If you've been \
                       checking one service, check its upstream or downstream dependencies \
-                      via service_dependencies.",
-                2 => "You've tried alternative tool categories without finding the signal. \
+                      via service_dependencies."
+                }
+                2 => {
+                    "You've tried alternative tool categories without finding the signal. \
                       Do NOT give up. Check the service dependency graph — the root cause \
                       is often in an upstream or downstream service, not the one originally \
                       reported. Use service_dependencies then investigate each adjacent \
-                      service. Also try widening your time window.",
-                _ => "You have thoroughly explored multiple angles. Before producing a \
+                      service. Also try widening your time window."
+                }
+                _ => {
+                    "You have thoroughly explored multiple angles. Before producing a \
                       final conclusion, you MUST enumerate what you've ruled out and what \
                       specific questions remain open. Produce a PRELIMINARY findings report \
                       with explicit open questions, not a 'cannot determine' surrender. \
                       The user may follow up to refine further — give them specific things \
-                      to ask about.",
+                      to ask about."
+                }
             };
 
             // Inject the nudge as a system message for the next LLM call.
@@ -393,8 +415,14 @@ async fn parse_streaming_response(
         };
 
         if let Some(usage) = chunk.get("usage") {
-            prompt_tokens = usage.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(prompt_tokens);
-            completion_tokens = usage.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(completion_tokens);
+            prompt_tokens = usage
+                .get("prompt_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(prompt_tokens);
+            completion_tokens = usage
+                .get("completion_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(completion_tokens);
         }
 
         let choices = match chunk.get("choices").and_then(|c| c.as_array()) {
@@ -411,7 +439,11 @@ async fn parse_streaming_response(
             if let Some(text) = delta.get("content").and_then(|v| v.as_str()) {
                 if !text.is_empty() {
                     content.push_str(text);
-                    let _ = tx.send(AgentEvent::ThinkingDelta { text: text.to_string() }).await;
+                    let _ = tx
+                        .send(AgentEvent::ThinkingDelta {
+                            text: text.to_string(),
+                        })
+                        .await;
                 }
             }
 

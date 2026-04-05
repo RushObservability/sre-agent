@@ -6,7 +6,9 @@ pub struct GetAnomalyContext;
 
 #[async_trait::async_trait]
 impl Tool for GetAnomalyContext {
-    fn name(&self) -> &str { "get_anomaly_context" }
+    fn name(&self) -> &str {
+        "get_anomaly_context"
+    }
 
     fn description(&self) -> &str {
         "Get anomaly detection rules and recent anomaly events. \
@@ -29,11 +31,17 @@ impl Tool for GetAnomalyContext {
         let rule_id = args.get("rule_id").and_then(|v| v.as_str()).unwrap_or("");
 
         if !rule_id.is_empty() {
-            let rule = ctx.state.config_db.get_anomaly_rule(rule_id)
+            let rule = ctx
+                .state
+                .config_db
+                .get_anomaly_rule(rule_id)
                 .map_err(|e| anyhow::anyhow!("failed to get rule: {e}"))?
                 .ok_or_else(|| anyhow::anyhow!("anomaly rule not found: {rule_id}"))?;
 
-            let events = ctx.state.config_db.list_anomaly_events(rule_id, 10)
+            let events = ctx
+                .state
+                .config_db
+                .list_anomaly_events(rule_id, 10)
                 .map_err(|e| anyhow::anyhow!("failed to get events: {e}"))?;
 
             let mut out = format!(
@@ -44,8 +52,12 @@ impl Tool for GetAnomalyContext {
                  - Sensitivity: {:.1}σ\n\
                  - State: {}\n\
                  - Last triggered: {}\n\n",
-                rule.name, rule.source, rule.pattern,
-                rule.service_name, rule.sensitivity, rule.state,
+                rule.name,
+                rule.source,
+                rule.pattern,
+                rule.service_name,
+                rule.sensitivity,
+                rule.state,
                 rule.last_triggered_at.as_deref().unwrap_or("never"),
             );
 
@@ -63,7 +75,10 @@ impl Tool for GetAnomalyContext {
             }
             Ok(out)
         } else {
-            let rules = ctx.state.config_db.list_anomaly_rules()
+            let rules = ctx
+                .state
+                .config_db
+                .list_anomaly_rules()
                 .map_err(|e| anyhow::anyhow!("failed to list rules: {e}"))?;
 
             if rules.is_empty() {

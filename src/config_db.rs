@@ -120,7 +120,8 @@ impl ConfigDb {
         }
         sql.push_str(" ORDER BY deployed_at DESC LIMIT 100");
 
-        let params_ref: Vec<&dyn rusqlite::types::ToSql> = param_values.iter().map(|p| p.as_ref()).collect();
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+            param_values.iter().map(|p| p.as_ref()).collect();
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
             .query_map(params_ref.as_slice(), |row| {
@@ -412,7 +413,9 @@ mod tests {
         assert_eq!(all[0].version, "v1.2.3");
         assert_eq!(all[0].commit_sha, "abc1234");
 
-        let filtered = db.list_deploy_markers(Some("checkout"), None, None).unwrap();
+        let filtered = db
+            .list_deploy_markers(Some("checkout"), None, None)
+            .unwrap();
         assert_eq!(filtered.len(), 1);
 
         let none = db.list_deploy_markers(Some("other"), None, None).unwrap();
@@ -424,7 +427,11 @@ mod tests {
         let db = fresh_db();
         {
             let conn = db.conn.lock().unwrap();
-            for (id, at) in [("d1", "2026-01-01"), ("d2", "2026-01-15"), ("d3", "2026-02-01")] {
+            for (id, at) in [
+                ("d1", "2026-01-01"),
+                ("d2", "2026-01-15"),
+                ("d3", "2026-02-01"),
+            ] {
                 conn.execute(
                     "INSERT INTO deploy_markers (id, service_name, version, deployed_at) VALUES (?1, 'svc', 'v1', ?2)",
                     params![id, at],

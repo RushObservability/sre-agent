@@ -6,7 +6,9 @@ pub struct ListDeploys;
 
 #[async_trait::async_trait]
 impl Tool for ListDeploys {
-    fn name(&self) -> &str { "list_deploys" }
+    fn name(&self) -> &str {
+        "list_deploys"
+    }
 
     fn description(&self) -> &str {
         "List recent deploys/releases. Use this to check if a deploy correlates with the incident timing."
@@ -35,16 +37,24 @@ impl Tool for ListDeploys {
         let cutoff = chrono::Utc::now() - chrono::Duration::hours(hours as i64);
         let from_str = cutoff.format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
-        let svc_filter = if service.is_empty() { None } else { Some(service.to_string()) };
+        let svc_filter = if service.is_empty() {
+            None
+        } else {
+            Some(service.to_string())
+        };
 
-        let deploys = ctx.state.config_db.list_deploy_markers(
-            svc_filter.as_deref(),
-            Some(&from_str),
-            None,
-        ).map_err(|e| anyhow::anyhow!("failed to list deploys: {e}"))?;
+        let deploys = ctx
+            .state
+            .config_db
+            .list_deploy_markers(svc_filter.as_deref(), Some(&from_str), None)
+            .map_err(|e| anyhow::anyhow!("failed to list deploys: {e}"))?;
 
         if deploys.is_empty() {
-            let scope = if service.is_empty() { "any service".to_string() } else { service.to_string() };
+            let scope = if service.is_empty() {
+                "any service".to_string()
+            } else {
+                service.to_string()
+            };
             return Ok(format!("No deploys for {scope} in last {hours}h."));
         }
 
@@ -57,7 +67,10 @@ impl Tool for ListDeploys {
                 ver = d.version,
             ));
             if !d.commit_sha.is_empty() {
-                out.push_str(&format!(" ({})", &d.commit_sha[..d.commit_sha.len().min(8)]));
+                out.push_str(&format!(
+                    " ({})",
+                    &d.commit_sha[..d.commit_sha.len().min(8)]
+                ));
             }
             if !d.description.is_empty() {
                 out.push_str(&format!("  — {}", d.description));

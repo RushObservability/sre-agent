@@ -189,9 +189,7 @@ pub fn anomaly_context(event: &AnomalyEvent, rule: &AnomalyRule) -> String {
 
 /// Build the initial user message from a freeform question.
 pub fn question_context(question: &str, additional: &str) -> String {
-    let mut msg = format!(
-        "Investigate the following:\n\n{question}\n"
-    );
+    let mut msg = format!("Investigate the following:\n\n{question}\n");
     if !additional.is_empty() {
         msg.push_str(&format!("\n## Additional context\n{additional}\n"));
     }

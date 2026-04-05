@@ -7,6 +7,7 @@ use serde_json::{Value, json};
 pub struct SearchLogs;
 
 #[derive(Debug, Row, Deserialize)]
+#[allow(dead_code)] // fields populated by ClickHouse row deserialization
 struct LogRow {
     timestamp: String,
     service_name: String,
@@ -17,7 +18,9 @@ struct LogRow {
 
 #[async_trait::async_trait]
 impl Tool for SearchLogs {
-    fn name(&self) -> &str { "search_logs" }
+    fn name(&self) -> &str {
+        "search_logs"
+    }
 
     fn description(&self) -> &str {
         "Search application logs. Returns matching log entries with timestamp, service, severity, and message. \
@@ -63,19 +66,25 @@ impl Tool for SearchLogs {
         let query_text = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
         let around = args.get("around").and_then(|v| v.as_str()).unwrap_or("");
         let minutes = args.get("minutes").and_then(|v| v.as_u64()).unwrap_or(15);
-        let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50).min(200);
+        let limit = args
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(50)
+            .min(200);
 
         let mut conditions = if !around.is_empty() {
             // ClickHouse expects 'YYYY-MM-DD hh:mm:ss' — strip trailing Z and replace T with space
-            let ts = around.replace('\'', "''").replace('T', " ").trim_end_matches('Z').to_string();
+            let ts = around
+                .replace('\'', "''")
+                .replace('T', " ")
+                .trim_end_matches('Z')
+                .to_string();
             vec![
                 format!("Timestamp >= toDateTime64('{ts}', 9) - INTERVAL 5 MINUTE"),
                 format!("Timestamp <= toDateTime64('{ts}', 9) + INTERVAL 5 MINUTE"),
             ]
         } else {
-            vec![
-                format!("Timestamp >= now() - INTERVAL {minutes} MINUTE"),
-            ]
+            vec![format!("Timestamp >= now() - INTERVAL {minutes} MINUTE")]
         };
         if !service.is_empty() {
             conditions.push(format!("ServiceName = '{}'", service.replace('\'', "''")));
@@ -88,13 +97,20 @@ impl Tool for SearchLogs {
                 "INFO" => vec!["INFO", "WARN", "WARNING", "ERROR", "FATAL", "CRITICAL"],
                 _ => vec![severity],
             };
-            let in_list: String = levels.iter().map(|l| format!("'{l}'")).collect::<Vec<_>>().join(",");
+            let in_list: String = levels
+                .iter()
+                .map(|l| format!("'{l}'"))
+                .collect::<Vec<_>>()
+                .join(",");
             conditions.push(format!("SeverityText IN ({in_list})"));
         }
         if !query_text.is_empty() {
             conditions.push(format!(
                 "lower(Body) LIKE '%{}%'",
-                query_text.to_lowercase().replace('\'', "''").replace('%', "\\%")
+                query_text
+                    .to_lowercase()
+                    .replace('\'', "''")
+                    .replace('%', "\\%")
             ));
         }
 
@@ -118,10 +134,15 @@ impl Tool for SearchLogs {
         }
 
         // Group by message pattern to avoid repeating the same error 100 times
-        let mut pattern_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut pattern_counts: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
         for r in &rows {
             // Use first 120 chars as pattern key
-            let key = if r.body.len() > 120 { &r.body[..120] } else { &r.body };
+            let key = if r.body.len() > 120 {
+                &r.body[..120]
+            } else {
+                &r.body
+            };
             *pattern_counts.entry(key.to_string()).or_default() += 1;
         }
 
@@ -148,17 +169,27 @@ impl Tool for SearchLogs {
         let mut seen = std::collections::HashSet::new();
         let mut shown = 0;
         for r in &rows {
-            let key = if r.body.len() > 120 { &r.body[..120] } else { &r.body };
+            let key = if r.body.len() > 120 {
+                &r.body[..120]
+            } else {
+                &r.body
+            };
             if seen.insert(key.to_string()) {
                 out.push_str(&format!(
                     "  [{ts}] [{sev}] {svc}: {body}\n",
                     ts = r.timestamp,
                     sev = r.severity,
                     svc = r.service_name,
-                    body = if r.body.len() > 300 { format!("{}...", &r.body[..300]) } else { r.body.clone() },
+                    body = if r.body.len() > 300 {
+                        format!("{}...", &r.body[..300])
+                    } else {
+                        r.body.clone()
+                    },
                 ));
                 shown += 1;
-                if shown >= 20 { break; }
+                if shown >= 20 {
+                    break;
+                }
             }
         }
 

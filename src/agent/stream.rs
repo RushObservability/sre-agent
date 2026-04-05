@@ -32,7 +32,11 @@ pub enum AgentEvent {
     #[serde(rename = "error")]
     Error { message: String },
     #[serde(rename = "done")]
-    Done { rounds: u32, prompt_tokens: u64, completion_tokens: u64 },
+    Done {
+        rounds: u32,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+    },
 }
 
 impl AgentEvent {
@@ -61,7 +65,9 @@ mod tests {
 
     #[test]
     fn thinking_delta_serializes() {
-        let out = as_string(AgentEvent::ThinkingDelta { text: "hello".into() });
+        let out = as_string(AgentEvent::ThinkingDelta {
+            text: "hello".into(),
+        });
         assert!(out.contains(r#""type":"thinking_delta""#));
         assert!(out.contains(r#""text":"hello""#));
     }

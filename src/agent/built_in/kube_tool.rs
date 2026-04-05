@@ -9,7 +9,9 @@ pub struct KubeDescribe;
 
 #[async_trait::async_trait]
 impl Tool for KubeDescribe {
-    fn name(&self) -> &str { "kube_describe" }
+    fn name(&self) -> &str {
+        "kube_describe"
+    }
 
     fn description(&self) -> &str {
         "Describe a Kubernetes resource to see its full status, conditions, events, and configuration. \
@@ -39,7 +41,11 @@ impl Tool for KubeDescribe {
     }
 
     async fn execute(&self, args: Value, _ctx: &ToolContext) -> Result<String> {
-        let kind = args.get("kind").and_then(|v| v.as_str()).unwrap_or("pod").to_lowercase();
+        let kind = args
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .unwrap_or("pod")
+            .to_lowercase();
         let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
         let namespace = args.get("namespace").and_then(|v| v.as_str()).unwrap_or("");
 
@@ -59,7 +65,9 @@ impl Tool for KubeDescribe {
             "event" | "events" => ("", "v1", "events"),
             "node" | "nodes" => ("", "v1", "nodes"),
             "namespace" | "ns" | "namespaces" => ("", "v1", "namespaces"),
-            "pvc" | "persistentvolumeclaim" | "persistentvolumeclaims" => ("", "v1", "persistentvolumeclaims"),
+            "pvc" | "persistentvolumeclaim" | "persistentvolumeclaims" => {
+                ("", "v1", "persistentvolumeclaims")
+            }
             "sa" | "serviceaccount" | "serviceaccounts" => ("", "v1", "serviceaccounts"),
             "endpoint" | "endpoints" => ("", "v1", "endpoints"),
             "deployment" | "deploy" | "deployments" => ("apps", "v1", "deployments"),
@@ -70,18 +78,29 @@ impl Tool for KubeDescribe {
             "cronjob" | "cj" | "cronjobs" => ("batch", "v1", "cronjobs"),
             "ingress" | "ing" | "ingresses" => ("networking.k8s.io", "v1", "ingresses"),
             "hpa" | "horizontalpodautoscaler" => ("autoscaling", "v2", "horizontalpodautoscalers"),
-            _ => return Ok(format!("Unknown resource kind: '{kind}'. Supported: pod, deployment, replicaset, service, event, configmap, node, job, statefulset, daemonset, ingress, hpa, pvc")),
+            _ => {
+                return Ok(format!(
+                    "Unknown resource kind: '{kind}'. Supported: pod, deployment, replicaset, service, event, configmap, node, job, statefulset, daemonset, ingress, hpa, pvc"
+                ));
+            }
         };
 
         let ar = ApiResource {
             group: api_group.into(),
             version: api_version.into(),
             kind: kind.clone(),
-            api_version: if api_group.is_empty() { api_version.into() } else { format!("{api_group}/{api_version}") },
+            api_version: if api_group.is_empty() {
+                api_version.into()
+            } else {
+                format!("{api_group}/{api_version}")
+            },
             plural: plural.into(),
         };
 
-        let is_cluster_scoped = matches!(kind.as_str(), "node" | "nodes" | "namespace" | "ns" | "namespaces");
+        let is_cluster_scoped = matches!(
+            kind.as_str(),
+            "node" | "nodes" | "namespace" | "ns" | "namespaces"
+        );
 
         // List mode
         if name == "*" {
@@ -97,22 +116,49 @@ impl Tool for KubeDescribe {
             };
 
             if list.items.is_empty() {
-                return Ok(format!("No {plural} found{}", if !namespace.is_empty() { format!(" in namespace '{namespace}'") } else { String::new() }));
+                return Ok(format!(
+                    "No {plural} found{}",
+                    if !namespace.is_empty() {
+                        format!(" in namespace '{namespace}'")
+                    } else {
+                        String::new()
+                    }
+                ));
             }
 
-            let mut out = format!("Found {} {plural}{}:\n", list.items.len(), if !namespace.is_empty() { format!(" in {namespace}") } else { String::new() });
+            let mut out = format!(
+                "Found {} {plural}{}:\n",
+                list.items.len(),
+                if !namespace.is_empty() {
+                    format!(" in {namespace}")
+                } else {
+                    String::new()
+                }
+            );
             for obj in &list.items {
                 let n = obj.metadata.name.as_deref().unwrap_or("?");
                 let ns = obj.metadata.namespace.as_deref().unwrap_or("");
                 // Try to extract status info
-                let phase = obj.data.pointer("/status/phase").and_then(|v| v.as_str()).unwrap_or("");
+                let phase = obj
+                    .data
+                    .pointer("/status/phase")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 let ready = extract_ready_status(&obj.data);
                 let age = extract_age(&obj.metadata);
                 out.push_str(&format!("  {n}"));
-                if !ns.is_empty() { out.push_str(&format!("  (ns: {ns})")); }
-                if !phase.is_empty() { out.push_str(&format!("  {phase}")); }
-                if !ready.is_empty() { out.push_str(&format!("  {ready}")); }
-                if !age.is_empty() { out.push_str(&format!("  age: {age}")); }
+                if !ns.is_empty() {
+                    out.push_str(&format!("  (ns: {ns})"));
+                }
+                if !phase.is_empty() {
+                    out.push_str(&format!("  {phase}"));
+                }
+                if !ready.is_empty() {
+                    out.push_str(&format!("  {ready}"));
+                }
+                if !age.is_empty() {
+                    out.push_str(&format!("  age: {age}"));
+                }
                 out.push('\n');
             }
             return Ok(out);
@@ -129,11 +175,22 @@ impl Tool for KubeDescribe {
 
         let obj = match api.get(name).await {
             Ok(o) => o,
-            Err(e) => return Ok(format!("{kind} '{name}' not found{}: {e}", if !namespace.is_empty() { format!(" in namespace '{namespace}'") } else { String::new() })),
+            Err(e) => {
+                return Ok(format!(
+                    "{kind} '{name}' not found{}: {e}",
+                    if !namespace.is_empty() {
+                        format!(" in namespace '{namespace}'")
+                    } else {
+                        String::new()
+                    }
+                ));
+            }
         };
 
         let mut out = format!("{kind}/{name}");
-        if !namespace.is_empty() { out.push_str(&format!(" (namespace: {namespace})")); }
+        if !namespace.is_empty() {
+            out.push_str(&format!(" (namespace: {namespace})"));
+        }
         out.push('\n');
 
         // Format based on resource type
@@ -149,7 +206,10 @@ impl Tool for KubeDescribe {
         }
 
         // Also fetch events for this resource
-        if !is_cluster_scoped && !namespace.is_empty() && !matches!(kind.as_str(), "event" | "events") {
+        if !is_cluster_scoped
+            && !namespace.is_empty()
+            && !matches!(kind.as_str(), "event" | "events")
+        {
             let events_ar = ApiResource {
                 group: String::new(),
                 version: "v1".into(),
@@ -157,12 +217,17 @@ impl Tool for KubeDescribe {
                 api_version: "v1".into(),
                 plural: "events".into(),
             };
-            let events_api: Api<DynamicObject> = Api::namespaced_with(client, namespace, &events_ar);
+            let events_api: Api<DynamicObject> =
+                Api::namespaced_with(client, namespace, &events_ar);
             if let Ok(event_list) = events_api.list(&ListParams::default()).await {
-                let related: Vec<_> = event_list.items.iter().filter(|e| {
-                    let involved = &e.data["involvedObject"];
-                    involved["name"].as_str() == Some(name)
-                }).collect();
+                let related: Vec<_> = event_list
+                    .items
+                    .iter()
+                    .filter(|e| {
+                        let involved = &e.data["involvedObject"];
+                        involved["name"].as_str() == Some(name)
+                    })
+                    .collect();
                 if !related.is_empty() {
                     out.push_str(&format!("\nEvents ({}):\n", related.len()));
                     for ev in related.iter().rev().take(15) {
@@ -172,9 +237,13 @@ impl Tool for KubeDescribe {
                         let count = ev.data["count"].as_u64().unwrap_or(1);
                         let last = ev.data["lastTimestamp"].as_str().unwrap_or("");
                         out.push_str(&format!("  [{etype}] {reason}"));
-                        if count > 1 { out.push_str(&format!(" (x{count})")); }
+                        if count > 1 {
+                            out.push_str(&format!(" (x{count})"));
+                        }
                         out.push_str(&format!(": {msg}"));
-                        if !last.is_empty() { out.push_str(&format!("  ({last})")); }
+                        if !last.is_empty() {
+                            out.push_str(&format!("  ({last})"));
+                        }
                         out.push('\n');
                     }
                 }
@@ -190,7 +259,9 @@ pub struct KubeEvents;
 
 #[async_trait::async_trait]
 impl Tool for KubeEvents {
-    fn name(&self) -> &str { "kube_events" }
+    fn name(&self) -> &str {
+        "kube_events"
+    }
 
     fn description(&self) -> &str {
         "List Kubernetes events in a namespace. Events reveal why pods fail, deployments stall, \
@@ -220,8 +291,14 @@ impl Tool for KubeEvents {
 
     async fn execute(&self, args: Value, _ctx: &ToolContext) -> Result<String> {
         let namespace = args.get("namespace").and_then(|v| v.as_str()).unwrap_or("");
-        let resource_name = args.get("resource_name").and_then(|v| v.as_str()).unwrap_or("");
-        let warnings_only = args.get("warnings_only").and_then(|v| v.as_bool()).unwrap_or(false);
+        let resource_name = args
+            .get("resource_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let warnings_only = args
+            .get("warnings_only")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         if namespace.is_empty() {
             return Ok("'namespace' is required.".to_string());
@@ -246,16 +323,23 @@ impl Tool for KubeEvents {
             Err(e) => return Ok(format!("Failed to list events: {e}")),
         };
 
-        let mut events: Vec<&DynamicObject> = list.items.iter().filter(|e| {
-            if !resource_name.is_empty() {
-                let name_match = e.data["involvedObject"]["name"].as_str() == Some(resource_name);
-                if !name_match { return false; }
-            }
-            if warnings_only {
-                return e.data["type"].as_str() == Some("Warning");
-            }
-            true
-        }).collect();
+        let mut events: Vec<&DynamicObject> = list
+            .items
+            .iter()
+            .filter(|e| {
+                if !resource_name.is_empty() {
+                    let name_match =
+                        e.data["involvedObject"]["name"].as_str() == Some(resource_name);
+                    if !name_match {
+                        return false;
+                    }
+                }
+                if warnings_only {
+                    return e.data["type"].as_str() == Some("Warning");
+                }
+                true
+            })
+            .collect();
 
         // Sort by lastTimestamp descending
         events.sort_by(|a, b| {
@@ -265,11 +349,20 @@ impl Tool for KubeEvents {
         });
 
         if events.is_empty() {
-            return Ok(format!("No events found in namespace '{namespace}'{}", if !resource_name.is_empty() { format!(" for '{resource_name}'") } else { String::new() }));
+            return Ok(format!(
+                "No events found in namespace '{namespace}'{}",
+                if !resource_name.is_empty() {
+                    format!(" for '{resource_name}'")
+                } else {
+                    String::new()
+                }
+            ));
         }
 
         let mut out = format!("Events in {namespace}");
-        if !resource_name.is_empty() { out.push_str(&format!(" for '{resource_name}'")); }
+        if !resource_name.is_empty() {
+            out.push_str(&format!(" for '{resource_name}'"));
+        }
         out.push_str(&format!(" ({} events):\n", events.len().min(30)));
 
         for ev in events.iter().take(30) {
@@ -282,9 +375,18 @@ impl Tool for KubeEvents {
             let obj_name = ev.data["involvedObject"]["name"].as_str().unwrap_or("");
 
             out.push_str(&format!("  [{etype}] {obj_kind}/{obj_name}: {reason}"));
-            if count > 1 { out.push_str(&format!(" (x{count})")); }
-            if !msg.is_empty() { out.push_str(&format!(" — {}", if msg.len() > 200 { &msg[..200] } else { msg })); }
-            if !last.is_empty() { out.push_str(&format!("  ({last})")); }
+            if count > 1 {
+                out.push_str(&format!(" (x{count})"));
+            }
+            if !msg.is_empty() {
+                out.push_str(&format!(
+                    " — {}",
+                    if msg.len() > 200 { &msg[..200] } else { msg }
+                ));
+            }
+            if !last.is_empty() {
+                out.push_str(&format!("  ({last})"));
+            }
             out.push('\n');
         }
 
@@ -297,7 +399,10 @@ impl Tool for KubeEvents {
 // ---------------------------------------------------------------------------
 
 fn extract_ready_status(data: &Value) -> String {
-    if let Some(conditions) = data.pointer("/status/conditions").and_then(|v| v.as_array()) {
+    if let Some(conditions) = data
+        .pointer("/status/conditions")
+        .and_then(|v| v.as_array())
+    {
         for c in conditions {
             if c["type"].as_str() == Some("Ready") {
                 let status = c["status"].as_str().unwrap_or("?");
@@ -307,7 +412,8 @@ fn extract_ready_status(data: &Value) -> String {
     }
     // For deployments: ready/total replicas
     if let (Some(ready), Some(desired)) = (
-        data.pointer("/status/readyReplicas").and_then(|v| v.as_u64()),
+        data.pointer("/status/readyReplicas")
+            .and_then(|v| v.as_u64()),
         data.pointer("/status/replicas").and_then(|v| v.as_u64()),
     ) {
         return format!("{ready}/{desired} ready");
@@ -320,9 +426,15 @@ fn extract_age(meta: &kube::api::ObjectMeta) -> String {
         let created = ts.0;
         let now = chrono::Utc::now();
         let dur = now.signed_duration_since(created);
-        if dur.num_days() > 0 { return format!("{}d", dur.num_days()); }
-        if dur.num_hours() > 0 { return format!("{}h", dur.num_hours()); }
-        if dur.num_minutes() > 0 { return format!("{}m", dur.num_minutes()); }
+        if dur.num_days() > 0 {
+            return format!("{}d", dur.num_days());
+        }
+        if dur.num_hours() > 0 {
+            return format!("{}h", dur.num_hours());
+        }
+        if dur.num_minutes() > 0 {
+            return format!("{}m", dur.num_minutes());
+        }
         return format!("{}s", dur.num_seconds());
     }
     String::new()
@@ -349,36 +461,62 @@ fn format_pod(data: &Value, out: &mut String) {
             let restarts = c["restartCount"].as_u64().unwrap_or(0);
             let image = c["image"].as_str().unwrap_or("?");
 
-            out.push_str(&format!("  {name}: ready={ready} restarts={restarts} image={image}\n"));
+            out.push_str(&format!(
+                "  {name}: ready={ready} restarts={restarts} image={image}\n"
+            ));
 
             // Waiting state (most important for debugging)
             if let Some(waiting) = c["state"]["waiting"].as_object() {
-                let reason = waiting.get("reason").and_then(|v| v.as_str()).unwrap_or("?");
-                let msg = waiting.get("message").and_then(|v| v.as_str()).unwrap_or("");
+                let reason = waiting
+                    .get("reason")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                let msg = waiting
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 out.push_str(&format!("    WAITING: {reason}"));
-                if !msg.is_empty() { out.push_str(&format!(" — {}", if msg.len() > 300 { &msg[..300] } else { msg })); }
+                if !msg.is_empty() {
+                    out.push_str(&format!(
+                        " — {}",
+                        if msg.len() > 300 { &msg[..300] } else { msg }
+                    ));
+                }
                 out.push('\n');
             }
 
             // Terminated state
             if let Some(terminated) = c["state"]["terminated"].as_object() {
-                let reason = terminated.get("reason").and_then(|v| v.as_str()).unwrap_or("?");
-                let exit_code = terminated.get("exitCode").and_then(|v| v.as_i64()).unwrap_or(-1);
-                out.push_str(&format!("    TERMINATED: {reason} (exit code: {exit_code})\n"));
+                let reason = terminated
+                    .get("reason")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                let exit_code = terminated
+                    .get("exitCode")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(-1);
+                out.push_str(&format!(
+                    "    TERMINATED: {reason} (exit code: {exit_code})\n"
+                ));
             }
 
             // Last terminated (for crash loops)
             if let Some(last) = c["lastState"]["terminated"].as_object() {
                 let reason = last.get("reason").and_then(|v| v.as_str()).unwrap_or("?");
                 let exit_code = last.get("exitCode").and_then(|v| v.as_i64()).unwrap_or(-1);
-                out.push_str(&format!("    LAST TERMINATED: {reason} (exit code: {exit_code})\n"));
+                out.push_str(&format!(
+                    "    LAST TERMINATED: {reason} (exit code: {exit_code})\n"
+                ));
             }
         }
     }
 
     // Conditions
     if let Some(conditions) = status["conditions"].as_array() {
-        let non_true: Vec<_> = conditions.iter().filter(|c| c["status"].as_str() != Some("True")).collect();
+        let non_true: Vec<_> = conditions
+            .iter()
+            .filter(|c| c["status"].as_str() != Some("True"))
+            .collect();
         if !non_true.is_empty() {
             out.push_str("\nFailing Conditions:\n");
             for c in non_true {
@@ -386,7 +524,9 @@ fn format_pod(data: &Value, out: &mut String) {
                 let reason = c["reason"].as_str().unwrap_or("");
                 let msg = c["message"].as_str().unwrap_or("");
                 out.push_str(&format!("  {ctype}: {reason}"));
-                if !msg.is_empty() { out.push_str(&format!(" — {msg}")); }
+                if !msg.is_empty() {
+                    out.push_str(&format!(" — {msg}"));
+                }
                 out.push('\n');
             }
         }
@@ -402,7 +542,9 @@ fn format_deployment(data: &Value, out: &mut String) {
     let available = status["availableReplicas"].as_u64().unwrap_or(0);
     let updated = status["updatedReplicas"].as_u64().unwrap_or(0);
 
-    out.push_str(&format!("Replicas: {ready}/{replicas} ready, {available} available, {updated} updated\n"));
+    out.push_str(&format!(
+        "Replicas: {ready}/{replicas} ready, {available} available, {updated} updated\n"
+    ));
 
     // Strategy
     if let Some(strategy) = spec["strategy"]["type"].as_str() {
@@ -418,13 +560,18 @@ fn format_deployment(data: &Value, out: &mut String) {
             let reason = c["reason"].as_str().unwrap_or("");
             let msg = c["message"].as_str().unwrap_or("");
             out.push_str(&format!("  {ctype}={cstatus} ({reason})"));
-            if !msg.is_empty() { out.push_str(&format!(": {msg}")); }
+            if !msg.is_empty() {
+                out.push_str(&format!(": {msg}"));
+            }
             out.push('\n');
         }
     }
 
     // Container images
-    if let Some(containers) = spec.pointer("/template/spec/containers").and_then(|v| v.as_array()) {
+    if let Some(containers) = spec
+        .pointer("/template/spec/containers")
+        .and_then(|v| v.as_array())
+    {
         out.push_str("\nContainers:\n");
         for c in containers {
             let name = c["name"].as_str().unwrap_or("?");
@@ -447,8 +594,15 @@ fn format_generic(data: &Value, out: &mut String) {
                     let reason = c["reason"].as_str().unwrap_or("");
                     let msg = c["message"].as_str().unwrap_or("");
                     out.push_str(&format!("  {ctype}={cstatus}"));
-                    if !reason.is_empty() { out.push_str(&format!(" ({reason})")); }
-                    if !msg.is_empty() { out.push_str(&format!(": {}", if msg.len() > 200 { &msg[..200] } else { msg })); }
+                    if !reason.is_empty() {
+                        out.push_str(&format!(" ({reason})"));
+                    }
+                    if !msg.is_empty() {
+                        out.push_str(&format!(
+                            ": {}",
+                            if msg.len() > 200 { &msg[..200] } else { msg }
+                        ));
+                    }
                     out.push('\n');
                 }
             }

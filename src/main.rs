@@ -43,9 +43,10 @@ async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
 
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-            EnvFilter::new("sre_agent=debug,tower_http=debug")
-        }))
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("sre_agent=debug,tower_http=debug")),
+        )
         .init();
 
     let clickhouse_url =
@@ -130,9 +131,8 @@ async fn investigate(
     // server restart. Prefers HTTP fetch from query-api (single source of
     // truth) when QUERY_API_URL is configured; falls back to the local
     // config_db otherwise.
-    let skill_store = Arc::new(
-        SkillStore::load_unified(&state.config_db, state.query_api_url.as_deref()).await,
-    );
+    let skill_store =
+        Arc::new(SkillStore::load_unified(&state.config_db, state.query_api_url.as_deref()).await);
 
     // Build the user turn that starts or continues the investigation.
     let user_content = if !req.event_id.is_empty() {
@@ -204,7 +204,11 @@ async fn investigate(
     // Spawn the agent loop in a background task
     tokio::spawn(async move {
         if let Err(e) = agent::loop_runner::run(messages, &registry, &tool_ctx, &tx).await {
-            let _ = tx.send(AgentEvent::Error { message: e.to_string() }).await;
+            let _ = tx
+                .send(AgentEvent::Error {
+                    message: e.to_string(),
+                })
+                .await;
         }
     });
 

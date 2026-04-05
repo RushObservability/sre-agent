@@ -383,7 +383,10 @@ mod tests {
         ];
         for (key, skill) in all_skills() {
             let mentions_any = tool_names.iter().any(|t| skill.content.contains(t));
-            assert!(mentions_any, "skill {key} does not reference any agent tool");
+            assert!(
+                mentions_any,
+                "skill {key} does not reference any agent tool"
+            );
         }
     }
 

@@ -17,7 +17,9 @@ struct ServiceRow {
 
 #[async_trait::async_trait]
 impl Tool for ListServices {
-    fn name(&self) -> &str { "list_services" }
+    fn name(&self) -> &str {
+        "list_services"
+    }
 
     fn description(&self) -> &str {
         "List all services with their request count, error count, and latency. \
@@ -59,13 +61,19 @@ impl Tool for ListServices {
         }
 
         let mut out = format!("Services in last {minutes}m:\n\n");
-        out.push_str(&format!("{:<25} {:>8} {:>8} {:>6} {:>10} {:>10}\n",
-            "Service", "Requests", "Errors", "Err%", "p50(ms)", "p99(ms)"));
+        out.push_str(&format!(
+            "{:<25} {:>8} {:>8} {:>6} {:>10} {:>10}\n",
+            "Service", "Requests", "Errors", "Err%", "p50(ms)", "p99(ms)"
+        ));
         out.push_str(&"-".repeat(75));
         out.push('\n');
 
         for r in &rows {
-            let err_pct = if r.total > 0 { (r.errors as f64 / r.total as f64) * 100.0 } else { 0.0 };
+            let err_pct = if r.total > 0 {
+                (r.errors as f64 / r.total as f64) * 100.0
+            } else {
+                0.0
+            };
             out.push_str(&format!(
                 "{:<25} {:>8} {:>8} {:>5.1}% {:>10.1} {:>10.1}\n",
                 r.service_name, r.total, r.errors, err_pct, r.p50_ms, r.p99_ms
@@ -87,7 +95,9 @@ struct DepRow {
 
 #[async_trait::async_trait]
 impl Tool for ServiceDependencies {
-    fn name(&self) -> &str { "service_dependencies" }
+    fn name(&self) -> &str {
+        "service_dependencies"
+    }
 
     fn description(&self) -> &str {
         "Get the dependency graph showing which services call which other services. \
@@ -120,9 +130,7 @@ impl Tool for ServiceDependencies {
         ];
         if !service.is_empty() {
             let safe = service.replace('\'', "''");
-            conditions.push(format!(
-                "(caller = '{safe}' OR callee = '{safe}')"
-            ));
+            conditions.push(format!("(caller = '{safe}' OR callee = '{safe}')"));
         }
 
         // Join wide_events with itself on parent_span_id to find cross-service calls
@@ -148,7 +156,10 @@ impl Tool for ServiceDependencies {
 
         let mut out = format!("Service dependencies (last {minutes}m):\n\n");
         for r in &rows {
-            out.push_str(&format!("  {} → {} ({} calls)\n", r.caller, r.callee, r.call_count));
+            out.push_str(&format!(
+                "  {} → {} ({} calls)\n",
+                r.caller, r.callee, r.call_count
+            ));
         }
         Ok(out)
     }

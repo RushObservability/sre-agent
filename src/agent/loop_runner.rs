@@ -436,15 +436,15 @@ async fn parse_streaming_response(
                 None => continue,
             };
 
-            if let Some(text) = delta.get("content").and_then(|v| v.as_str()) {
-                if !text.is_empty() {
-                    content.push_str(text);
-                    let _ = tx
-                        .send(AgentEvent::ThinkingDelta {
-                            text: text.to_string(),
-                        })
-                        .await;
-                }
+            if let Some(text) = delta.get("content").and_then(|v| v.as_str())
+                && !text.is_empty()
+            {
+                content.push_str(text);
+                let _ = tx
+                    .send(AgentEvent::ThinkingDelta {
+                        text: text.to_string(),
+                    })
+                    .await;
             }
 
             if let Some(tcs) = delta.get("tool_calls").and_then(|v| v.as_array()) {

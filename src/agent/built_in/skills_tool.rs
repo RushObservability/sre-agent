@@ -109,6 +109,8 @@ mod tests {
                 query_api_url: None,
             },
             skill_store,
+            tenant_id: "default".to_string(),
+            scopes: vec!["all".to_string()],
         }
     }
 

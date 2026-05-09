@@ -61,6 +61,9 @@ impl Tool for QueryTraces {
     }
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String> {
+        if !ctx.has_scope("traces") {
+            return Ok("Access denied: your account does not have permission to query traces. Try a different investigation approach using tools you have access to.".to_string());
+        }
         let service = args.get("service").and_then(|v| v.as_str()).unwrap_or("");
         let status = args.get("status").and_then(|v| v.as_str()).unwrap_or("");
         let around = args.get("around").and_then(|v| v.as_str()).unwrap_or("");
@@ -70,6 +73,8 @@ impl Tool for QueryTraces {
             .and_then(|v| v.as_u64())
             .unwrap_or(20)
             .min(100);
+
+        let tenant_id = ctx.tenant_id.replace('\'', "\\'");
 
         let mut conditions = if !around.is_empty() {
             let ts = around
@@ -84,6 +89,7 @@ impl Tool for QueryTraces {
         } else {
             vec![format!("timestamp >= now() - INTERVAL {minutes} MINUTE")]
         };
+        conditions.push(format!("tenant_id = '{tenant_id}'"));
         if !service.is_empty() {
             conditions.push(format!("service_name = '{}'", service.replace('\'', "''")));
         }
@@ -104,7 +110,7 @@ impl Tool for QueryTraces {
              LIMIT {limit}"
         );
 
-        let rows: Vec<TraceRow> = ctx.state.ch.query(&query).fetch_all().await?;
+        let rows: Vec<TraceRow> = ctx.state.ch.query(&query).with_option("rush_tenant_id", &ctx.tenant_id).fetch_all().await?;
 
         if rows.is_empty() {
             return Ok("No matching spans found.".to_string());
@@ -226,10 +232,15 @@ impl Tool for GetTrace {
     }
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String> {
+        if !ctx.has_scope("traces") {
+            return Ok("Access denied: your account does not have permission to query traces. Try a different investigation approach using tools you have access to.".to_string());
+        }
         let trace_id = args
             .get("trace_id")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("trace_id is required"))?;
+
+        let tenant_id = ctx.tenant_id.replace('\'', "\\'");
 
         let query = format!(
             "SELECT span_id, parent_span_id, service_name, http_method, http_path, \
@@ -237,11 +248,12 @@ impl Tool for GetTrace {
                     toString(timestamp) AS ts_str \
              FROM wide_events \
              WHERE trace_id = '{}' \
+               AND tenant_id = '{tenant_id}' \
              ORDER BY timestamp ASC",
             trace_id.replace('\'', "''")
         );
 
-        let rows: Vec<SpanRow> = ctx.state.ch.query(&query).fetch_all().await?;
+        let rows: Vec<SpanRow> = ctx.state.ch.query(&query).with_option("rush_tenant_id", &ctx.tenant_id).fetch_all().await?;
 
         if rows.is_empty() {
             return Ok(format!("No spans found for trace {trace_id}"));

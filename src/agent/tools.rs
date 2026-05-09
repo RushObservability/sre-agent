@@ -12,6 +12,22 @@ pub struct ToolContext {
     /// Built fresh per investigation so edits to custom skills are picked up
     /// on the next invocation.
     pub skill_store: Arc<SkillStore>,
+    /// Tenant ID for multi-tenant ClickHouse query scoping. Every ClickHouse
+    /// query will include `AND tenant_id = '{tenant_id}'` to restrict results
+    /// to the caller's tenant.
+    pub tenant_id: String,
+    /// Scopes the caller has access to (e.g., ["logs", "traces", "metrics"] or ["all"]).
+    /// Tools that query signals outside these scopes return a friendly error
+    /// instead of data.
+    pub scopes: Vec<String>,
+}
+
+impl ToolContext {
+    /// Returns true if the caller has access to the given signal type.
+    /// The "all" scope grants access to everything.
+    pub fn has_scope(&self, signal: &str) -> bool {
+        self.scopes.iter().any(|s| s == "all" || s == signal)
+    }
 }
 
 /// A tool the agent can invoke.
@@ -122,6 +138,8 @@ mod tests {
                 query_api_url: None,
             },
             skill_store,
+            tenant_id: "default".to_string(),
+            scopes: vec!["all".to_string()],
         }
     }
 

@@ -53,6 +53,9 @@ impl Tool for QueryMetrics {
     }
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String> {
+        if !ctx.has_scope("metrics") {
+            return Ok("Access denied: your account does not have permission to query metrics. Try a different investigation approach using tools you have access to.".to_string());
+        }
         let service = args.get("service").and_then(|v| v.as_str()).unwrap_or("");
         let metric = args
             .get("metric")
@@ -64,6 +67,8 @@ impl Tool for QueryMetrics {
             .unwrap_or("");
         let around = args.get("around").and_then(|v| v.as_str()).unwrap_or("");
         let minutes = args.get("minutes").and_then(|v| v.as_u64()).unwrap_or(30);
+
+        let tenant_id = ctx.tenant_id.replace('\'', "\\'");
 
         // Normalize ISO timestamp for ClickHouse: strip Z, replace T with space
         let ch_ts = if !around.is_empty() {
@@ -79,19 +84,19 @@ impl Tool for QueryMetrics {
         // Build time filter for wide_events (DateTime64 timestamp column)
         let time_filter = if !around.is_empty() {
             format!(
-                "timestamp >= toDateTime64('{ch_ts}', 9) - INTERVAL 5 MINUTE AND timestamp <= toDateTime64('{ch_ts}', 9) + INTERVAL 5 MINUTE"
+                "tenant_id = '{tenant_id}' AND timestamp >= toDateTime64('{ch_ts}', 9) - INTERVAL 5 MINUTE AND timestamp <= toDateTime64('{ch_ts}', 9) + INTERVAL 5 MINUTE"
             )
         } else {
-            format!("timestamp >= now() - INTERVAL {minutes} MINUTE")
+            format!("tenant_id = '{tenant_id}' AND timestamp >= now() - INTERVAL {minutes} MINUTE")
         };
 
         // Build time filter for otel_metrics tables (TimeUnix column)
         let otel_time_filter = if !around.is_empty() {
             format!(
-                "TimeUnix >= toDateTime64('{ch_ts}', 9) - INTERVAL 5 MINUTE AND TimeUnix <= toDateTime64('{ch_ts}', 9) + INTERVAL 5 MINUTE"
+                "tenant_id = '{tenant_id}' AND TimeUnix >= toDateTime64('{ch_ts}', 9) - INTERVAL 5 MINUTE AND TimeUnix <= toDateTime64('{ch_ts}', 9) + INTERVAL 5 MINUTE"
             )
         } else {
-            format!("TimeUnix >= now() - INTERVAL {minutes} MINUTE")
+            format!("tenant_id = '{tenant_id}' AND TimeUnix >= now() - INTERVAL {minutes} MINUTE")
         };
 
         let time_desc = if !around.is_empty() {
@@ -164,7 +169,7 @@ impl Tool for QueryMetrics {
             return Ok("Provide either 'service' + 'metric' or 'metric_name'.".to_string());
         };
 
-        let rows: Vec<MetricRow> = ctx.state.ch.query(&query).fetch_all().await?;
+        let rows: Vec<MetricRow> = ctx.state.ch.query(&query).with_option("rush_tenant_id", &ctx.tenant_id).fetch_all().await?;
 
         if rows.is_empty() {
             return Ok(format!("No data for {label} ({time_desc})."));

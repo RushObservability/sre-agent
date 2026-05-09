@@ -5,7 +5,12 @@ use crate::models::anomaly::{AnomalyEvent, AnomalyRule};
 /// `skill_catalog` is the rendered catalog block produced by
 /// `SkillStore::catalog()` — it lists every built-in and custom skill
 /// available to this investigation, so the model can decide which to load.
-pub fn system_prompt(skill_catalog: &str) -> String {
+///
+/// `scopes` lists the signal types the caller has access to (e.g.,
+/// `["logs", "traces"]` or `["all"]`). The prompt tells the model which
+/// signals are in scope so it avoids calling tools that will be denied.
+pub fn system_prompt(skill_catalog: &str, scopes: &[String]) -> String {
+    let scopes_display = scopes.join(", ");
     format!(
         r#"<PERSISTENCE>
 You have abundant context window and tool budget. Do NOT rush to conclude.
@@ -16,6 +21,11 @@ Preliminary findings are acceptable; fabricated conclusions are not.
 
 You are an expert SRE investigation agent for the Rush Observability platform.
 You diagnose production incidents by querying traces, logs, metrics, deploy history, and service topology.
+
+## SIGNAL SCOPES
+Your investigation is scoped to these signal types: {scopes_display}.
+Do not attempt to use tools for signals outside your scope — they will be denied.
+Plan your investigation strategy around the signals you have access to.
 
 ## INVESTIGATION METHODOLOGY
 
@@ -251,9 +261,13 @@ mod tests {
             .to_string()
     }
 
+    fn all_scopes() -> Vec<String> {
+        vec!["all".to_string()]
+    }
+
     #[test]
     fn system_prompt_contains_all_key_sections() {
-        let p = system_prompt(&sample_catalog());
+        let p = system_prompt(&sample_catalog(), &all_scopes());
         assert!(p.contains("INVESTIGATION METHODOLOGY"));
         assert!(p.contains("WORKING MEMORY"));
         assert!(p.contains("REPEAT DETECTION"));
@@ -261,11 +275,20 @@ mod tests {
         assert!(p.contains("AVAILABLE SKILLS"));
         assert!(p.contains("TIME CONTEXT"));
         assert!(p.contains("PERSISTENCE"));
+        assert!(p.contains("SIGNAL SCOPES"));
+    }
+
+    #[test]
+    fn system_prompt_includes_scopes() {
+        let scopes = vec!["logs".to_string(), "traces".to_string()];
+        let p = system_prompt(&sample_catalog(), &scopes);
+        assert!(p.contains("logs, traces"));
+        assert!(p.contains("SIGNAL SCOPES"));
     }
 
     #[test]
     fn system_prompt_includes_catalog_text() {
-        let p = system_prompt(&sample_catalog());
+        let p = system_prompt(&sample_catalog(), &all_scopes());
         for skill in [
             "error_rate_spike",
             "latency_degradation",
@@ -283,7 +306,7 @@ mod tests {
 
     #[test]
     fn system_prompt_has_persistence_at_top_and_bottom() {
-        let p = system_prompt(&sample_catalog());
+        let p = system_prompt(&sample_catalog(), &all_scopes());
         // Should appear twice — open tag at top and bottom
         let count = p.matches("<PERSISTENCE>").count();
         assert_eq!(count, 2, "expected PERSISTENCE block at top and bottom");
@@ -291,7 +314,7 @@ mod tests {
 
     #[test]
     fn system_prompt_has_no_scarcity_language() {
-        let p = system_prompt(&sample_catalog());
+        let p = system_prompt(&sample_catalog(), &all_scopes());
         // The prompt should not expose any hard tool-step budgets to the
         // model — abundance framing is fine, scarcity numbers are not.
         assert!(!p.contains("max 25"));
@@ -303,7 +326,7 @@ mod tests {
     #[test]
     fn system_prompt_is_substantial() {
         // A short system prompt is a sign of broken code
-        assert!(system_prompt(&sample_catalog()).len() > 2000);
+        assert!(system_prompt(&sample_catalog(), &all_scopes()).len() > 2000);
     }
 
     #[test]

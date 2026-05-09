@@ -1,13 +1,14 @@
 use serde::Serialize;
 
-/// Whether an investigation report is a final root-cause analysis or a
-/// preliminary set of findings with open questions for the user to follow
-/// up on.
+/// Whether an investigation report is a final root-cause analysis, a
+/// preliminary set of findings with open questions, or a clarifying
+/// question the agent is posing back to the user.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ReportKind {
     Final,
     Preliminary,
+    Question,
 }
 
 /// Events sent over the SSE stream during an investigation.
@@ -31,11 +32,16 @@ pub enum AgentEvent {
     },
     #[serde(rename = "error")]
     Error { message: String },
+    #[serde(rename = "session_created")]
+    SessionCreated {
+        session_id: String,
+    },
     #[serde(rename = "done")]
     Done {
         rounds: u32,
         prompt_tokens: u64,
         completion_tokens: u64,
+        session_id: String,
     },
 }
 
@@ -99,11 +105,13 @@ mod tests {
             rounds: 5,
             prompt_tokens: 1000,
             completion_tokens: 500,
+            session_id: "sess_abc".into(),
         });
         assert!(out.contains(r#""type":"done""#));
         assert!(out.contains(r#""rounds":5"#));
         assert!(out.contains(r#""prompt_tokens":1000"#));
         assert!(out.contains(r#""completion_tokens":500"#));
+        assert!(out.contains(r#""session_id":"sess_abc""#));
     }
 
     #[test]
@@ -132,5 +140,23 @@ mod tests {
             kind: ReportKind::Preliminary,
         });
         assert!(out.contains(r#""kind":"preliminary""#));
+    }
+
+    #[test]
+    fn summary_event_question_serializes_kind() {
+        let out = as_string(AgentEvent::Summary {
+            text: "Which service should I investigate first?".into(),
+            kind: ReportKind::Question,
+        });
+        assert!(out.contains(r#""kind":"question""#));
+    }
+
+    #[test]
+    fn session_created_event() {
+        let out = as_string(AgentEvent::SessionCreated {
+            session_id: "sess_xyz".into(),
+        });
+        assert!(out.contains(r#""type":"session_created""#));
+        assert!(out.contains(r#""session_id":"sess_xyz""#));
     }
 }

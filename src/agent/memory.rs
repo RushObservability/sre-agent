@@ -1,16 +1,22 @@
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
 /// Working memory — distilled facts that survive aggressive transcript compaction.
 /// Based on Raschka's two-layer memory pattern: transcript is for prompt reconstruction,
 /// working memory is for task continuity.
-#[derive(Debug, Default)]
+///
+/// Serializable to JSON so it can be persisted across investigation turns in the
+/// `investigation_sessions.working_memory` column.
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct WorkingMemory {
     pub task: String,
     pub suspect_services: Vec<String>,         // LRU, max 8
     pub confirmed_facts: Vec<String>,          // max 10
     pub ruled_out: Vec<String>,                // max 10
-    pub recent_tool_calls: Vec<CallSignature>, // for repeat detection
-    pub consecutive_empty_results: u32,        // dead-end detection
+    #[serde(skip)]
+    pub recent_tool_calls: Vec<CallSignature>, // transient: per-turn repeat detection
+    #[serde(skip)]
+    pub consecutive_empty_results: u32,        // transient: per-turn dead-end detection
     /// Hypotheses we explored and ruled out (LRU, max 5). Used to discourage
     /// re-exploring dead ends across escalation rounds.
     pub failed_hypotheses: Vec<String>,

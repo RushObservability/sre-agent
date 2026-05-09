@@ -1,9 +1,8 @@
-//! Read-only SQLite adapter over the shared `rush_config.db` file.
+//! SQLite adapter over the shared `rush_config.db` file.
 //!
-//! The agent does NOT migrate or write to this database — query-api owns the
-//! schema. The agent opens the file read-only and exposes only the methods
-//! needed by investigation tools: anomaly rules/events, deploy markers,
-//! and settings lookup.
+//! For shared tables (anomaly_rules, deploy_markers, custom_skills, settings)
+//! the agent reads from tables owned by query-api. For investigation sessions
+//! and turns, the agent owns the schema and reads/writes directly.
 
 use rusqlite::{Connection, params};
 use std::sync::Mutex;
@@ -86,6 +85,37 @@ impl ConfigDb {
                 created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
                 updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
             );
+
+            -- Investigation sessions (owned by sre-agent)
+            CREATE TABLE IF NOT EXISTS investigation_sessions (
+                id              TEXT PRIMARY KEY,
+                tenant_id       TEXT NOT NULL DEFAULT 'default',
+                title           TEXT NOT NULL DEFAULT '',
+                status          TEXT NOT NULL DEFAULT 'active',
+                template_id     TEXT NOT NULL DEFAULT '',
+                created_by      TEXT NOT NULL DEFAULT '',
+                created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+                updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+                working_memory  TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE INDEX IF NOT EXISTS idx_sessions_tenant
+                ON investigation_sessions(tenant_id, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_sessions_status
+                ON investigation_sessions(tenant_id, status);
+
+            -- Investigation turns (owned by sre-agent)
+            CREATE TABLE IF NOT EXISTS investigation_turns (
+                id          TEXT PRIMARY KEY,
+                session_id  TEXT NOT NULL REFERENCES investigation_sessions(id) ON DELETE CASCADE,
+                turn_index  INTEGER NOT NULL,
+                role        TEXT NOT NULL,
+                content     TEXT NOT NULL,
+                tool_calls  TEXT NOT NULL DEFAULT '[]',
+                report_kind TEXT NOT NULL DEFAULT '',
+                created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_turns_session
+                ON investigation_turns(session_id, turn_index);
             "#,
         )?;
 
@@ -335,6 +365,234 @@ impl ConfigDb {
         })?;
         Ok(rows.next().transpose()?)
     }
+
+    // ── Investigation sessions ──
+
+    /// Create a new investigation session.
+    pub fn create_session(
+        &self,
+        id: &str,
+        tenant_id: &str,
+        title: &str,
+        created_by: &str,
+        template_id: &str,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO investigation_sessions (id, tenant_id, title, created_by, template_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![id, tenant_id, title, created_by, template_id],
+        )?;
+        Ok(())
+    }
+
+    /// Get a session by ID.
+    pub fn get_session(&self, id: &str) -> anyhow::Result<Option<InvestigationSession>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, tenant_id, title, status, template_id, created_by, \
+             created_at, updated_at, working_memory FROM investigation_sessions WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![id], |row| {
+            Ok(InvestigationSession {
+                id: row.get(0)?,
+                tenant_id: row.get(1)?,
+                title: row.get(2)?,
+                status: row.get(3)?,
+                template_id: row.get(4)?,
+                created_by: row.get(5)?,
+                created_at: row.get(6)?,
+                updated_at: row.get(7)?,
+                working_memory: row.get(8)?,
+            })
+        })?;
+        Ok(rows.next().transpose()?)
+    }
+
+    /// Update the working memory JSON for a session.
+    pub fn update_session_memory(&self, id: &str, working_memory_json: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE investigation_sessions SET working_memory = ?1, \
+             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?2",
+            params![working_memory_json, id],
+        )?;
+        Ok(())
+    }
+
+    /// Update the status of a session (active, completed, archived).
+    pub fn update_session_status(&self, id: &str, status: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE investigation_sessions SET status = ?1, \
+             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?2",
+            params![status, id],
+        )?;
+        Ok(())
+    }
+
+    /// Update the title of a session.
+    pub fn update_session_title(&self, id: &str, title: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE investigation_sessions SET title = ?1, \
+             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?2",
+            params![title, id],
+        )?;
+        Ok(())
+    }
+
+    /// List recent sessions for a tenant.
+    pub fn list_sessions(
+        &self,
+        tenant_id: &str,
+        limit: i64,
+    ) -> anyhow::Result<Vec<InvestigationSession>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, tenant_id, title, status, template_id, created_by, \
+             created_at, updated_at, working_memory FROM investigation_sessions \
+             WHERE tenant_id = ?1 AND status != 'archived' \
+             ORDER BY updated_at DESC LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![tenant_id, limit], |row| {
+                Ok(InvestigationSession {
+                    id: row.get(0)?,
+                    tenant_id: row.get(1)?,
+                    title: row.get(2)?,
+                    status: row.get(3)?,
+                    template_id: row.get(4)?,
+                    created_by: row.get(5)?,
+                    created_at: row.get(6)?,
+                    updated_at: row.get(7)?,
+                    working_memory: row.get(8)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Delete a session (cascade deletes turns).
+    pub fn delete_session(&self, id: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM investigation_sessions WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    // ── Investigation turns ──
+
+    /// Append a turn to a session.
+    pub fn add_turn(
+        &self,
+        id: &str,
+        session_id: &str,
+        turn_index: i64,
+        role: &str,
+        content: &str,
+        tool_calls: &str,
+        report_kind: &str,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO investigation_turns (id, session_id, turn_index, role, content, tool_calls, report_kind) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![id, session_id, turn_index, role, content, tool_calls, report_kind],
+        )?;
+        Ok(())
+    }
+
+    /// Get all turns for a session, ordered by turn_index.
+    pub fn get_turns(&self, session_id: &str) -> anyhow::Result<Vec<InvestigationTurn>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, session_id, turn_index, role, content, tool_calls, report_kind, created_at \
+             FROM investigation_turns WHERE session_id = ?1 ORDER BY turn_index ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![session_id], |row| {
+                Ok(InvestigationTurn {
+                    id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    turn_index: row.get(2)?,
+                    role: row.get(3)?,
+                    content: row.get(4)?,
+                    tool_calls: row.get(5)?,
+                    report_kind: row.get(6)?,
+                    created_at: row.get(7)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Get the last N turns for a session (for context window reconstruction).
+    pub fn get_recent_turns(
+        &self,
+        session_id: &str,
+        limit: i64,
+    ) -> anyhow::Result<Vec<InvestigationTurn>> {
+        let conn = self.conn.lock().unwrap();
+        // Sub-query to get latest N in DESC, then re-sort ASC for message ordering.
+        let mut stmt = conn.prepare(
+            "SELECT id, session_id, turn_index, role, content, tool_calls, report_kind, created_at \
+             FROM ( \
+                 SELECT * FROM investigation_turns WHERE session_id = ?1 \
+                 ORDER BY turn_index DESC LIMIT ?2 \
+             ) ORDER BY turn_index ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![session_id, limit], |row| {
+                Ok(InvestigationTurn {
+                    id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    turn_index: row.get(2)?,
+                    role: row.get(3)?,
+                    content: row.get(4)?,
+                    tool_calls: row.get(5)?,
+                    report_kind: row.get(6)?,
+                    created_at: row.get(7)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Count turns in a session (for determining next turn_index).
+    pub fn count_turns(&self, session_id: &str) -> anyhow::Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT COUNT(*) FROM investigation_turns WHERE session_id = ?1")?;
+        let count: i64 = stmt.query_row(params![session_id], |row| row.get(0))?;
+        Ok(count)
+    }
+}
+
+/// Row struct for `investigation_sessions`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct InvestigationSession {
+    pub id: String,
+    pub tenant_id: String,
+    pub title: String,
+    pub status: String,
+    pub template_id: String,
+    pub created_by: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub working_memory: String,
+}
+
+/// Row struct for `investigation_turns`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct InvestigationTurn {
+    pub id: String,
+    pub session_id: String,
+    pub turn_index: i64,
+    pub role: String,
+    pub content: String,
+    pub tool_calls: String,
+    pub report_kind: String,
+    pub created_at: String,
 }
 
 #[cfg(test)]
@@ -446,5 +704,130 @@ mod tests {
         let ids: Vec<_> = january.iter().map(|d| d.id.as_str()).collect();
         assert!(ids.contains(&"d1"));
         assert!(ids.contains(&"d2"));
+    }
+
+    // ── Investigation session tests ──
+
+    #[test]
+    fn session_roundtrip() {
+        let db = fresh_db();
+        db.create_session("s1", "tenant-a", "My investigation", "alice", "")
+            .unwrap();
+        let s = db.get_session("s1").unwrap().unwrap();
+        assert_eq!(s.id, "s1");
+        assert_eq!(s.tenant_id, "tenant-a");
+        assert_eq!(s.title, "My investigation");
+        assert_eq!(s.status, "active");
+        assert_eq!(s.working_memory, "{}");
+    }
+
+    #[test]
+    fn get_missing_session_returns_none() {
+        let db = fresh_db();
+        assert!(db.get_session("nonexistent").unwrap().is_none());
+    }
+
+    #[test]
+    fn update_session_memory_roundtrip() {
+        let db = fresh_db();
+        db.create_session("s1", "t", "", "", "").unwrap();
+        let mem = r#"{"task":"find bug","suspect_services":["checkout"]}"#;
+        db.update_session_memory("s1", mem).unwrap();
+        let s = db.get_session("s1").unwrap().unwrap();
+        assert_eq!(s.working_memory, mem);
+    }
+
+    #[test]
+    fn update_session_status() {
+        let db = fresh_db();
+        db.create_session("s1", "t", "", "", "").unwrap();
+        db.update_session_status("s1", "completed").unwrap();
+        let s = db.get_session("s1").unwrap().unwrap();
+        assert_eq!(s.status, "completed");
+    }
+
+    #[test]
+    fn update_session_title() {
+        let db = fresh_db();
+        db.create_session("s1", "t", "Old title", "", "").unwrap();
+        db.update_session_title("s1", "New title").unwrap();
+        let s = db.get_session("s1").unwrap().unwrap();
+        assert_eq!(s.title, "New title");
+    }
+
+    #[test]
+    fn list_sessions_filters_by_tenant() {
+        let db = fresh_db();
+        db.create_session("s1", "a", "", "", "").unwrap();
+        db.create_session("s2", "b", "", "", "").unwrap();
+        db.create_session("s3", "a", "", "", "").unwrap();
+        let list = db.list_sessions("a", 50).unwrap();
+        assert_eq!(list.len(), 2);
+    }
+
+    #[test]
+    fn list_sessions_excludes_archived() {
+        let db = fresh_db();
+        db.create_session("s1", "a", "", "", "").unwrap();
+        db.create_session("s2", "a", "", "", "").unwrap();
+        db.update_session_status("s2", "archived").unwrap();
+        let list = db.list_sessions("a", 50).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].id, "s1");
+    }
+
+    #[test]
+    fn delete_session_cascades_to_turns() {
+        let db = fresh_db();
+        db.create_session("s1", "t", "", "", "").unwrap();
+        db.add_turn("t1", "s1", 0, "user", "hello", "[]", "").unwrap();
+        db.add_turn("t2", "s1", 1, "assistant", "hi", "[]", "final").unwrap();
+        assert_eq!(db.get_turns("s1").unwrap().len(), 2);
+
+        db.delete_session("s1").unwrap();
+        assert!(db.get_session("s1").unwrap().is_none());
+        assert_eq!(db.get_turns("s1").unwrap().len(), 0);
+    }
+
+    // ── Investigation turn tests ──
+
+    #[test]
+    fn turn_roundtrip() {
+        let db = fresh_db();
+        db.create_session("s1", "t", "", "", "").unwrap();
+        db.add_turn("t1", "s1", 0, "user", "Why is checkout slow?", "[]", "").unwrap();
+        db.add_turn("t2", "s1", 1, "assistant", "Root cause found.", "[{\"name\":\"search_logs\"}]", "final").unwrap();
+
+        let turns = db.get_turns("s1").unwrap();
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].role, "user");
+        assert_eq!(turns[0].content, "Why is checkout slow?");
+        assert_eq!(turns[1].role, "assistant");
+        assert_eq!(turns[1].report_kind, "final");
+    }
+
+    #[test]
+    fn get_recent_turns_limits_correctly() {
+        let db = fresh_db();
+        db.create_session("s1", "t", "", "", "").unwrap();
+        for i in 0..10 {
+            db.add_turn(&format!("t{i}"), "s1", i, "user", &format!("msg {i}"), "[]", "").unwrap();
+        }
+        let recent = db.get_recent_turns("s1", 3).unwrap();
+        assert_eq!(recent.len(), 3);
+        // Should be the last 3 turns, in ascending order
+        assert_eq!(recent[0].turn_index, 7);
+        assert_eq!(recent[1].turn_index, 8);
+        assert_eq!(recent[2].turn_index, 9);
+    }
+
+    #[test]
+    fn count_turns_returns_correct_count() {
+        let db = fresh_db();
+        db.create_session("s1", "t", "", "", "").unwrap();
+        assert_eq!(db.count_turns("s1").unwrap(), 0);
+        db.add_turn("t1", "s1", 0, "user", "q", "[]", "").unwrap();
+        db.add_turn("t2", "s1", 1, "assistant", "a", "[]", "").unwrap();
+        assert_eq!(db.count_turns("s1").unwrap(), 2);
     }
 }

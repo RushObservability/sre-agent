@@ -5,4 +5,5 @@ pub mod prompt;
 pub mod skill_store;
 pub mod skills;
 pub mod stream;
+pub mod templates;
 pub mod tools;

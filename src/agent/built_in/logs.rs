@@ -61,6 +61,9 @@ impl Tool for SearchLogs {
     }
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String> {
+        if !ctx.has_scope("logs") {
+            return Ok("Access denied: your account does not have permission to search logs. Try a different investigation approach using tools you have access to.".to_string());
+        }
         let service = args.get("service").and_then(|v| v.as_str()).unwrap_or("");
         let severity = args.get("severity").and_then(|v| v.as_str()).unwrap_or("");
         let query_text = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
@@ -71,6 +74,8 @@ impl Tool for SearchLogs {
             .and_then(|v| v.as_u64())
             .unwrap_or(50)
             .min(200);
+
+        let tenant_id = ctx.tenant_id.replace('\'', "\\'");
 
         let mut conditions = if !around.is_empty() {
             // ClickHouse expects 'YYYY-MM-DD hh:mm:ss' — strip trailing Z and replace T with space
@@ -86,6 +91,7 @@ impl Tool for SearchLogs {
         } else {
             vec![format!("Timestamp >= now() - INTERVAL {minutes} MINUTE")]
         };
+        conditions.push(format!("tenant_id = '{tenant_id}'"));
         if !service.is_empty() {
             conditions.push(format!("ServiceName = '{}'", service.replace('\'', "''")));
         }
@@ -127,7 +133,7 @@ impl Tool for SearchLogs {
              LIMIT {limit}"
         );
 
-        let rows: Vec<LogRow> = ctx.state.ch.query(&sql).fetch_all().await?;
+        let rows: Vec<LogRow> = ctx.state.ch.query(&sql).with_option("rush_tenant_id", &ctx.tenant_id).fetch_all().await?;
 
         if rows.is_empty() {
             return Ok("No matching logs found.".to_string());

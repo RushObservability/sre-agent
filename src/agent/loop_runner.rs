@@ -25,7 +25,13 @@ const DEAD_END_THRESHOLD: u32 = 4;
 /// preliminary report. A final report requires an unescalated run with at
 /// least one confirmed fact and at least one suspect service. Anything less
 /// rigorous is surfaced as preliminary so the user knows to follow up.
-fn decide_report_kind(memory: &WorkingMemory) -> ReportKind {
+fn decide_report_kind(memory: &WorkingMemory, content: &str) -> ReportKind {
+    // Detect [QUESTION] prefix — agent is asking the user a clarifying question.
+    let trimmed = content.trim_start();
+    if trimmed.starts_with("[QUESTION]") {
+        return ReportKind::Question;
+    }
+
     if memory.escalation_level < 2
         && !memory.confirmed_facts.is_empty()
         && !memory.suspect_services.is_empty()
@@ -33,6 +39,17 @@ fn decide_report_kind(memory: &WorkingMemory) -> ReportKind {
         ReportKind::Final
     } else {
         ReportKind::Preliminary
+    }
+}
+
+/// Strip the `[QUESTION]` prefix from content if present, returning the
+/// clean text to show to the user.
+fn strip_question_prefix(content: &str) -> String {
+    let trimmed = content.trim_start();
+    if let Some(rest) = trimmed.strip_prefix("[QUESTION]") {
+        rest.trim_start().to_string()
+    } else {
+        content.to_string()
     }
 }
 
@@ -62,6 +79,7 @@ impl LlmConfig {
 }
 
 /// Run the agent investigation loop, sending events to the channel.
+/// Backward-compatible entry point (no session persistence).
 pub async fn run(
     messages: Vec<Value>,
     registry: &ToolRegistry,
@@ -72,6 +90,7 @@ pub async fn run(
 }
 
 /// Run the agent loop with an explicit LLM configuration.
+/// Backward-compatible entry point (no session persistence).
 pub async fn run_with_config(
     messages: Vec<Value>,
     registry: &ToolRegistry,
@@ -79,6 +98,48 @@ pub async fn run_with_config(
     tx: &mpsc::Sender<AgentEvent>,
     llm: LlmConfig,
 ) -> Result<()> {
+    let (_, _, _) = run_inner(messages, registry, ctx, tx, llm, None, "").await?;
+    Ok(())
+}
+
+/// Session-aware entry point. Accepts optional restored working memory from a
+/// prior turn and returns `(summary_text, report_kind, final_working_memory)`
+/// so the caller can persist the state. The `session_id` is included in the
+/// `Done` event sent over SSE.
+pub async fn run_with_session(
+    messages: Vec<Value>,
+    registry: &ToolRegistry,
+    ctx: &ToolContext,
+    tx: &mpsc::Sender<AgentEvent>,
+    restored_memory: Option<WorkingMemory>,
+    session_id: &str,
+) -> Result<(String, ReportKind, WorkingMemory)> {
+    run_inner(
+        messages,
+        registry,
+        ctx,
+        tx,
+        LlmConfig::from_env()?,
+        restored_memory,
+        session_id,
+    )
+    .await
+}
+
+/// Core agent loop implementation.
+///
+/// Returns `(summary_text, report_kind, final_working_memory)` when the loop
+/// completes. For backward-compatible callers these are ignored; for
+/// session-aware callers they enable persistence.
+async fn run_inner(
+    messages: Vec<Value>,
+    registry: &ToolRegistry,
+    ctx: &ToolContext,
+    tx: &mpsc::Sender<AgentEvent>,
+    llm: LlmConfig,
+    restored_memory: Option<WorkingMemory>,
+    session_id: &str,
+) -> Result<(String, ReportKind, WorkingMemory)> {
     let base_url = llm.base_url;
     let api_key = llm.api_key;
     let model = llm.model;
@@ -99,7 +160,18 @@ pub async fn run_with_config(
         .take(300)
         .collect::<String>();
 
-    let mut memory = WorkingMemory::new(initial_task);
+    // Use restored memory if provided, otherwise create fresh.
+    let mut memory = if let Some(mut mem) = restored_memory {
+        // Update task with the latest user question
+        if !initial_task.is_empty() {
+            mem.task = initial_task;
+        }
+        // Reset transient per-turn counters
+        mem.consecutive_empty_results = 0;
+        mem
+    } else {
+        WorkingMemory::new(initial_task)
+    };
 
     let mut total_prompt = 0u64;
     let mut total_completion = 0u64;
@@ -180,12 +252,13 @@ pub async fn run_with_config(
                 }));
                 continue;
             }
-            // Final answer
-            let kind = decide_report_kind(&memory);
+            // Final answer (or question)
+            let kind = decide_report_kind(&memory, &content);
+            let display_text = strip_question_prefix(&content);
             let _ = tx
                 .send(AgentEvent::Summary {
-                    text: content.clone(),
-                    kind,
+                    text: display_text.clone(),
+                    kind: kind.clone(),
                 })
                 .await;
             let _ = tx
@@ -193,9 +266,10 @@ pub async fn run_with_config(
                     rounds: tool_steps + 1,
                     prompt_tokens: total_prompt,
                     completion_tokens: total_completion,
+                    session_id: session_id.to_string(),
                 })
                 .await;
-            return Ok(());
+            return Ok((display_text, kind, memory));
         }
 
         // Record assistant message with tool calls
@@ -365,7 +439,7 @@ pub async fn run_with_config(
 
     let _ = tx
         .send(AgentEvent::Summary {
-            text,
+            text: text.clone(),
             kind: ReportKind::Preliminary,
         })
         .await;
@@ -374,10 +448,11 @@ pub async fn run_with_config(
             rounds: tool_steps,
             prompt_tokens: total_prompt,
             completion_tokens: total_completion,
+            session_id: session_id.to_string(),
         })
         .await;
 
-    Ok(())
+    Ok((text, ReportKind::Preliminary, memory))
 }
 
 struct ToolCallAccum {

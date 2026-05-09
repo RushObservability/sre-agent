@@ -39,7 +39,11 @@ impl Tool for ListServices {
     }
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String> {
+        if !ctx.has_scope("traces") {
+            return Ok("Access denied: your account does not have permission to list services (service data is derived from traces). Try a different investigation approach using tools you have access to.".to_string());
+        }
         let minutes = args.get("minutes").and_then(|v| v.as_u64()).unwrap_or(15);
+        let tenant_id = ctx.tenant_id.replace('\'', "\\'");
 
         let query = format!(
             "SELECT service_name, \
@@ -48,13 +52,14 @@ impl Tool for ListServices {
                     quantile(0.5)(duration_ns) / 1e6 AS p50_ms, \
                     quantile(0.99)(duration_ns) / 1e6 AS p99_ms \
              FROM wide_events \
-             WHERE timestamp >= now() - INTERVAL {minutes} MINUTE \
+             WHERE tenant_id = '{tenant_id}' \
+               AND timestamp >= now() - INTERVAL {minutes} MINUTE \
                AND service_name != '' \
              GROUP BY service_name \
              ORDER BY total DESC"
         );
 
-        let rows: Vec<ServiceRow> = ctx.state.ch.query(&query).fetch_all().await?;
+        let rows: Vec<ServiceRow> = ctx.state.ch.query(&query).with_option("rush_tenant_id", &ctx.tenant_id).fetch_all().await?;
 
         if rows.is_empty() {
             return Ok(format!("No service traffic in last {minutes}m."));
@@ -121,8 +126,12 @@ impl Tool for ServiceDependencies {
     }
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String> {
+        if !ctx.has_scope("traces") {
+            return Ok("Access denied: your account does not have permission to query service dependencies (service data is derived from traces). Try a different investigation approach using tools you have access to.".to_string());
+        }
         let service = args.get("service").and_then(|v| v.as_str()).unwrap_or("");
         let minutes = args.get("minutes").and_then(|v| v.as_u64()).unwrap_or(30);
+        let tenant_id = ctx.tenant_id.replace('\'', "\\'");
 
         let mut conditions = vec![
             format!("timestamp >= now() - INTERVAL {minutes} MINUTE"),
@@ -140,7 +149,9 @@ impl Tool for ServiceDependencies {
              FROM wide_events AS child \
              INNER JOIN wide_events AS parent ON child.parent_span_id = parent.span_id \
                 AND parent.trace_id = child.trace_id \
-             WHERE child.timestamp >= now() - INTERVAL {minutes} MINUTE \
+             WHERE child.tenant_id = '{tenant_id}' \
+               AND parent.tenant_id = '{tenant_id}' \
+               AND child.timestamp >= now() - INTERVAL {minutes} MINUTE \
                AND parent.timestamp >= now() - INTERVAL {minutes} MINUTE \
                AND parent.service_name != child.service_name \
              GROUP BY caller, callee \
@@ -148,7 +159,7 @@ impl Tool for ServiceDependencies {
              LIMIT 50"
         );
 
-        let rows: Vec<DepRow> = ctx.state.ch.query(&query).fetch_all().await?;
+        let rows: Vec<DepRow> = ctx.state.ch.query(&query).with_option("rush_tenant_id", &ctx.tenant_id).fetch_all().await?;
 
         if rows.is_empty() {
             return Ok(format!("No cross-service calls found in last {minutes}m."));

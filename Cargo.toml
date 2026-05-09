@@ -52,6 +52,7 @@ reqwest = { version = "0.12", features = ["json"] }
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 dotenvy = "0.15"
+uuid = { version = "1", features = ["v4"] }
 
 [profile.release]
 lto = true

@@ -59,7 +59,7 @@ impl Tool for ListServices {
              ORDER BY total DESC"
         );
 
-        let rows: Vec<ServiceRow> = ctx.state.ch.query(&query).with_option("rush_tenant_id", &ctx.tenant_id).fetch_all().await?;
+        let rows: Vec<ServiceRow> = crate::state::tenant_query(&ctx.state.ch, &query, &ctx.tenant_id).fetch_all().await?;
 
         if rows.is_empty() {
             return Ok(format!("No service traffic in last {minutes}m."));
@@ -159,7 +159,7 @@ impl Tool for ServiceDependencies {
              LIMIT 50"
         );
 
-        let rows: Vec<DepRow> = ctx.state.ch.query(&query).with_option("rush_tenant_id", &ctx.tenant_id).fetch_all().await?;
+        let rows: Vec<DepRow> = crate::state::tenant_query(&ctx.state.ch, &query, &ctx.tenant_id).fetch_all().await?;
 
         if rows.is_empty() {
             return Ok(format!("No cross-service calls found in last {minutes}m."));

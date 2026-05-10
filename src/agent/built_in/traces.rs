@@ -110,7 +110,7 @@ impl Tool for QueryTraces {
              LIMIT {limit}"
         );
 
-        let rows: Vec<TraceRow> = ctx.state.ch.query(&query).with_option("rush_tenant_id", &ctx.tenant_id).fetch_all().await?;
+        let rows: Vec<TraceRow> = crate::state::tenant_query(&ctx.state.ch, &query, &ctx.tenant_id).fetch_all().await?;
 
         if rows.is_empty() {
             return Ok("No matching spans found.".to_string());
@@ -253,7 +253,7 @@ impl Tool for GetTrace {
             trace_id.replace('\'', "''")
         );
 
-        let rows: Vec<SpanRow> = ctx.state.ch.query(&query).with_option("rush_tenant_id", &ctx.tenant_id).fetch_all().await?;
+        let rows: Vec<SpanRow> = crate::state::tenant_query(&ctx.state.ch, &query, &ctx.tenant_id).fetch_all().await?;
 
         if rows.is_empty() {
             return Ok(format!("No spans found for trace {trace_id}"));

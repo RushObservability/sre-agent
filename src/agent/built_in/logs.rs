@@ -133,7 +133,7 @@ impl Tool for SearchLogs {
              LIMIT {limit}"
         );
 
-        let rows: Vec<LogRow> = ctx.state.ch.query(&sql).with_option("rush_tenant_id", &ctx.tenant_id).fetch_all().await?;
+        let rows: Vec<LogRow> = crate::state::tenant_query(&ctx.state.ch, &sql, &ctx.tenant_id).fetch_all().await?;
 
         if rows.is_empty() {
             return Ok("No matching logs found.".to_string());

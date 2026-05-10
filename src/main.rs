@@ -15,6 +15,7 @@ use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
 
+use sre_agent::state::probe_row_policy_support;
 use sre_agent::agent::memory::WorkingMemory;
 use sre_agent::agent::skill_store::SkillStore;
 use sre_agent::agent::stream::AgentEvent;
@@ -88,6 +89,8 @@ async fn main() -> anyhow::Result<()> {
         .with_user(&clickhouse_user)
         .with_password(&clickhouse_password)
         .with_option("max_execution_time", "30");
+
+    probe_row_policy_support(&ch).await;
 
     let config_db_path =
         std::env::var("RUSH_CONFIG_DB").unwrap_or_else(|_| "./rush_config.db".to_string());

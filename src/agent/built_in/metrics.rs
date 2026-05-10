@@ -169,7 +169,7 @@ impl Tool for QueryMetrics {
             return Ok("Provide either 'service' + 'metric' or 'metric_name'.".to_string());
         };
 
-        let rows: Vec<MetricRow> = ctx.state.ch.query(&query).with_option("rush_tenant_id", &ctx.tenant_id).fetch_all().await?;
+        let rows: Vec<MetricRow> = crate::state::tenant_query(&ctx.state.ch, &query, &ctx.tenant_id).fetch_all().await?;
 
         if rows.is_empty() {
             return Ok(format!("No data for {label} ({time_desc})."));

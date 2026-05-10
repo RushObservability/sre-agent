@@ -26,6 +26,11 @@ pub struct WorkingMemory {
     ///   2 = nudged to check dependency graph / widen window
     ///   3+ = force preliminary report
     pub escalation_level: u32,
+    /// Signal types that have produced real data in this investigation (e.g.
+    /// "logs", "traces", "metrics", "kubernetes", "deploys"). Persisted across
+    /// turns so the root-cause gate can require cross-signal confirmation.
+    /// LRU-capped at 10.
+    pub signals_consulted: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -81,6 +86,24 @@ impl WorkingMemory {
         Self::remember(&mut self.failed_hypotheses, item, 5);
     }
 
+    /// Record that a tool from the given signal category returned real data.
+    /// `signal` should be one of "logs", "traces", "metrics", "kubernetes", "deploys".
+    pub fn record_signal(&mut self, signal: &str) {
+        if signal.is_empty() {
+            return;
+        }
+        Self::remember(&mut self.signals_consulted, signal.to_string(), 10);
+    }
+
+    /// Number of distinct signal types that have returned real data.
+    pub fn unique_signal_count(&self) -> usize {
+        let mut seen = std::collections::HashSet::new();
+        for s in &self.signals_consulted {
+            seen.insert(s.as_str());
+        }
+        seen.len()
+    }
+
     /// Check if this exact tool call was made recently (exact dup).
     pub fn is_repeat_call(&self, sig: &CallSignature) -> bool {
         self.recent_tool_calls.iter().any(|c| c == sig)
@@ -124,6 +147,17 @@ impl WorkingMemory {
             for h in &self.failed_hypotheses {
                 out.push_str(&format!("- {h}\n"));
             }
+        }
+        if !self.signals_consulted.is_empty() {
+            let unique: std::collections::HashSet<&str> =
+                self.signals_consulted.iter().map(|s| s.as_str()).collect();
+            let mut sorted: Vec<&str> = unique.into_iter().collect();
+            sorted.sort();
+            out.push_str(&format!(
+                "**Signals consulted ({})**: {}\n",
+                sorted.len(),
+                sorted.join(", ")
+            ));
         }
         if self.escalation_level > 0 {
             let stage_hint = match self.escalation_level {

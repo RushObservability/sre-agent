@@ -10,22 +10,35 @@ use super::tools::{ToolContext, ToolRegistry};
 
 /// Maximum real tool-executing rounds. The model should never hear about this
 /// number — it exists purely as a backstop against runaway loops.
-const MAX_TOOL_STEPS: u32 = 25;
+const MAX_TOOL_STEPS: u32 = 40;
 
 /// Max total LLM calls. Includes parse-failure retries, so gives slack
 /// over MAX_TOOL_STEPS for things like empty responses or repeat-call
 /// corrections that don't consume a real step. Inspired by Raschka's
 /// dual-counter pattern.
-const MAX_ATTEMPTS: u32 = 35;
+const MAX_ATTEMPTS: u32 = 55;
 
 /// How many consecutive empty/no-data tool results before escalating.
 const DEAD_END_THRESHOLD: u32 = 4;
 
+/// Minimum real tool steps before the root-cause gate will accept a final
+/// answer. Prevents the model from concluding after a single lookup.
+const MIN_INVESTIGATION_DEPTH: u32 = 4;
+
+/// Minimum number of distinct signal types (logs/traces/metrics/…) that must
+/// have returned real data before the gate will accept a Final report.
+const MIN_SIGNAL_TYPES: usize = 2;
+
+/// Maximum times the root-cause gate will bounce a premature conclusion back
+/// per session. After this many rejections the gate steps aside to avoid an
+/// infinite loop, and the report is surfaced as Preliminary.
+const MAX_GATE_REJECTIONS: u32 = 3;
+
 /// Decide whether a given investigation state represents a final or
-/// preliminary report. A final report requires an unescalated run with at
-/// least one confirmed fact and at least one suspect service. Anything less
-/// rigorous is surfaced as preliminary so the user knows to follow up.
-fn decide_report_kind(memory: &WorkingMemory, content: &str) -> ReportKind {
+/// preliminary report. A final report requires an unescalated run with
+/// confirmed facts, suspect services, and multi-signal evidence. Anything
+/// less rigorous is surfaced as preliminary so the user knows to follow up.
+fn decide_report_kind(memory: &WorkingMemory, content: &str, tool_steps: u32) -> ReportKind {
     // Detect [QUESTION] prefix — agent is asking the user a clarifying question.
     let trimmed = content.trim_start();
     if trimmed.starts_with("[QUESTION]") {
@@ -35,11 +48,89 @@ fn decide_report_kind(memory: &WorkingMemory, content: &str) -> ReportKind {
     if memory.escalation_level < 2
         && !memory.confirmed_facts.is_empty()
         && !memory.suspect_services.is_empty()
+        && memory.unique_signal_count() >= MIN_SIGNAL_TYPES
+        && tool_steps >= MIN_INVESTIGATION_DEPTH
     {
         ReportKind::Final
     } else {
         ReportKind::Preliminary
     }
+}
+
+/// Map a tool name to the signal category it belongs to.
+fn tool_signal_type(tool_name: &str) -> Option<&'static str> {
+    match tool_name {
+        "search_logs" => Some("logs"),
+        "query_traces" | "get_trace" | "list_services" | "service_dependencies" => {
+            Some("traces")
+        }
+        "query_metrics" => Some("metrics"),
+        "kube_describe" | "kube_events" | "get_argocd_app" => Some("kubernetes"),
+        "list_deploys" => Some("deploys"),
+        _ => None,
+    }
+}
+
+/// Root-cause gate: examine the investigation state and return a descriptive
+/// gap message if the agent shouldn't be allowed to conclude yet, or `None`
+/// if the conclusion is sufficiently grounded.
+///
+/// The gate checks three criteria:
+/// 1. Minimum investigation depth (at least MIN_INVESTIGATION_DEPTH real tool steps).
+/// 2. Multi-signal coverage (at least MIN_SIGNAL_TYPES distinct signal types).
+/// 3. Minimum confirmed evidence (at least 2 confirmed facts in working memory).
+fn root_cause_gate(memory: &WorkingMemory, tool_steps: u32) -> Option<String> {
+    let mut gaps: Vec<String> = Vec::new();
+
+    if tool_steps < MIN_INVESTIGATION_DEPTH {
+        gaps.push(format!(
+            "Only {tool_steps} investigation step(s) completed. \
+             Dig deeper — aim for at least {MIN_INVESTIGATION_DEPTH} before concluding."
+        ));
+    }
+
+    let unique_signals = memory.unique_signal_count();
+    if unique_signals < MIN_SIGNAL_TYPES {
+        let consulted: std::collections::HashSet<&str> =
+            memory.signals_consulted.iter().map(|s| s.as_str()).collect();
+        let missing: Vec<&str> = ["logs", "traces", "metrics"]
+            .iter()
+            .copied()
+            .filter(|&s| !consulted.contains(s))
+            .take(2)
+            .collect();
+        gaps.push(format!(
+            "Only {unique_signals} signal type(s) checked (need {MIN_SIGNAL_TYPES}). \
+             Verify the root cause with at least one of: {}. \
+             Cross-signal confirmation is required before concluding.",
+            if missing.is_empty() {
+                "a different signal category".to_string()
+            } else {
+                missing.join(", ")
+            }
+        ));
+    }
+
+    if memory.confirmed_facts.len() < 2 {
+        gaps.push(format!(
+            "Fewer than 2 confirmed facts in working memory (have {}). \
+             Run targeted queries to build concrete evidence before concluding.",
+            memory.confirmed_facts.len()
+        ));
+    }
+
+    if gaps.is_empty() {
+        return None;
+    }
+
+    Some(format!(
+        "Root cause not yet confirmed. The following evidence gaps remain:\n{}\n\n\
+         Continue the investigation to address these gaps. \
+         You MUST check additional signals before producing a final report. \
+         Do not repeat queries you've already made — try a different service, \
+         time window, or signal type.",
+        gaps.iter().map(|g| format!("- {g}")).collect::<Vec<_>>().join("\n")
+    ))
 }
 
 /// Strip the `[QUESTION]` prefix from content if present, returning the
@@ -179,6 +270,7 @@ async fn run_inner(
     let mut tool_steps = 0u32;
     let mut attempts = 0u32;
     let mut force_summary = false;
+    let mut gate_rejection_count = 0u32;
 
     while tool_steps < MAX_TOOL_STEPS && attempts < MAX_ATTEMPTS {
         attempts += 1;
@@ -252,8 +344,28 @@ async fn run_inner(
                 }));
                 continue;
             }
+
+            // Root-cause gate: bounce premature conclusions back until the
+            // agent has gathered sufficient multi-signal evidence, or until
+            // the gate has rejected MAX_GATE_REJECTIONS times (at which point
+            // we surface a Preliminary report rather than looping forever).
+            if gate_rejection_count < MAX_GATE_REJECTIONS {
+                if let Some(gap_msg) = root_cause_gate(&memory, tool_steps) {
+                    gate_rejection_count += 1;
+                    messages.push(serde_json::json!({
+                        "role": "assistant",
+                        "content": content.clone(),
+                    }));
+                    messages.push(serde_json::json!({
+                        "role": "system",
+                        "content": gap_msg,
+                    }));
+                    continue;
+                }
+            }
+
             // Final answer (or question)
-            let kind = decide_report_kind(&memory, &content);
+            let kind = decide_report_kind(&memory, &content, tool_steps);
             let display_text = strip_question_prefix(&content);
             let _ = tx
                 .send(AgentEvent::Summary {
@@ -327,6 +439,9 @@ async fn run_inner(
                 )
             } else {
                 memory.record_call(sig);
+                if let Some(sig_type) = tool_signal_type(&tc.name) {
+                    memory.record_signal(sig_type);
+                }
                 match registry.execute(&tc.name, args.clone(), ctx).await {
                     Ok(data) => {
                         any_real_work = true;

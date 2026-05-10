@@ -427,7 +427,7 @@ async fn investigate(
                 .await;
 
         match result {
-            Ok((summary_text, report_kind, final_memory)) => {
+            Ok((summary_text, report_kind, final_memory, total_prompt, total_completion, llm_model_used)) => {
                 // Persist assistant turn and updated working memory
                 if session_mode_for_task {
                     let turn_index = config_db
@@ -453,6 +453,14 @@ async fn investigate(
                     if let Ok(mem_json) = serde_json::to_string(&final_memory) {
                         let _ = config_db.update_session_memory(&session_id_for_task, &mem_json);
                     }
+
+                    // Accumulate token usage
+                    let _ = config_db.update_session_tokens(
+                        &session_id_for_task,
+                        total_prompt,
+                        total_completion,
+                        &llm_model_used,
+                    );
 
                     // If the report is final, mark session completed
                     if report_kind == agent::stream::ReportKind::Final {
@@ -523,6 +531,9 @@ async fn list_sessions(
                 "created_by": s.created_by,
                 "created_at": s.created_at,
                 "updated_at": s.updated_at,
+                "prompt_tokens": s.prompt_tokens,
+                "completion_tokens": s.completion_tokens,
+                "llm_model": s.llm_model,
             })
         })
         .collect();
@@ -555,6 +566,9 @@ async fn get_session(
             "created_by": session.created_by,
             "created_at": session.created_at,
             "updated_at": session.updated_at,
+            "prompt_tokens": session.prompt_tokens,
+            "completion_tokens": session.completion_tokens,
+            "llm_model": session.llm_model,
         },
         "turns": turns,
     })))

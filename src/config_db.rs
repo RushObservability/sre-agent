@@ -119,6 +119,15 @@ impl ConfigDb {
             "#,
         )?;
 
+        // Additive migrations — ignored if column already exists.
+        let _ = conn.execute_batch(
+            r#"
+            ALTER TABLE investigation_sessions ADD COLUMN prompt_tokens INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE investigation_sessions ADD COLUMN completion_tokens INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE investigation_sessions ADD COLUMN llm_model TEXT NOT NULL DEFAULT '';
+            "#,
+        );
+
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -391,7 +400,9 @@ impl ConfigDb {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, tenant_id, title, status, template_id, created_by, \
-             created_at, updated_at, working_memory FROM investigation_sessions WHERE id = ?1",
+             created_at, updated_at, working_memory, \
+             COALESCE(prompt_tokens, 0), COALESCE(completion_tokens, 0), COALESCE(llm_model, '') \
+             FROM investigation_sessions WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map(params![id], |row| {
             Ok(InvestigationSession {
@@ -404,6 +415,9 @@ impl ConfigDb {
                 created_at: row.get(6)?,
                 updated_at: row.get(7)?,
                 working_memory: row.get(8)?,
+                prompt_tokens: row.get(9)?,
+                completion_tokens: row.get(10)?,
+                llm_model: row.get(11)?,
             })
         })?;
         Ok(rows.next().transpose()?)
@@ -442,6 +456,27 @@ impl ConfigDb {
         Ok(())
     }
 
+    /// Accumulate token usage for a session (additive — called after each agent turn).
+    pub fn update_session_tokens(
+        &self,
+        id: &str,
+        prompt: u64,
+        completion: u64,
+        model: &str,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE investigation_sessions SET \
+             prompt_tokens = COALESCE(prompt_tokens, 0) + ?1, \
+             completion_tokens = COALESCE(completion_tokens, 0) + ?2, \
+             llm_model = ?3, \
+             updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') \
+             WHERE id = ?4",
+            params![prompt as i64, completion as i64, model, id],
+        )?;
+        Ok(())
+    }
+
     /// List recent sessions for a tenant.
     pub fn list_sessions(
         &self,
@@ -451,7 +486,9 @@ impl ConfigDb {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, tenant_id, title, status, template_id, created_by, \
-             created_at, updated_at, working_memory FROM investigation_sessions \
+             created_at, updated_at, working_memory, \
+             COALESCE(prompt_tokens, 0), COALESCE(completion_tokens, 0), COALESCE(llm_model, '') \
+             FROM investigation_sessions \
              WHERE tenant_id = ?1 AND status != 'archived' \
              ORDER BY updated_at DESC LIMIT ?2",
         )?;
@@ -467,6 +504,9 @@ impl ConfigDb {
                     created_at: row.get(6)?,
                     updated_at: row.get(7)?,
                     working_memory: row.get(8)?,
+                    prompt_tokens: row.get(9)?,
+                    completion_tokens: row.get(10)?,
+                    llm_model: row.get(11)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -580,6 +620,9 @@ pub struct InvestigationSession {
     pub created_at: String,
     pub updated_at: String,
     pub working_memory: String,
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    pub llm_model: String,
 }
 
 /// Row struct for `investigation_turns`.

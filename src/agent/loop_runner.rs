@@ -189,7 +189,7 @@ pub async fn run_with_config(
     tx: &mpsc::Sender<AgentEvent>,
     llm: LlmConfig,
 ) -> Result<()> {
-    let (_, _, _) = run_inner(messages, registry, ctx, tx, llm, None, "").await?;
+    let (_, _, _, _, _, _) = run_inner(messages, registry, ctx, tx, llm, None, "").await?;
     Ok(())
 }
 
@@ -197,6 +197,7 @@ pub async fn run_with_config(
 /// prior turn and returns `(summary_text, report_kind, final_working_memory)`
 /// so the caller can persist the state. The `session_id` is included in the
 /// `Done` event sent over SSE.
+/// Returns `(summary_text, report_kind, final_memory, prompt_tokens, completion_tokens, model)`
 pub async fn run_with_session(
     messages: Vec<Value>,
     registry: &ToolRegistry,
@@ -204,7 +205,7 @@ pub async fn run_with_session(
     tx: &mpsc::Sender<AgentEvent>,
     restored_memory: Option<WorkingMemory>,
     session_id: &str,
-) -> Result<(String, ReportKind, WorkingMemory)> {
+) -> Result<(String, ReportKind, WorkingMemory, u64, u64, String)> {
     run_inner(
         messages,
         registry,
@@ -230,7 +231,7 @@ async fn run_inner(
     llm: LlmConfig,
     restored_memory: Option<WorkingMemory>,
     session_id: &str,
-) -> Result<(String, ReportKind, WorkingMemory)> {
+) -> Result<(String, ReportKind, WorkingMemory, u64, u64, String)> {
     let base_url = llm.base_url;
     let api_key = llm.api_key;
     let model = llm.model;
@@ -379,9 +380,10 @@ async fn run_inner(
                     prompt_tokens: total_prompt,
                     completion_tokens: total_completion,
                     session_id: session_id.to_string(),
+                    model: model.clone(),
                 })
                 .await;
-            return Ok((display_text, kind, memory));
+            return Ok((display_text, kind, memory, total_prompt, total_completion, model));
         }
 
         // Record assistant message with tool calls
@@ -564,10 +566,11 @@ async fn run_inner(
             prompt_tokens: total_prompt,
             completion_tokens: total_completion,
             session_id: session_id.to_string(),
+            model: model.clone(),
         })
         .await;
 
-    Ok((text, ReportKind::Preliminary, memory))
+    Ok((text, ReportKind::Preliminary, memory, total_prompt, total_completion, model))
 }
 
 struct ToolCallAccum {

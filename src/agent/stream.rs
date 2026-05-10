@@ -42,6 +42,7 @@ pub enum AgentEvent {
         prompt_tokens: u64,
         completion_tokens: u64,
         session_id: String,
+        model: String,
     },
 }
 

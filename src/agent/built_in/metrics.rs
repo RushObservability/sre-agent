@@ -38,7 +38,7 @@ impl Tool for QueryMetrics {
                 },
                 "metric_name": {
                     "type": "string",
-                    "description": "Raw metric name to query from otel_metrics tables (alternative to service+metric)"
+                    "description": "Raw metric name to query from metrics_ tables (alternative to service+metric)"
                 },
                 "around": {
                     "type": "string",
@@ -81,7 +81,7 @@ impl Tool for QueryMetrics {
             String::new()
         };
 
-        // Build time filter for wide_events (DateTime64 timestamp column)
+        // Build time filter for spans (DateTime64 timestamp column)
         let time_filter = if !around.is_empty() {
             format!(
                 "tenant_id = '{tenant_id}' AND timestamp >= toDateTime64('{ch_ts}', 9) - INTERVAL 5 MINUTE AND timestamp <= toDateTime64('{ch_ts}', 9) + INTERVAL 5 MINUTE"
@@ -90,7 +90,7 @@ impl Tool for QueryMetrics {
             format!("tenant_id = '{tenant_id}' AND timestamp >= now() - INTERVAL {minutes} MINUTE")
         };
 
-        // Build time filter for otel_metrics tables (TimeUnix column)
+        // Build time filter for metrics_ tables (TimeUnix column)
         let otel_time_filter = if !around.is_empty() {
             format!(
                 "tenant_id = '{tenant_id}' AND TimeUnix >= toDateTime64('{ch_ts}', 9) - INTERVAL 5 MINUTE AND TimeUnix <= toDateTime64('{ch_ts}', 9) + INTERVAL 5 MINUTE"
@@ -109,7 +109,7 @@ impl Tool for QueryMetrics {
             let sql = format!(
                 "SELECT toString(toStartOfInterval(TimeUnix, INTERVAL 1 MINUTE)) AS bucket, \
                         avg(Value) AS value \
-                 FROM otel_metrics_gauge \
+                 FROM metrics_gauge \
                  WHERE MetricName = '{}' \
                    AND {otel_time_filter} \
                  GROUP BY bucket \
@@ -124,7 +124,7 @@ impl Tool for QueryMetrics {
                     let sql = format!(
                         "SELECT toString(toStartOfInterval(timestamp, INTERVAL 1 MINUTE)) AS bucket, \
                                 countIf(status = 'STATUS_CODE_ERROR') AS value \
-                         FROM wide_events \
+                         FROM spans \
                          WHERE service_name = '{safe_svc}' \
                            AND {time_filter} \
                          GROUP BY bucket ORDER BY bucket"
@@ -135,7 +135,7 @@ impl Tool for QueryMetrics {
                     let sql = format!(
                         "SELECT toString(toStartOfInterval(timestamp, INTERVAL 1 MINUTE)) AS bucket, \
                                 quantile(0.5)(duration_ns) / 1e6 AS value \
-                         FROM wide_events \
+                         FROM spans \
                          WHERE service_name = '{safe_svc}' \
                            AND {time_filter} \
                          GROUP BY bucket ORDER BY bucket"
@@ -146,7 +146,7 @@ impl Tool for QueryMetrics {
                     let sql = format!(
                         "SELECT toString(toStartOfInterval(timestamp, INTERVAL 1 MINUTE)) AS bucket, \
                                 quantile(0.99)(duration_ns) / 1e6 AS value \
-                         FROM wide_events \
+                         FROM spans \
                          WHERE service_name = '{safe_svc}' \
                            AND {time_filter} \
                          GROUP BY bucket ORDER BY bucket"
@@ -157,7 +157,7 @@ impl Tool for QueryMetrics {
                     let sql = format!(
                         "SELECT toString(toStartOfInterval(timestamp, INTERVAL 1 MINUTE)) AS bucket, \
                                 count() AS value \
-                         FROM wide_events \
+                         FROM spans \
                          WHERE service_name = '{safe_svc}' \
                            AND {time_filter} \
                          GROUP BY bucket ORDER BY bucket"

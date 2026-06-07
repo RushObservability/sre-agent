@@ -127,7 +127,7 @@ impl Tool for SearchLogs {
                     SeverityText AS severity, \
                     Body AS body, \
                     TraceId AS trace_id \
-             FROM otel_logs \
+             FROM logs \
              WHERE {where_clause} \
              ORDER BY Timestamp DESC \
              LIMIT {limit}"

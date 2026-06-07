@@ -1,8 +1,9 @@
 use serde::{Deserialize, Serialize};
 
 /// User-defined investigation skill. The sre-agent reads these from the
-/// shared `rush_config.db` (owned and written by query-api) and exposes them
-/// via the `load_skill` tool to LLM investigation loops.
+/// shared ClickHouse `config_custom_skills` table (owned and written by
+/// query-api) and exposes them via the `load_skill` tool to LLM investigation
+/// loops.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CustomSkill {
     pub id: String,

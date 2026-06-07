@@ -92,10 +92,19 @@ async fn main() -> anyhow::Result<()> {
 
     probe_row_policy_support(&ch).await;
 
-    let config_db_path =
-        std::env::var("RUSH_CONFIG_DB").unwrap_or_else(|_| "./rush_config.db".to_string());
-    let config_db = Arc::new(ConfigDb::open(&config_db_path)?);
-    tracing::info!("sre-agent config db opened at {config_db_path}");
+    // ConfigDb uses the session-default database (`default`), matching query-api —
+    // config_* tables live there, not in `observability` (which holds telemetry data).
+    let config_db = Arc::new(
+        ConfigDb::open(
+            &clickhouse_url,
+            &clickhouse_user,
+            &clickhouse_password,
+        )
+        .await?,
+    );
+    tracing::info!(
+        "sre-agent config db opened against ClickHouse at {clickhouse_url} (config tables in default database)"
+    );
 
     // Optional: URL of the query-api used to fetch custom skills.
     let query_api_url = std::env::var("QUERY_API_URL")
@@ -197,12 +206,14 @@ async fn investigate(
         state
             .config_db
             .create_session(&session_id, &req.tenant_id, &auto_title, "", &req.template_id)
+            .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     } else if !is_new_session && session_mode {
         // Load session from DB and verify tenant
         let session = state
             .config_db
             .get_session(&session_id)
+            .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
             .ok_or_else(|| (StatusCode::NOT_FOUND, "session not found".to_string()))?;
 
@@ -218,6 +229,7 @@ async fn investigate(
             state
                 .config_db
                 .update_session_status(&session_id, "active")
+                .await
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         }
 
@@ -237,11 +249,13 @@ async fn investigate(
         let event = state
             .config_db
             .get_anomaly_event(&req.event_id)
+            .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
             .ok_or_else(|| (StatusCode::NOT_FOUND, "anomaly event not found".to_string()))?;
         let rule = state
             .config_db
             .get_anomaly_rule(&event.rule_id)
+            .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
             .ok_or_else(|| (StatusCode::NOT_FOUND, "anomaly rule not found".to_string()))?;
 
@@ -264,6 +278,7 @@ async fn investigate(
         let turn_index = state
             .config_db
             .count_turns(&session_id)
+            .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         let turn_id = uuid::Uuid::new_v4().to_string();
         state
@@ -277,6 +292,7 @@ async fn investigate(
                 "[]",
                 "",
             )
+            .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     }
 
@@ -339,6 +355,7 @@ async fn investigate(
             let recent = state
                 .config_db
                 .get_recent_turns(&session_id, context_turns as i64)
+                .await
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
             for turn in &recent {
                 let role = turn.role.as_str();
@@ -432,6 +449,7 @@ async fn investigate(
                 if session_mode_for_task {
                     let turn_index = config_db
                         .count_turns(&session_id_for_task)
+                        .await
                         .unwrap_or(0);
                     let turn_id = uuid::Uuid::new_v4().to_string();
                     let kind_str = match report_kind {
@@ -439,32 +457,40 @@ async fn investigate(
                         agent::stream::ReportKind::Preliminary => "preliminary",
                         agent::stream::ReportKind::Question => "question",
                     };
-                    let _ = config_db.add_turn(
-                        &turn_id,
-                        &session_id_for_task,
-                        turn_index,
-                        "assistant",
-                        &summary_text,
-                        "[]", // tool_calls summary omitted for now
-                        kind_str,
-                    );
+                    let _ = config_db
+                        .add_turn(
+                            &turn_id,
+                            &session_id_for_task,
+                            turn_index,
+                            "assistant",
+                            &summary_text,
+                            "[]", // tool_calls summary omitted for now
+                            kind_str,
+                        )
+                        .await;
 
                     // Serialize and persist working memory
                     if let Ok(mem_json) = serde_json::to_string(&final_memory) {
-                        let _ = config_db.update_session_memory(&session_id_for_task, &mem_json);
+                        let _ = config_db
+                            .update_session_memory(&session_id_for_task, &mem_json)
+                            .await;
                     }
 
                     // Accumulate token usage
-                    let _ = config_db.update_session_tokens(
-                        &session_id_for_task,
-                        total_prompt,
-                        total_completion,
-                        &llm_model_used,
-                    );
+                    let _ = config_db
+                        .update_session_tokens(
+                            &session_id_for_task,
+                            total_prompt,
+                            total_completion,
+                            &llm_model_used,
+                        )
+                        .await;
 
                     // If the report is final, mark session completed
                     if report_kind == agent::stream::ReportKind::Final {
-                        let _ = config_db.update_session_status(&session_id_for_task, "completed");
+                        let _ = config_db
+                            .update_session_status(&session_id_for_task, "completed")
+                            .await;
                     }
                 }
             }
@@ -516,6 +542,7 @@ async fn list_sessions(
     let sessions = state
         .config_db
         .list_sessions(&params.tenant_id, params.limit)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     // Return sessions without working_memory to reduce payload
@@ -548,12 +575,14 @@ async fn get_session(
     let session = state
         .config_db
         .get_session(&id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "session not found".to_string()))?;
 
     let turns = state
         .config_db
         .get_turns(&id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(serde_json::json!({
@@ -582,6 +611,7 @@ async fn delete_session(
     state
         .config_db
         .update_session_status(&id, "archived")
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(serde_json::json!({"ok": true})))
 }

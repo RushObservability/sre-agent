@@ -104,7 +104,7 @@ impl Tool for QueryTraces {
             "SELECT trace_id, span_id, service_name, http_method, http_path, \
                     http_status_code, status, duration_ns, \
                     toString(timestamp) AS ts_str \
-             FROM wide_events \
+             FROM spans \
              WHERE {where_clause} \
              ORDER BY timestamp DESC \
              LIMIT {limit}"
@@ -246,7 +246,7 @@ impl Tool for GetTrace {
             "SELECT span_id, parent_span_id, service_name, http_method, http_path, \
                     http_status_code, status, duration_ns, attributes, \
                     toString(timestamp) AS ts_str \
-             FROM wide_events \
+             FROM spans \
              WHERE trace_id = '{}' \
                AND tenant_id = '{tenant_id}' \
              ORDER BY timestamp ASC",

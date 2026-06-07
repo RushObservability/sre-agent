@@ -27,11 +27,8 @@ futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-# ClickHouse client (for log/trace/metric queries)
+# ClickHouse client (for log/trace/metric queries + shared config tables)
 clickhouse = { version = "0.13", features = ["time", "uuid"] }
-
-# SQLite (for anomaly events/rules + deploy markers + settings)
-rusqlite = { version = "0.31", features = ["bundled"] }
 
 # Kubernetes client (for argocd + kube tools)
 kube = { version = "0.98", features = ["client", "runtime", "derive"] }

@@ -107,6 +107,7 @@ mod tests {
             prompt_tokens: 1000,
             completion_tokens: 500,
             session_id: "sess_abc".into(),
+            model: "test-model".into(),
         });
         assert!(out.contains(r#""type":"done""#));
         assert!(out.contains(r#""rounds":5"#));

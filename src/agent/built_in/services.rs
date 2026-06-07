@@ -51,7 +51,7 @@ impl Tool for ListServices {
                     countIf(status = 'STATUS_CODE_ERROR') AS errors, \
                     quantile(0.5)(duration_ns) / 1e6 AS p50_ms, \
                     quantile(0.99)(duration_ns) / 1e6 AS p99_ms \
-             FROM wide_events \
+             FROM spans \
              WHERE tenant_id = '{tenant_id}' \
                AND timestamp >= now() - INTERVAL {minutes} MINUTE \
                AND service_name != '' \
@@ -142,12 +142,12 @@ impl Tool for ServiceDependencies {
             conditions.push(format!("(caller = '{safe}' OR callee = '{safe}')"));
         }
 
-        // Join wide_events with itself on parent_span_id to find cross-service calls
+        // Join spans with itself on parent_span_id to find cross-service calls
         let query = format!(
             "SELECT parent.service_name AS caller, child.service_name AS callee, \
                     count() AS call_count \
-             FROM wide_events AS child \
-             INNER JOIN wide_events AS parent ON child.parent_span_id = parent.span_id \
+             FROM spans AS child \
+             INNER JOIN spans AS parent ON child.parent_span_id = parent.span_id \
                 AND parent.trace_id = child.trace_id \
              WHERE child.tenant_id = '{tenant_id}' \
                AND parent.tenant_id = '{tenant_id}' \

@@ -35,6 +35,7 @@ impl Tool for GetAnomalyContext {
                 .state
                 .config_db
                 .get_anomaly_rule(rule_id)
+                .await
                 .map_err(|e| anyhow::anyhow!("failed to get rule: {e}"))?
                 .ok_or_else(|| anyhow::anyhow!("anomaly rule not found: {rule_id}"))?;
 
@@ -42,6 +43,7 @@ impl Tool for GetAnomalyContext {
                 .state
                 .config_db
                 .list_anomaly_events(rule_id, 10)
+                .await
                 .map_err(|e| anyhow::anyhow!("failed to get events: {e}"))?;
 
             let mut out = format!(
@@ -79,6 +81,7 @@ impl Tool for GetAnomalyContext {
                 .state
                 .config_db
                 .list_anomaly_rules()
+                .await
                 .map_err(|e| anyhow::anyhow!("failed to list rules: {e}"))?;
 
             if rules.is_empty() {

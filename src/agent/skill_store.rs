@@ -59,9 +59,9 @@ impl SkillStore {
     /// This is the synchronous variant used in tests and when no query-api URL
     /// is configured. In the cluster, prefer [`load_unified`] which fetches
     /// custom skills over HTTP from query-api (the single source of truth).
-    pub fn load(config_db: &Arc<ConfigDb>) -> Self {
+    pub async fn load(config_db: &Arc<ConfigDb>) -> Self {
         let mut store = Self::with_built_ins();
-        match config_db.list_enabled_custom_skills() {
+        match config_db.list_enabled_custom_skills().await {
             Ok(custom) => store.extend_with_custom(custom),
             Err(e) => {
                 tracing::warn!(
@@ -104,7 +104,7 @@ impl SkillStore {
 
         // Fallback: read from the local config_db. In the cluster this is
         // always empty for the sre-agent pod, but keeps local dev working.
-        match config_db.list_enabled_custom_skills() {
+        match config_db.list_enabled_custom_skills().await {
             Ok(custom) => store.extend_with_custom(custom),
             Err(e) => {
                 tracing::warn!(
@@ -251,34 +251,45 @@ async fn fetch_custom_skills_http(base_url: &str) -> anyhow::Result<Vec<CustomSk
 mod tests {
     use super::*;
 
-    fn in_memory_db() -> Arc<ConfigDb> {
-        Arc::new(ConfigDb::open(":memory:").unwrap())
+    /// Build a SkillStore against a live ClickHouse. The DB-backed tests below
+    /// are `#[ignore]`d because they require a running ClickHouse with the
+    /// query-api `config_*` schema; the rendering/catalog assertions are also
+    /// covered by the pure-logic tests that follow, which need no database.
+    async fn live_store() -> SkillStore {
+        let url = std::env::var("CLICKHOUSE_URL")
+            .unwrap_or_else(|_| "http://localhost:8123".to_string());
+        let database = std::env::var("CLICKHOUSE_DATABASE")
+            .unwrap_or_else(|_| "observability".to_string());
+        let user = std::env::var("CLICKHOUSE_USER").unwrap_or_else(|_| "default".to_string());
+        let password = std::env::var("CLICKHOUSE_PASSWORD").unwrap_or_default();
+        let db = Arc::new(ConfigDb::open(&url, &database, &user, &password).await.unwrap());
+        SkillStore::load(&db).await
     }
 
-    #[test]
-    fn load_with_empty_db_still_has_built_ins() {
-        let db = in_memory_db();
-        let store = SkillStore::load(&db);
+    #[tokio::test]
+    #[ignore = "requires a live ClickHouse with query-api config schema"]
+    async fn load_with_empty_db_still_has_built_ins() {
+        let store = live_store().await;
         // Should have at least the 6 known built-ins
         assert!(store.len() >= 6);
         assert!(store.get("error_rate_spike").is_some());
         assert!(store.get("argocd_unhealthy").is_some());
     }
 
-    #[test]
-    fn built_in_entries_have_builtin_source() {
-        let db = in_memory_db();
-        let store = SkillStore::load(&db);
+    #[tokio::test]
+    #[ignore = "requires a live ClickHouse with query-api config schema"]
+    async fn built_in_entries_have_builtin_source() {
+        let store = live_store().await;
         let entry = store.get("error_rate_spike").unwrap();
         assert!(!entry.is_custom());
         assert_eq!(entry.source, SkillSource::BuiltIn);
         assert!(entry.allowed_tools.is_empty());
     }
 
-    #[test]
-    fn catalog_lists_all_entries() {
-        let db = in_memory_db();
-        let store = SkillStore::load(&db);
+    #[tokio::test]
+    #[ignore = "requires a live ClickHouse with query-api config schema"]
+    async fn catalog_lists_all_entries() {
+        let store = live_store().await;
         let cat = store.catalog();
         assert!(cat.contains("AVAILABLE SKILLS"));
         assert!(cat.contains("error_rate_spike"));
@@ -287,8 +298,8 @@ mod tests {
 
     #[test]
     fn render_body_builtin_appends_guidance() {
-        let db = in_memory_db();
-        let store = SkillStore::load(&db);
+        // Built-ins are compiled in, so this needs no database.
+        let store = SkillStore::with_built_ins();
         let body = store.render_body("error_rate_spike").unwrap();
         assert!(body.contains("Use this playbook"));
         // Should NOT wrap built-ins in trust tags
@@ -298,16 +309,14 @@ mod tests {
 
     #[test]
     fn render_body_unknown_id_returns_none() {
-        let db = in_memory_db();
-        let store = SkillStore::load(&db);
+        let store = SkillStore::with_built_ins();
         assert!(store.render_body("no_such_skill").is_none());
     }
 
     #[test]
     fn custom_skill_renders_with_trust_wrapper() {
-        // We can't reach the private Mutex<Connection> on ConfigDb to insert
-        // custom rows, so we exercise the rendering path via a hand-built
-        // store instead.
+        // Exercise the rendering path via a hand-built store so we don't need
+        // a database to insert custom rows.
         let mut entries = HashMap::new();
         let mut order = Vec::new();
         let id = "custom:kafka_lag".to_string();

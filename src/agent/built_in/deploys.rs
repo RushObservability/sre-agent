@@ -47,6 +47,7 @@ impl Tool for ListDeploys {
             .state
             .config_db
             .list_deploy_markers(svc_filter.as_deref(), Some(&from_str), None)
+            .await
             .map_err(|e| anyhow::anyhow!("failed to list deploys: {e}"))?;
 
         if deploys.is_empty() {

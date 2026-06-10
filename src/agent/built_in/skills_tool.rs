@@ -101,7 +101,7 @@ mod tests {
     async fn test_ctx() -> ToolContext {
         let ch = clickhouse::Client::default().with_url("http://localhost:8123");
         let config_db = Arc::new(
-            ConfigDb::open("http://localhost:8123", "observability", "default", "")
+            ConfigDb::open("http://localhost:8123", "default", "")
                 .await
                 .unwrap(),
         );

@@ -204,7 +204,7 @@ impl Tool for FakeTool {
 async fn make_ctx() -> ToolContext {
     let ch = clickhouse::Client::default().with_url("http://localhost:8123");
     let config_db = Arc::new(
-        sre_agent::config_db::ConfigDb::open("http://localhost:8123", "observability", "default", "")
+        sre_agent::config_db::ConfigDb::open("http://localhost:8123", "default", "")
             .await
             .unwrap(),
     );

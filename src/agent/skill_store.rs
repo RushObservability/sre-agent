@@ -262,7 +262,7 @@ mod tests {
             .unwrap_or_else(|_| "observability".to_string());
         let user = std::env::var("CLICKHOUSE_USER").unwrap_or_else(|_| "default".to_string());
         let password = std::env::var("CLICKHOUSE_PASSWORD").unwrap_or_default();
-        let db = Arc::new(ConfigDb::open(&url, &database, &user, &password).await.unwrap());
+        let db = Arc::new(ConfigDb::open(&url, &user, &password).await.unwrap());
         SkillStore::load(&db).await
     }
 

@@ -433,6 +433,26 @@ async fn investigate(
             .await;
     }
 
+    // Resolve the cost-control budget for this run. Settings (set in the UI,
+    // stored in config_settings) win; env vars are the fallback for
+    // deployments without the settings UI; defaults otherwise. Values are
+    // untrusted strings either way — LoopBudget::from_overrides clamps them.
+    let budget = {
+        let read = |key: &'static str, env: &'static str| {
+            let db = state.config_db.clone();
+            async move {
+                match db.get_setting(key).await {
+                    Ok(Some(v)) => v.trim().parse::<u32>().ok(),
+                    _ => std::env::var(env).ok().and_then(|v| v.trim().parse::<u32>().ok()),
+                }
+            }
+        };
+        agent::loop_runner::LoopBudget::from_overrides(
+            read("sre_agent_max_tool_steps", "SRE_AGENT_MAX_TOOL_STEPS").await,
+            read("sre_agent_max_llm_calls", "SRE_AGENT_MAX_LLM_CALLS").await,
+        )
+    };
+
     // Spawn the agent loop in a background task, then persist results
     let config_db = state.config_db.clone();
     let session_id_for_task = session_id.clone();
@@ -440,7 +460,7 @@ async fn investigate(
     let restored_mem = restored_memory;
     tokio::spawn(async move {
         let result =
-            agent::loop_runner::run_with_session(messages, &registry, &tool_ctx, &tx, restored_mem, &session_id_for_task)
+            agent::loop_runner::run_with_session(messages, &registry, &tool_ctx, &tx, restored_mem, &session_id_for_task, budget)
                 .await;
 
         match result {

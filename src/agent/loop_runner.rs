@@ -8,15 +8,54 @@ use super::memory::{
 use super::stream::{AgentEvent, ReportKind};
 use super::tools::{ToolContext, ToolRegistry};
 
-/// Maximum real tool-executing rounds. The model should never hear about this
-/// number — it exists purely as a backstop against runaway loops.
-const MAX_TOOL_STEPS: u32 = 40;
+/// Default maximum real tool-executing rounds. The model should never hear
+/// about this number — it exists purely as a backstop against runaway loops.
+/// Operators can override per deployment via the `sre_agent_max_tool_steps`
+/// setting (see `LoopBudget`).
+const DEFAULT_MAX_TOOL_STEPS: u32 = 40;
 
-/// Max total LLM calls. Includes parse-failure retries, so gives slack
-/// over MAX_TOOL_STEPS for things like empty responses or repeat-call
+/// Default max total LLM calls. Includes parse-failure retries, so gives slack
+/// over max_tool_steps for things like empty responses or repeat-call
 /// corrections that don't consume a real step. Inspired by Raschka's
-/// dual-counter pattern.
-const MAX_ATTEMPTS: u32 = 55;
+/// dual-counter pattern. Overridable via `sre_agent_max_llm_calls`.
+const DEFAULT_MAX_ATTEMPTS: u32 = 55;
+
+/// Cost-control budgets for one investigation run. Values arrive from the
+/// `config_settings` table (set in Settings → AI Agent) or env vars; both
+/// paths are untrusted strings, so construction clamps to sane bounds.
+#[derive(Debug, Clone, Copy)]
+pub struct LoopBudget {
+    /// Max real tool-executing rounds before a summary is forced.
+    pub max_tool_steps: u32,
+    /// Max total LLM calls (tool rounds + retries + critique + summary).
+    pub max_llm_calls: u32,
+}
+
+impl Default for LoopBudget {
+    fn default() -> Self {
+        Self { max_tool_steps: DEFAULT_MAX_TOOL_STEPS, max_llm_calls: DEFAULT_MAX_ATTEMPTS }
+    }
+}
+
+impl LoopBudget {
+    /// Build from optional override values, clamping to bounds that keep the
+    /// agent functional (too low → it can't investigate; absurdly high → no
+    /// cost protection at all).
+    pub fn from_overrides(max_tool_steps: Option<u32>, max_llm_calls: Option<u32>) -> Self {
+        let steps = max_tool_steps.unwrap_or(DEFAULT_MAX_TOOL_STEPS).clamp(4, 200);
+        // LLM calls must exceed tool steps or the loop dies on retries first.
+        let calls = max_llm_calls
+            .unwrap_or(DEFAULT_MAX_ATTEMPTS)
+            .clamp(steps.saturating_add(2), 300);
+        Self { max_tool_steps: steps, max_llm_calls: calls }
+    }
+
+    /// Minimum tool steps the root-cause gate demands before accepting a
+    /// final answer — adapts downward when the operator sets a small budget.
+    fn min_depth(&self) -> u32 {
+        MIN_INVESTIGATION_DEPTH.min(self.max_tool_steps.saturating_sub(1)).max(1)
+    }
+}
 
 /// How many consecutive empty/no-data tool results before escalating.
 const DEAD_END_THRESHOLD: u32 = 4;
@@ -38,7 +77,12 @@ const MAX_GATE_REJECTIONS: u32 = 3;
 /// preliminary report. A final report requires an unescalated run with
 /// confirmed facts, suspect services, and multi-signal evidence. Anything
 /// less rigorous is surfaced as preliminary so the user knows to follow up.
-fn decide_report_kind(memory: &WorkingMemory, content: &str, tool_steps: u32) -> ReportKind {
+fn decide_report_kind(
+    memory: &WorkingMemory,
+    content: &str,
+    tool_steps: u32,
+    min_depth: u32,
+) -> ReportKind {
     // Detect [QUESTION] prefix — agent is asking the user a clarifying question.
     let trimmed = content.trim_start();
     if trimmed.starts_with("[QUESTION]") {
@@ -49,7 +93,7 @@ fn decide_report_kind(memory: &WorkingMemory, content: &str, tool_steps: u32) ->
         && !memory.confirmed_facts.is_empty()
         && !memory.suspect_services.is_empty()
         && memory.unique_signal_count() >= MIN_SIGNAL_TYPES
-        && tool_steps >= MIN_INVESTIGATION_DEPTH
+        && tool_steps >= min_depth
     {
         ReportKind::Final
     } else {
@@ -79,13 +123,13 @@ fn tool_signal_type(tool_name: &str) -> Option<&'static str> {
 /// 1. Minimum investigation depth (at least MIN_INVESTIGATION_DEPTH real tool steps).
 /// 2. Multi-signal coverage (at least MIN_SIGNAL_TYPES distinct signal types).
 /// 3. Minimum confirmed evidence (at least 2 confirmed facts in working memory).
-fn root_cause_gate(memory: &WorkingMemory, tool_steps: u32) -> Option<String> {
+fn root_cause_gate(memory: &WorkingMemory, tool_steps: u32, min_depth: u32) -> Option<String> {
     let mut gaps: Vec<String> = Vec::new();
 
-    if tool_steps < MIN_INVESTIGATION_DEPTH {
+    if tool_steps < min_depth {
         gaps.push(format!(
             "Only {tool_steps} investigation step(s) completed. \
-             Dig deeper — aim for at least {MIN_INVESTIGATION_DEPTH} before concluding."
+             Dig deeper — aim for at least {min_depth} before concluding."
         ));
     }
 
@@ -189,7 +233,8 @@ pub async fn run_with_config(
     tx: &mpsc::Sender<AgentEvent>,
     llm: LlmConfig,
 ) -> Result<()> {
-    let (_, _, _, _, _, _) = run_inner(messages, registry, ctx, tx, llm, None, "").await?;
+    let (_, _, _, _, _, _) =
+        run_inner(messages, registry, ctx, tx, llm, None, "", LoopBudget::default()).await?;
     Ok(())
 }
 
@@ -205,6 +250,7 @@ pub async fn run_with_session(
     tx: &mpsc::Sender<AgentEvent>,
     restored_memory: Option<WorkingMemory>,
     session_id: &str,
+    budget: LoopBudget,
 ) -> Result<(String, ReportKind, WorkingMemory, u64, u64, String)> {
     run_inner(
         messages,
@@ -214,6 +260,7 @@ pub async fn run_with_session(
         LlmConfig::from_env()?,
         restored_memory,
         session_id,
+        budget,
     )
     .await
 }
@@ -223,6 +270,7 @@ pub async fn run_with_session(
 /// Returns `(summary_text, report_kind, final_working_memory)` when the loop
 /// completes. For backward-compatible callers these are ignored; for
 /// session-aware callers they enable persistence.
+#[allow(clippy::too_many_arguments)]
 async fn run_inner(
     messages: Vec<Value>,
     registry: &ToolRegistry,
@@ -231,6 +279,7 @@ async fn run_inner(
     llm: LlmConfig,
     restored_memory: Option<WorkingMemory>,
     session_id: &str,
+    budget: LoopBudget,
 ) -> Result<(String, ReportKind, WorkingMemory, u64, u64, String)> {
     let base_url = llm.base_url;
     let api_key = llm.api_key;
@@ -272,8 +321,13 @@ async fn run_inner(
     let mut attempts = 0u32;
     let mut force_summary = false;
     let mut gate_rejection_count = 0u32;
+    let min_depth = budget.min_depth();
+    // One self-critique cycle per run: when a conclusion passes the gate for
+    // the first time, the agent is asked to challenge it (and may run more
+    // tools) before the report is accepted.
+    let mut self_review_done = false;
 
-    while tool_steps < MAX_TOOL_STEPS && attempts < MAX_ATTEMPTS {
+    while tool_steps < budget.max_tool_steps && attempts < budget.max_llm_calls {
         attempts += 1;
 
         // Inject working memory as a system message if we have facts to share.
@@ -290,7 +344,7 @@ async fn run_inner(
         }
 
         // Final round or dead-end: force summary by withholding tools
-        let force_final = tool_steps + 1 >= MAX_TOOL_STEPS || force_summary;
+        let force_final = tool_steps + 1 >= budget.max_tool_steps || force_summary;
         let tools = if force_final {
             None
         } else {
@@ -351,7 +405,7 @@ async fn run_inner(
             // the gate has rejected MAX_GATE_REJECTIONS times (at which point
             // we surface a Preliminary report rather than looping forever).
             if gate_rejection_count < MAX_GATE_REJECTIONS {
-                if let Some(gap_msg) = root_cause_gate(&memory, tool_steps) {
+                if let Some(gap_msg) = root_cause_gate(&memory, tool_steps, min_depth) {
                     gate_rejection_count += 1;
                     messages.push(serde_json::json!({
                         "role": "assistant",
@@ -365,8 +419,42 @@ async fn run_inner(
                 }
             }
 
+            // Self-review pass: the first time a conclusion clears the gate
+            // (i.e. it would be accepted), make the agent challenge its own
+            // root cause before we take it. Tools stay available so it can go
+            // verify or revisit something — "question yourself, then look
+            // again". One cycle per run keeps the added cost bounded; skipped
+            // when the budget forced this summary or for clarifying questions.
+            let is_question = content.trim_start().starts_with("[QUESTION]");
+            if !self_review_done
+                && !is_question
+                && !force_final
+                && memory.escalation_level < 2
+                && attempts + 2 <= budget.max_llm_calls
+            {
+                self_review_done = true;
+                messages.push(serde_json::json!({
+                    "role": "assistant",
+                    "content": content.clone(),
+                }));
+                messages.push(serde_json::json!({
+                    "role": "system",
+                    "content": "Before this conclusion is accepted, review it as a skeptical \
+                        senior SRE who did NOT run this investigation:\n\
+                        1. What alternative explanations fit the same evidence? Name the strongest one.\n\
+                        2. Does anything in the gathered evidence contradict or weaken your root cause?\n\
+                        3. Is there ONE targeted check that would materially confirm or refute it \
+                        (e.g. the suspect's upstream dependency, the deploy timeline, a narrower \
+                        time window around onset)? If yes, RUN IT NOW with a tool.\n\
+                        Then produce your final report. State a confidence level (high/medium/low) \
+                        with one line of justification, and list what you ruled out. If the review \
+                        changed your conclusion, say so explicitly and continue investigating instead.",
+                }));
+                continue;
+            }
+
             // Final answer (or question)
-            let kind = decide_report_kind(&memory, &content, tool_steps);
+            let kind = decide_report_kind(&memory, &content, tool_steps, min_depth);
             let display_text = strip_question_prefix(&content);
             let _ = tx
                 .send(AgentEvent::Summary {
@@ -539,7 +627,7 @@ async fn run_inner(
     // the user sees what we learned and can follow up. This branch should be
     // rare because the escalation ladder above usually forces an earlier
     // summary, but we still need a safety net for runaway loops.
-    let termination_reason = if attempts >= MAX_ATTEMPTS && tool_steps < MAX_TOOL_STEPS {
+    let termination_reason = if attempts >= budget.max_llm_calls && tool_steps < budget.max_tool_steps {
         "Too many parse failures or repeat calls"
     } else {
         "Exhausted internal investigation budget"

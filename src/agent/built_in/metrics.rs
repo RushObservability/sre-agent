@@ -6,6 +6,120 @@ use serde_json::{Value, json};
 
 pub struct QueryMetrics;
 
+/// Pure SQL builder for `query_metrics`. Returns `(sql, label)` for the
+/// selected query mode, or `None` when neither `metric_name` nor `service`
+/// is provided. Every interpolated string value (`tenant_id`, `around`,
+/// `metric_name`, `service`) is escaped with the ClickHouse-standard doubled
+/// single quote (`''`); the model-supplied `minutes` is clamped here so a
+/// hostile value can never widen the scan window.
+pub(crate) fn build_query_metrics_sql(
+    service: &str,
+    metric: &str,
+    metric_name: &str,
+    around: &str,
+    minutes: u64,
+    tenant_id: &str,
+) -> Option<(String, String)> {
+    // Clamp the model-supplied window to at most 24h so the LLM can't
+    // request a months-long full scan.
+    let minutes = minutes.clamp(1, 1440);
+    let tenant_id = tenant_id.replace('\'', "''");
+
+    // Normalize ISO timestamp for ClickHouse: strip Z, replace T with space
+    let ch_ts = if !around.is_empty() {
+        around
+            .replace('\'', "''")
+            .replace('T', " ")
+            .trim_end_matches('Z')
+            .to_string()
+    } else {
+        String::new()
+    };
+
+    // Build time filter for spans (DateTime64 timestamp column)
+    let time_filter = if !around.is_empty() {
+        format!(
+            "tenant_id = '{tenant_id}' AND timestamp >= toDateTime64('{ch_ts}', 9) - INTERVAL 5 MINUTE AND timestamp <= toDateTime64('{ch_ts}', 9) + INTERVAL 5 MINUTE"
+        )
+    } else {
+        format!("tenant_id = '{tenant_id}' AND timestamp >= now() - INTERVAL {minutes} MINUTE")
+    };
+
+    // Build time filter for metrics_ tables (TimeUnix column)
+    let otel_time_filter = if !around.is_empty() {
+        format!(
+            "tenant_id = '{tenant_id}' AND TimeUnix >= toDateTime64('{ch_ts}', 9) - INTERVAL 5 MINUTE AND TimeUnix <= toDateTime64('{ch_ts}', 9) + INTERVAL 5 MINUTE"
+        )
+    } else {
+        format!("tenant_id = '{tenant_id}' AND TimeUnix >= now() - INTERVAL {minutes} MINUTE")
+    };
+
+    if !metric_name.is_empty() {
+        let sql = format!(
+            "SELECT toString(toStartOfInterval(TimeUnix, INTERVAL 1 MINUTE)) AS bucket, \
+                    avg(Value) AS value \
+             FROM metrics_gauge \
+             WHERE MetricName = '{}' \
+               AND {otel_time_filter} \
+             GROUP BY bucket \
+             ORDER BY bucket",
+            metric_name.replace('\'', "''")
+        );
+        Some((sql, metric_name.to_string()))
+    } else if !service.is_empty() {
+        let safe_svc = service.replace('\'', "''");
+        let pair = match metric {
+            "error_rate" => {
+                let sql = format!(
+                    "SELECT toString(toStartOfInterval(timestamp, INTERVAL 1 MINUTE)) AS bucket, \
+                            countIf(status = 'STATUS_CODE_ERROR') AS value \
+                     FROM spans \
+                     WHERE service_name = '{safe_svc}' \
+                       AND {time_filter} \
+                     GROUP BY bucket ORDER BY bucket"
+                );
+                (sql, format!("{service} error_rate"))
+            }
+            "p50_latency" => {
+                let sql = format!(
+                    "SELECT toString(toStartOfInterval(timestamp, INTERVAL 1 MINUTE)) AS bucket, \
+                            quantile(0.5)(duration_ns) / 1e6 AS value \
+                     FROM spans \
+                     WHERE service_name = '{safe_svc}' \
+                       AND {time_filter} \
+                     GROUP BY bucket ORDER BY bucket"
+                );
+                (sql, format!("{service} p50 latency (ms)"))
+            }
+            "p99_latency" => {
+                let sql = format!(
+                    "SELECT toString(toStartOfInterval(timestamp, INTERVAL 1 MINUTE)) AS bucket, \
+                            quantile(0.99)(duration_ns) / 1e6 AS value \
+                     FROM spans \
+                     WHERE service_name = '{safe_svc}' \
+                       AND {time_filter} \
+                     GROUP BY bucket ORDER BY bucket"
+                );
+                (sql, format!("{service} p99 latency (ms)"))
+            }
+            _ => {
+                let sql = format!(
+                    "SELECT toString(toStartOfInterval(timestamp, INTERVAL 1 MINUTE)) AS bucket, \
+                            count() AS value \
+                     FROM spans \
+                     WHERE service_name = '{safe_svc}' \
+                       AND {time_filter} \
+                     GROUP BY bucket ORDER BY bucket"
+                );
+                (sql, format!("{service} request_rate"))
+            }
+        };
+        Some(pair)
+    } else {
+        None
+    }
+}
+
 #[derive(Debug, Row, Deserialize)]
 struct MetricRow {
     bucket: String,
@@ -74,104 +188,15 @@ impl Tool for QueryMetrics {
             .unwrap_or(30)
             .clamp(1, 1440);
 
-        let tenant_id = ctx.tenant_id.replace('\'', "\\'");
-
-        // Normalize ISO timestamp for ClickHouse: strip Z, replace T with space
-        let ch_ts = if !around.is_empty() {
-            around
-                .replace('\'', "''")
-                .replace('T', " ")
-                .trim_end_matches('Z')
-                .to_string()
-        } else {
-            String::new()
-        };
-
-        // Build time filter for spans (DateTime64 timestamp column)
-        let time_filter = if !around.is_empty() {
-            format!(
-                "tenant_id = '{tenant_id}' AND timestamp >= toDateTime64('{ch_ts}', 9) - INTERVAL 5 MINUTE AND timestamp <= toDateTime64('{ch_ts}', 9) + INTERVAL 5 MINUTE"
-            )
-        } else {
-            format!("tenant_id = '{tenant_id}' AND timestamp >= now() - INTERVAL {minutes} MINUTE")
-        };
-
-        // Build time filter for metrics_ tables (TimeUnix column)
-        let otel_time_filter = if !around.is_empty() {
-            format!(
-                "tenant_id = '{tenant_id}' AND TimeUnix >= toDateTime64('{ch_ts}', 9) - INTERVAL 5 MINUTE AND TimeUnix <= toDateTime64('{ch_ts}', 9) + INTERVAL 5 MINUTE"
-            )
-        } else {
-            format!("tenant_id = '{tenant_id}' AND TimeUnix >= now() - INTERVAL {minutes} MINUTE")
-        };
-
         let time_desc = if !around.is_empty() {
             format!("±5m around {around}")
         } else {
             format!("last {minutes}m")
         };
 
-        let (query, label) = if !metric_name.is_empty() {
-            let sql = format!(
-                "SELECT toString(toStartOfInterval(TimeUnix, INTERVAL 1 MINUTE)) AS bucket, \
-                        avg(Value) AS value \
-                 FROM metrics_gauge \
-                 WHERE MetricName = '{}' \
-                   AND {otel_time_filter} \
-                 GROUP BY bucket \
-                 ORDER BY bucket",
-                metric_name.replace('\'', "''")
-            );
-            (sql, metric_name.to_string())
-        } else if !service.is_empty() {
-            let safe_svc = service.replace('\'', "''");
-            match metric {
-                "error_rate" => {
-                    let sql = format!(
-                        "SELECT toString(toStartOfInterval(timestamp, INTERVAL 1 MINUTE)) AS bucket, \
-                                countIf(status = 'STATUS_CODE_ERROR') AS value \
-                         FROM spans \
-                         WHERE service_name = '{safe_svc}' \
-                           AND {time_filter} \
-                         GROUP BY bucket ORDER BY bucket"
-                    );
-                    (sql, format!("{service} error_rate"))
-                }
-                "p50_latency" => {
-                    let sql = format!(
-                        "SELECT toString(toStartOfInterval(timestamp, INTERVAL 1 MINUTE)) AS bucket, \
-                                quantile(0.5)(duration_ns) / 1e6 AS value \
-                         FROM spans \
-                         WHERE service_name = '{safe_svc}' \
-                           AND {time_filter} \
-                         GROUP BY bucket ORDER BY bucket"
-                    );
-                    (sql, format!("{service} p50 latency (ms)"))
-                }
-                "p99_latency" => {
-                    let sql = format!(
-                        "SELECT toString(toStartOfInterval(timestamp, INTERVAL 1 MINUTE)) AS bucket, \
-                                quantile(0.99)(duration_ns) / 1e6 AS value \
-                         FROM spans \
-                         WHERE service_name = '{safe_svc}' \
-                           AND {time_filter} \
-                         GROUP BY bucket ORDER BY bucket"
-                    );
-                    (sql, format!("{service} p99 latency (ms)"))
-                }
-                _ => {
-                    let sql = format!(
-                        "SELECT toString(toStartOfInterval(timestamp, INTERVAL 1 MINUTE)) AS bucket, \
-                                count() AS value \
-                         FROM spans \
-                         WHERE service_name = '{safe_svc}' \
-                           AND {time_filter} \
-                         GROUP BY bucket ORDER BY bucket"
-                    );
-                    (sql, format!("{service} request_rate"))
-                }
-            }
-        } else {
+        let Some((query, label)) =
+            build_query_metrics_sql(service, metric, metric_name, around, minutes, &ctx.tenant_id)
+        else {
             return Ok("Provide either 'service' + 'metric' or 'metric_name'.".to_string());
         };
 
@@ -199,5 +224,71 @@ impl Tool for QueryMetrics {
         }
 
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_query_metrics_sql;
+
+    #[test]
+    fn returns_none_without_service_or_metric_name() {
+        assert!(build_query_metrics_sql("", "request_rate", "", "", 30, "default").is_none());
+    }
+
+    #[test]
+    fn service_mode_builds_each_metric_with_filter() {
+        for (metric, marker) in [
+            ("error_rate", "countIf(status = 'STATUS_CODE_ERROR')"),
+            ("p50_latency", "quantile(0.5)(duration_ns)"),
+            ("p99_latency", "quantile(0.99)(duration_ns)"),
+            ("request_rate", "count() AS value"),
+        ] {
+            let (sql, label) =
+                build_query_metrics_sql("api", metric, "", "", 30, "default").unwrap();
+            assert!(sql.contains("service_name = 'api'"), "{metric}: {sql}");
+            assert!(sql.contains(marker), "{metric}: {sql}");
+            assert!(label.starts_with("api "), "{metric}: {label}");
+        }
+    }
+
+    #[test]
+    fn metric_name_mode_escapes_and_targets_gauge_table() {
+        let (sql, label) =
+            build_query_metrics_sql("", "request_rate", "cpu's_usage", "", 30, "default").unwrap();
+        assert!(sql.contains("FROM metrics_gauge"), "{sql}");
+        assert!(sql.contains("MetricName = 'cpu''s_usage'"), "{sql}");
+        assert_eq!(label, "cpu's_usage");
+    }
+
+    #[test]
+    fn single_quotes_are_doubled_never_backslash_escaped() {
+        let (sql, _) =
+            build_query_metrics_sql("O'Brien", "error_rate", "", "", 30, "ten'ant").unwrap();
+        assert!(sql.contains("service_name = 'O''Brien'"), "{sql}");
+        assert!(sql.contains("tenant_id = 'ten''ant'"), "{sql}");
+        assert!(!sql.contains("\\'"), "no backslash quote escaping anywhere: {sql}");
+    }
+
+    #[test]
+    fn minutes_clamp_to_1440() {
+        let (sql, _) =
+            build_query_metrics_sql("api", "request_rate", "", "", 999_999, "default").unwrap();
+        assert!(sql.contains("INTERVAL 1440 MINUTE"), "{sql}");
+    }
+
+    #[test]
+    fn around_uses_normalized_timestamp_window() {
+        let (sql, _) = build_query_metrics_sql(
+            "api",
+            "request_rate",
+            "",
+            "2025-01-15T10:30:00Z",
+            30,
+            "default",
+        )
+        .unwrap();
+        assert!(sql.contains("toDateTime64('2025-01-15 10:30:00', 9)"), "{sql}");
+        assert!(!sql.contains("now() - INTERVAL"), "{sql}");
     }
 }

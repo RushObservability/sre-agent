@@ -5,6 +5,7 @@
 
 pub mod agent;
 pub mod config_db;
+pub mod http;
 pub mod models;
 pub mod state;
 

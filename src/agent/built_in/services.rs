@@ -6,6 +6,74 @@ use serde_json::{Value, json};
 
 pub struct ListServices;
 
+/// Pure SQL builder for `list_services`. The only interpolated string value
+/// (`tenant_id`) is escaped with the ClickHouse-standard doubled single
+/// quote (`''`); the model-supplied `minutes` is clamped here so a hostile
+/// value can never widen the scan window.
+pub(crate) fn build_list_services_sql(minutes: u64, tenant_id: &str) -> String {
+    // Clamp the model-supplied window to at most 24h so the LLM can't
+    // request a months-long full scan.
+    let minutes = minutes.clamp(1, 1440);
+    let tenant_id = tenant_id.replace('\'', "''");
+
+    format!(
+        "SELECT service_name, \
+                count() AS total, \
+                countIf(status = 'STATUS_CODE_ERROR') AS errors, \
+                quantile(0.5)(duration_ns) / 1e6 AS p50_ms, \
+                quantile(0.99)(duration_ns) / 1e6 AS p99_ms \
+         FROM spans \
+         WHERE tenant_id = '{tenant_id}' \
+           AND timestamp >= now() - INTERVAL {minutes} MINUTE \
+           AND service_name != '' \
+         GROUP BY service_name \
+         ORDER BY total DESC \
+         LIMIT 100"
+    )
+}
+
+/// Pure SQL builder for `service_dependencies`. Every interpolated string
+/// value (`tenant_id`, `service`) is escaped with the ClickHouse-standard
+/// doubled single quote (`''`); the model-supplied `minutes` is clamped here
+/// so a hostile value can never widen the self-join window.
+pub(crate) fn build_service_dependencies_sql(
+    service: &str,
+    minutes: u64,
+    tenant_id: &str,
+) -> String {
+    // Clamp the model-supplied window to at most 24h so the LLM can't
+    // request a months-long full-table self-join.
+    let minutes = minutes.clamp(1, 1440);
+    let tenant_id = tenant_id.replace('\'', "''");
+
+    // Restrict the join to the requested service's edges (either side).
+    // Empty/absent service keeps the global dependency graph behavior.
+    let service_filter = if service.is_empty() {
+        String::new()
+    } else {
+        let safe = service.replace('\'', "''");
+        format!("AND (parent.service_name = '{safe}' OR child.service_name = '{safe}') ")
+    };
+
+    // Join spans with itself on parent_span_id to find cross-service calls
+    format!(
+        "SELECT parent.service_name AS caller, child.service_name AS callee, \
+                count() AS call_count \
+         FROM spans AS child \
+         INNER JOIN spans AS parent ON child.parent_span_id = parent.span_id \
+            AND parent.trace_id = child.trace_id \
+         WHERE child.tenant_id = '{tenant_id}' \
+           AND parent.tenant_id = '{tenant_id}' \
+           AND child.timestamp >= now() - INTERVAL {minutes} MINUTE \
+           AND parent.timestamp >= now() - INTERVAL {minutes} MINUTE \
+           AND parent.service_name != child.service_name \
+         {service_filter}\
+         GROUP BY caller, callee \
+         ORDER BY call_count DESC \
+         LIMIT 50"
+    )
+}
+
 #[derive(Debug, Row, Deserialize)]
 struct ServiceRow {
     service_name: String,
@@ -42,22 +110,14 @@ impl Tool for ListServices {
         if !ctx.has_scope("traces") {
             return Ok("Access denied: your account does not have permission to list services (service data is derived from traces). Try a different investigation approach using tools you have access to.".to_string());
         }
-        let minutes = args.get("minutes").and_then(|v| v.as_u64()).unwrap_or(15);
-        let tenant_id = ctx.tenant_id.replace('\'', "\\'");
-
-        let query = format!(
-            "SELECT service_name, \
-                    count() AS total, \
-                    countIf(status = 'STATUS_CODE_ERROR') AS errors, \
-                    quantile(0.5)(duration_ns) / 1e6 AS p50_ms, \
-                    quantile(0.99)(duration_ns) / 1e6 AS p99_ms \
-             FROM spans \
-             WHERE tenant_id = '{tenant_id}' \
-               AND timestamp >= now() - INTERVAL {minutes} MINUTE \
-               AND service_name != '' \
-             GROUP BY service_name \
-             ORDER BY total DESC"
-        );
+        // Clamp the model-supplied window to at most 24h so the LLM can't
+        // request a months-long full scan.
+        let minutes = args
+            .get("minutes")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(15)
+            .clamp(1, 1440);
+        let query = build_list_services_sql(minutes, &ctx.tenant_id);
 
         let rows: Vec<ServiceRow> = crate::state::tenant_query(&ctx.state.ch, &query, &ctx.tenant_id).fetch_all().await?;
 
@@ -130,34 +190,14 @@ impl Tool for ServiceDependencies {
             return Ok("Access denied: your account does not have permission to query service dependencies (service data is derived from traces). Try a different investigation approach using tools you have access to.".to_string());
         }
         let service = args.get("service").and_then(|v| v.as_str()).unwrap_or("");
-        let minutes = args.get("minutes").and_then(|v| v.as_u64()).unwrap_or(30);
-        let tenant_id = ctx.tenant_id.replace('\'', "\\'");
-
-        let mut conditions = vec![
-            format!("timestamp >= now() - INTERVAL {minutes} MINUTE"),
-            "parent_span_id != ''".to_string(),
-        ];
-        if !service.is_empty() {
-            let safe = service.replace('\'', "''");
-            conditions.push(format!("(caller = '{safe}' OR callee = '{safe}')"));
-        }
-
-        // Join spans with itself on parent_span_id to find cross-service calls
-        let query = format!(
-            "SELECT parent.service_name AS caller, child.service_name AS callee, \
-                    count() AS call_count \
-             FROM spans AS child \
-             INNER JOIN spans AS parent ON child.parent_span_id = parent.span_id \
-                AND parent.trace_id = child.trace_id \
-             WHERE child.tenant_id = '{tenant_id}' \
-               AND parent.tenant_id = '{tenant_id}' \
-               AND child.timestamp >= now() - INTERVAL {minutes} MINUTE \
-               AND parent.timestamp >= now() - INTERVAL {minutes} MINUTE \
-               AND parent.service_name != child.service_name \
-             GROUP BY caller, callee \
-             ORDER BY call_count DESC \
-             LIMIT 50"
-        );
+        // Clamp the model-supplied window to at most 24h so the LLM can't
+        // request a months-long full-table self-join.
+        let minutes = args
+            .get("minutes")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(30)
+            .clamp(1, 1440);
+        let query = build_service_dependencies_sql(service, minutes, &ctx.tenant_id);
 
         let rows: Vec<DepRow> = crate::state::tenant_query(&ctx.state.ch, &query, &ctx.tenant_id).fetch_all().await?;
 
@@ -173,5 +213,47 @@ impl Tool for ServiceDependencies {
             ));
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_list_services_sql, build_service_dependencies_sql};
+
+    #[test]
+    fn list_services_has_limit_100_and_tenant_scope() {
+        let sql = build_list_services_sql(15, "default");
+        assert!(sql.contains("LIMIT 100"), "{sql}");
+        assert!(sql.contains("tenant_id = 'default'"), "{sql}");
+    }
+
+    #[test]
+    fn list_services_clamps_minutes_and_doubles_quotes() {
+        let sql = build_list_services_sql(999_999, "ten'ant");
+        assert!(sql.contains("INTERVAL 1440 MINUTE"), "{sql}");
+        assert!(sql.contains("tenant_id = 'ten''ant'"), "{sql}");
+        assert!(!sql.contains("\\'"), "no backslash quote escaping anywhere: {sql}");
+    }
+
+    #[test]
+    fn dependencies_service_predicate_present_when_set_absent_when_empty() {
+        let with = build_service_dependencies_sql("api", 30, "default");
+        assert!(
+            with.contains("(parent.service_name = 'api' OR child.service_name = 'api')"),
+            "{with}"
+        );
+
+        let without = build_service_dependencies_sql("", 30, "default");
+        assert!(!without.contains("parent.service_name = '"), "{without}");
+        assert!(without.contains("LIMIT 50"), "{without}");
+    }
+
+    #[test]
+    fn dependencies_clamps_minutes_and_doubles_quotes() {
+        let sql = build_service_dependencies_sql("O'Brien", 999_999, "ten'ant");
+        assert!(sql.contains("INTERVAL 1440 MINUTE"), "{sql}");
+        assert!(sql.contains("parent.service_name = 'O''Brien'"), "{sql}");
+        assert!(sql.contains("child.tenant_id = 'ten''ant'"), "{sql}");
+        assert!(!sql.contains("\\'"), "no backslash quote escaping anywhere: {sql}");
     }
 }

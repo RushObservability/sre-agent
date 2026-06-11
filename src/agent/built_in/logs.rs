@@ -6,6 +6,82 @@ use serde_json::{Value, json};
 
 pub struct SearchLogs;
 
+/// Pure SQL builder for `search_logs`. Every interpolated string value is
+/// escaped with the ClickHouse-standard doubled single quote (`''`); the
+/// model-supplied `minutes`/`limit` are clamped here so a hostile value can
+/// never widen the scan window or row count.
+pub(crate) fn build_search_logs_sql(
+    service: &str,
+    severity: &str,
+    query_text: &str,
+    around: &str,
+    minutes: u64,
+    limit: u64,
+    tenant_id: &str,
+) -> String {
+    // Clamp the model-supplied window to at most 24h so the LLM can't
+    // request a months-long full scan.
+    let minutes = minutes.clamp(1, 1440);
+    let limit = limit.min(200);
+    let tenant_id = tenant_id.replace('\'', "''");
+
+    let mut conditions = if !around.is_empty() {
+        // ClickHouse expects 'YYYY-MM-DD hh:mm:ss' — strip trailing Z and replace T with space
+        let ts = around
+            .replace('\'', "''")
+            .replace('T', " ")
+            .trim_end_matches('Z')
+            .to_string();
+        vec![
+            format!("Timestamp >= toDateTime64('{ts}', 9) - INTERVAL 5 MINUTE"),
+            format!("Timestamp <= toDateTime64('{ts}', 9) + INTERVAL 5 MINUTE"),
+        ]
+    } else {
+        vec![format!("Timestamp >= now() - INTERVAL {minutes} MINUTE")]
+    };
+    conditions.push(format!("tenant_id = '{tenant_id}'"));
+    if !service.is_empty() {
+        conditions.push(format!("ServiceName = '{}'", service.replace('\'', "''")));
+    }
+    if !severity.is_empty() {
+        // Map severity to include that level and above
+        let levels = match severity.to_uppercase().as_str() {
+            "ERROR" => vec!["ERROR", "FATAL", "CRITICAL"],
+            "WARN" => vec!["WARN", "WARNING", "ERROR", "FATAL", "CRITICAL"],
+            "INFO" => vec!["INFO", "WARN", "WARNING", "ERROR", "FATAL", "CRITICAL"],
+            _ => vec![severity],
+        };
+        let in_list: String = levels
+            .iter()
+            .map(|l| format!("'{}'", l.replace('\'', "''")))
+            .collect::<Vec<_>>()
+            .join(",");
+        conditions.push(format!("SeverityText IN ({in_list})"));
+    }
+    if !query_text.is_empty() {
+        conditions.push(format!(
+            "lower(Body) LIKE '%{}%'",
+            query_text
+                .to_lowercase()
+                .replace('\'', "''")
+                .replace('%', "\\%")
+        ));
+    }
+
+    let where_clause = conditions.join(" AND ");
+    format!(
+        "SELECT toString(Timestamp) AS timestamp, \
+                ServiceName AS service_name, \
+                SeverityText AS severity, \
+                Body AS body, \
+                TraceId AS trace_id \
+         FROM logs \
+         WHERE {where_clause} \
+         ORDER BY Timestamp DESC \
+         LIMIT {limit}"
+    )
+}
+
 #[derive(Debug, Row, Deserialize)]
 #[allow(dead_code)] // fields populated by ClickHouse row deserialization
 struct LogRow {
@@ -81,62 +157,14 @@ impl Tool for SearchLogs {
             .unwrap_or(50)
             .min(200);
 
-        let tenant_id = ctx.tenant_id.replace('\'', "\\'");
-
-        let mut conditions = if !around.is_empty() {
-            // ClickHouse expects 'YYYY-MM-DD hh:mm:ss' — strip trailing Z and replace T with space
-            let ts = around
-                .replace('\'', "''")
-                .replace('T', " ")
-                .trim_end_matches('Z')
-                .to_string();
-            vec![
-                format!("Timestamp >= toDateTime64('{ts}', 9) - INTERVAL 5 MINUTE"),
-                format!("Timestamp <= toDateTime64('{ts}', 9) + INTERVAL 5 MINUTE"),
-            ]
-        } else {
-            vec![format!("Timestamp >= now() - INTERVAL {minutes} MINUTE")]
-        };
-        conditions.push(format!("tenant_id = '{tenant_id}'"));
-        if !service.is_empty() {
-            conditions.push(format!("ServiceName = '{}'", service.replace('\'', "''")));
-        }
-        if !severity.is_empty() {
-            // Map severity to include that level and above
-            let levels = match severity.to_uppercase().as_str() {
-                "ERROR" => vec!["ERROR", "FATAL", "CRITICAL"],
-                "WARN" => vec!["WARN", "WARNING", "ERROR", "FATAL", "CRITICAL"],
-                "INFO" => vec!["INFO", "WARN", "WARNING", "ERROR", "FATAL", "CRITICAL"],
-                _ => vec![severity],
-            };
-            let in_list: String = levels
-                .iter()
-                .map(|l| format!("'{l}'"))
-                .collect::<Vec<_>>()
-                .join(",");
-            conditions.push(format!("SeverityText IN ({in_list})"));
-        }
-        if !query_text.is_empty() {
-            conditions.push(format!(
-                "lower(Body) LIKE '%{}%'",
-                query_text
-                    .to_lowercase()
-                    .replace('\'', "''")
-                    .replace('%', "\\%")
-            ));
-        }
-
-        let where_clause = conditions.join(" AND ");
-        let sql = format!(
-            "SELECT toString(Timestamp) AS timestamp, \
-                    ServiceName AS service_name, \
-                    SeverityText AS severity, \
-                    Body AS body, \
-                    TraceId AS trace_id \
-             FROM logs \
-             WHERE {where_clause} \
-             ORDER BY Timestamp DESC \
-             LIMIT {limit}"
+        let sql = build_search_logs_sql(
+            service,
+            severity,
+            query_text,
+            around,
+            minutes,
+            limit,
+            &ctx.tenant_id,
         );
 
         let rows: Vec<LogRow> = crate::state::tenant_query(&ctx.state.ch, &sql, &ctx.tenant_id).fetch_all().await?;
@@ -206,5 +234,52 @@ impl Tool for SearchLogs {
         }
 
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_search_logs_sql;
+
+    #[test]
+    fn service_filter_present_when_set_absent_when_empty() {
+        let with = build_search_logs_sql("api", "", "", "", 15, 50, "default");
+        assert!(with.contains("ServiceName = 'api'"));
+
+        let without = build_search_logs_sql("", "", "", "", 15, 50, "default");
+        assert!(!without.contains("ServiceName ="));
+    }
+
+    #[test]
+    fn single_quotes_are_doubled_never_backslash_escaped() {
+        let sql = build_search_logs_sql("O'Brien", "", "o'clock", "", 15, 50, "ten'ant");
+        assert!(sql.contains("ServiceName = 'O''Brien'"), "{sql}");
+        assert!(sql.contains("tenant_id = 'ten''ant'"), "{sql}");
+        assert!(sql.contains("'%o''clock%'"), "{sql}");
+        assert!(!sql.contains("\\'"), "no backslash quote escaping anywhere: {sql}");
+    }
+
+    #[test]
+    fn severity_fallthrough_value_is_escaped() {
+        let sql = build_search_logs_sql("", "bo'gus", "", "", 15, 50, "default");
+        assert!(sql.contains("SeverityText IN ('bo''gus')"), "{sql}");
+        assert!(!sql.contains("\\'"), "{sql}");
+    }
+
+    #[test]
+    fn minutes_clamp_to_1440_and_limit_present() {
+        let sql = build_search_logs_sql("", "", "", "", 999_999, 50, "default");
+        assert!(sql.contains("INTERVAL 1440 MINUTE"), "{sql}");
+        assert!(sql.contains("LIMIT 50"), "{sql}");
+
+        let capped = build_search_logs_sql("", "", "", "", 15, 9_999, "default");
+        assert!(capped.contains("LIMIT 200"), "limit capped at 200: {capped}");
+    }
+
+    #[test]
+    fn around_replaces_relative_window() {
+        let sql = build_search_logs_sql("", "", "", "2025-01-15T10:30:00Z", 15, 50, "default");
+        assert!(sql.contains("toDateTime64('2025-01-15 10:30:00', 9)"), "{sql}");
+        assert!(!sql.contains("now() - INTERVAL"), "{sql}");
     }
 }

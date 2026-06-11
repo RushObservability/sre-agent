@@ -338,11 +338,27 @@ pub fn clip_tool_result(tool_name: &str, result: &str) -> String {
     if result.len() <= limit {
         return result.to_string();
     }
+    let head = truncate_at_char_boundary(result, limit);
     format!(
         "{}\n...[truncated {} chars]",
-        &result[..limit],
-        result.len() - limit
+        head,
+        result.len() - head.len()
     )
+}
+
+/// Truncate `s` to at most `max` bytes without splitting a multi-byte
+/// character. Slicing at a raw byte index (`&s[..max]`) panics when the cut
+/// lands inside a UTF-8 sequence (smart quotes, emoji, non-Latin log text);
+/// this walks back to the nearest char boundary instead.
+pub(crate) fn truncate_at_char_boundary(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 #[cfg(test)]
@@ -635,5 +651,44 @@ mod tests {
         let long = "x".repeat(5_000);
         let clipped = clip_tool_result("mystery_tool", &long);
         assert!(clipped.contains("[truncated"));
+    }
+
+    // ── truncate_at_char_boundary ──
+
+    #[test]
+    fn truncate_at_char_boundary_no_panic_on_multibyte() {
+        // '…' is 3 bytes in UTF-8; for most `max` values the cut lands mid-char.
+        let s = "…".repeat(100); // 300 bytes
+        for max in 0..=s.len() {
+            let t = truncate_at_char_boundary(&s, max);
+            assert!(t.len() <= max, "result must be ≤{max} bytes, got {}", t.len());
+            assert!(s.starts_with(t));
+        }
+        // Same for a 4-byte emoji.
+        let e = "🚨".repeat(10); // 40 bytes
+        let t = truncate_at_char_boundary(&e, 6);
+        assert_eq!(t, "🚨"); // 4 bytes — walked back from byte 6
+    }
+
+    #[test]
+    fn truncate_at_char_boundary_short_input_unchanged() {
+        assert_eq!(truncate_at_char_boundary("abc", 10), "abc");
+        assert_eq!(truncate_at_char_boundary("abc", 3), "abc");
+        assert_eq!(truncate_at_char_boundary("abcdef", 3), "abc");
+    }
+
+    #[test]
+    fn clip_does_not_panic_when_budget_splits_multibyte_char() {
+        // query_metrics budget is 1500 bytes; fill with 3-byte chars so the
+        // cut at 1500 lands cleanly, then shift by a 1-byte prefix so it
+        // falls mid-char. Both must not panic and stay within budget + suffix.
+        for prefix in ["", "a", "ab"] {
+            let long = format!("{prefix}{}", "…".repeat(1000)); // > 1500 bytes
+            let clipped = clip_tool_result("query_metrics", &long);
+            assert!(clipped.contains("[truncated"));
+            let head = clipped.split("\n...[truncated").next().unwrap();
+            assert!(head.len() <= 1500);
+            assert!(long.starts_with(head));
+        }
     }
 }

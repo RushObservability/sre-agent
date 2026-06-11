@@ -6,6 +6,76 @@ use serde_json::{Value, json};
 
 pub struct QueryTraces;
 
+/// Pure SQL builder for `query_traces`. Every interpolated string value is
+/// escaped with the ClickHouse-standard doubled single quote (`''`); the
+/// model-supplied `minutes`/`limit` are clamped here so a hostile value can
+/// never widen the scan window or row count.
+pub(crate) fn build_query_traces_sql(
+    service: &str,
+    status: &str,
+    around: &str,
+    minutes: u64,
+    limit: u64,
+    tenant_id: &str,
+) -> String {
+    // Clamp the model-supplied window to at most 24h so the LLM can't
+    // request a months-long full scan.
+    let minutes = minutes.clamp(1, 1440);
+    let limit = limit.min(100);
+    let tenant_id = tenant_id.replace('\'', "''");
+
+    let mut conditions = if !around.is_empty() {
+        let ts = around
+            .replace('\'', "''")
+            .replace('T', " ")
+            .trim_end_matches('Z')
+            .to_string();
+        vec![
+            format!("timestamp >= toDateTime64('{ts}', 9) - INTERVAL 5 MINUTE"),
+            format!("timestamp <= toDateTime64('{ts}', 9) + INTERVAL 5 MINUTE"),
+        ]
+    } else {
+        vec![format!("timestamp >= now() - INTERVAL {minutes} MINUTE")]
+    };
+    conditions.push(format!("tenant_id = '{tenant_id}'"));
+    if !service.is_empty() {
+        conditions.push(format!("service_name = '{}'", service.replace('\'', "''")));
+    }
+    if status == "error" {
+        conditions.push("status = 'STATUS_CODE_ERROR'".to_string());
+    } else if status == "ok" {
+        conditions.push("status = 'STATUS_CODE_OK'".to_string());
+    }
+
+    let where_clause = conditions.join(" AND ");
+    format!(
+        "SELECT trace_id, span_id, service_name, http_method, http_path, \
+                http_status_code, status, duration_ns, \
+                toString(timestamp) AS ts_str \
+         FROM spans \
+         WHERE {where_clause} \
+         ORDER BY timestamp DESC \
+         LIMIT {limit}"
+    )
+}
+
+/// Pure SQL builder for `get_trace`. Both interpolated values (`trace_id`,
+/// `tenant_id`) are escaped with the ClickHouse-standard doubled single
+/// quote (`''`).
+pub(crate) fn build_get_trace_sql(trace_id: &str, tenant_id: &str) -> String {
+    let tenant_id = tenant_id.replace('\'', "''");
+    format!(
+        "SELECT span_id, parent_span_id, service_name, http_method, http_path, \
+                http_status_code, status, duration_ns, attributes, \
+                toString(timestamp) AS ts_str \
+         FROM spans \
+         WHERE trace_id = '{}' \
+           AND tenant_id = '{tenant_id}' \
+         ORDER BY timestamp ASC",
+        trace_id.replace('\'', "''")
+    )
+}
+
 #[derive(Debug, Row, Deserialize)]
 #[allow(dead_code)] // fields populated by ClickHouse row deserialization
 struct TraceRow {
@@ -80,41 +150,8 @@ impl Tool for QueryTraces {
             .unwrap_or(20)
             .min(100);
 
-        let tenant_id = ctx.tenant_id.replace('\'', "\\'");
-
-        let mut conditions = if !around.is_empty() {
-            let ts = around
-                .replace('\'', "''")
-                .replace('T', " ")
-                .trim_end_matches('Z')
-                .to_string();
-            vec![
-                format!("timestamp >= toDateTime64('{ts}', 9) - INTERVAL 5 MINUTE"),
-                format!("timestamp <= toDateTime64('{ts}', 9) + INTERVAL 5 MINUTE"),
-            ]
-        } else {
-            vec![format!("timestamp >= now() - INTERVAL {minutes} MINUTE")]
-        };
-        conditions.push(format!("tenant_id = '{tenant_id}'"));
-        if !service.is_empty() {
-            conditions.push(format!("service_name = '{}'", service.replace('\'', "''")));
-        }
-        if status == "error" {
-            conditions.push("status = 'STATUS_CODE_ERROR'".to_string());
-        } else if status == "ok" {
-            conditions.push("status = 'STATUS_CODE_OK'".to_string());
-        }
-
-        let where_clause = conditions.join(" AND ");
-        let query = format!(
-            "SELECT trace_id, span_id, service_name, http_method, http_path, \
-                    http_status_code, status, duration_ns, \
-                    toString(timestamp) AS ts_str \
-             FROM spans \
-             WHERE {where_clause} \
-             ORDER BY timestamp DESC \
-             LIMIT {limit}"
-        );
+        let query =
+            build_query_traces_sql(service, status, around, minutes, limit, &ctx.tenant_id);
 
         let rows: Vec<TraceRow> = crate::state::tenant_query(&ctx.state.ch, &query, &ctx.tenant_id).fetch_all().await?;
 
@@ -246,18 +283,7 @@ impl Tool for GetTrace {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("trace_id is required"))?;
 
-        let tenant_id = ctx.tenant_id.replace('\'', "\\'");
-
-        let query = format!(
-            "SELECT span_id, parent_span_id, service_name, http_method, http_path, \
-                    http_status_code, status, duration_ns, attributes, \
-                    toString(timestamp) AS ts_str \
-             FROM spans \
-             WHERE trace_id = '{}' \
-               AND tenant_id = '{tenant_id}' \
-             ORDER BY timestamp ASC",
-            trace_id.replace('\'', "''")
-        );
+        let query = build_get_trace_sql(trace_id, &ctx.tenant_id);
 
         let rows: Vec<SpanRow> = crate::state::tenant_query(&ctx.state.ch, &query, &ctx.tenant_id).fetch_all().await?;
 
@@ -288,5 +314,55 @@ impl Tool for GetTrace {
             ));
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_get_trace_sql, build_query_traces_sql};
+
+    #[test]
+    fn service_filter_present_when_set_absent_when_empty() {
+        let with = build_query_traces_sql("api", "", "", 15, 20, "default");
+        assert!(with.contains("service_name = 'api'"));
+
+        let without = build_query_traces_sql("", "", "", 15, 20, "default");
+        assert!(!without.contains("service_name = '"));
+    }
+
+    #[test]
+    fn single_quotes_are_doubled_never_backslash_escaped() {
+        let sql = build_query_traces_sql("O'Brien", "error", "", 15, 20, "ten'ant");
+        assert!(sql.contains("service_name = 'O''Brien'"), "{sql}");
+        assert!(sql.contains("tenant_id = 'ten''ant'"), "{sql}");
+        assert!(!sql.contains("\\'"), "no backslash quote escaping anywhere: {sql}");
+    }
+
+    #[test]
+    fn status_filter_maps_to_status_codes() {
+        let err = build_query_traces_sql("", "error", "", 15, 20, "default");
+        assert!(err.contains("status = 'STATUS_CODE_ERROR'"));
+        let ok = build_query_traces_sql("", "ok", "", 15, 20, "default");
+        assert!(ok.contains("status = 'STATUS_CODE_OK'"));
+        let none = build_query_traces_sql("", "", "", 15, 20, "default");
+        assert!(!none.contains("status = 'STATUS_CODE"));
+    }
+
+    #[test]
+    fn minutes_clamp_to_1440_and_limit_present() {
+        let sql = build_query_traces_sql("", "", "", 999_999, 20, "default");
+        assert!(sql.contains("INTERVAL 1440 MINUTE"), "{sql}");
+        assert!(sql.contains("LIMIT 20"), "{sql}");
+
+        let capped = build_query_traces_sql("", "", "", 15, 9_999, "default");
+        assert!(capped.contains("LIMIT 100"), "limit capped at 100: {capped}");
+    }
+
+    #[test]
+    fn get_trace_escapes_trace_id_and_tenant() {
+        let sql = build_get_trace_sql("ab'cd", "ten'ant");
+        assert!(sql.contains("trace_id = 'ab''cd'"), "{sql}");
+        assert!(sql.contains("tenant_id = 'ten''ant'"), "{sql}");
+        assert!(!sql.contains("\\'"), "{sql}");
     }
 }

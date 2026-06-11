@@ -4,6 +4,7 @@ use tokio::sync::mpsc;
 
 use super::memory::{
     CallSignature, WorkingMemory, clip_tool_result, extract_facts_from_tool_result, normalize_args,
+    truncate_at_char_boundary,
 };
 use super::stream::{AgentEvent, ReportKind};
 use super::tools::{ToolContext, ToolRegistry};
@@ -256,6 +257,24 @@ fn compact_old_tool_results(messages: &mut [Value], keep_recent_rounds: usize) {
     }
 }
 
+/// Request body for the chat-completions call. Borrows the live transcript
+/// so each round serializes straight to the request bytes instead of deep
+/// cloning the whole message Vec into an intermediate `Value`.
+#[derive(serde::Serialize)]
+struct ChatRequest<'a> {
+    model: &'a str,
+    messages: &'a [Value],
+    stream: bool,
+    stream_options: StreamOptions,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<&'a Value>,
+}
+
+#[derive(serde::Serialize)]
+struct StreamOptions {
+    include_usage: bool,
+}
+
 /// Configuration for the LLM client used by the agent loop.
 /// Decoupled from env vars so tests can point at a mock server.
 #[derive(Debug, Clone)]
@@ -331,6 +350,23 @@ pub async fn run_with_session(
         budget,
     )
     .await
+}
+
+/// Test-oriented entry point: like [`run_with_session`] but with an explicit
+/// [`LlmConfig`] (so tests can point at a mock server without env vars) AND an
+/// explicit [`LoopBudget`]. Thin public wrapper over the core loop.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_with_config_and_budget(
+    messages: Vec<Value>,
+    registry: &ToolRegistry,
+    ctx: &ToolContext,
+    tx: &mpsc::Sender<AgentEvent>,
+    llm: LlmConfig,
+    restored_memory: Option<WorkingMemory>,
+    session_id: &str,
+    budget: LoopBudget,
+) -> Result<(String, ReportKind, WorkingMemory, u64, u64, String)> {
+    run_inner(messages, registry, ctx, tx, llm, restored_memory, session_id, budget).await
 }
 
 /// Core agent loop implementation.
@@ -432,14 +468,16 @@ async fn run_inner(
         // round is pure prompt-token waste (O(n²) growth over a long run).
         compact_old_tool_results(&mut messages, KEEP_RECENT_TOOL_ROUNDS);
 
-        // Inject working memory as a system message if we have facts to share.
-        // This is a fresh view each iteration — the memory persists across compaction.
-        let mut turn_messages = messages.clone();
-        if !memory.confirmed_facts.is_empty()
+        // Inject working memory as a TRANSIENT system message if we have facts
+        // to share. This is a fresh view each iteration — it's pushed onto the
+        // live transcript only for the duration of the request and popped
+        // right after, so it never persists in the durable transcript (and we
+        // avoid deep-cloning the whole message Vec every round).
+        let injected_memory = !memory.confirmed_facts.is_empty()
             || !memory.suspect_services.is_empty()
-            || !memory.ruled_out.is_empty()
-        {
-            turn_messages.push(serde_json::json!({
+            || !memory.ruled_out.is_empty();
+        if injected_memory {
+            messages.push(serde_json::json!({
                 "role": "system",
                 "content": memory.to_prompt_block(),
             }));
@@ -448,30 +486,36 @@ async fn run_inner(
         // Final round or dead-end: force summary by withholding tools
         let force_final = tool_steps + 1 >= budget.max_tool_steps || force_summary;
 
-        let mut body = serde_json::json!({
-            "model": model,
-            "messages": turn_messages,
-            "stream": true,
-            "stream_options": { "include_usage": true },
-        });
-        if !force_final {
-            body["tools"] = tool_definitions.clone();
-        }
+        let resp = {
+            let body = ChatRequest {
+                model: &model,
+                messages: &messages,
+                stream: true,
+                stream_options: StreamOptions { include_usage: true },
+                tools: if force_final { None } else { Some(&tool_definitions) },
+            };
+            client
+                .post(&url)
+                .header("Authorization", format!("Bearer {api_key}"))
+                .header("Content-Type", "application/json")
+                .json(&body)
+                .send()
+                .await
+        };
 
-        let resp = client
-            .post(&url)
-            .header("Authorization", format!("Bearer {api_key}"))
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await?;
+        // Remove the transient memory message BEFORE any error propagation or
+        // transcript appends, so it can never leak into the durable transcript.
+        if injected_memory {
+            messages.pop();
+        }
+        let resp = resp?;
 
         if !resp.status().is_success() {
             let status = resp.status();
             let err_body = resp.text().await.unwrap_or_default();
             let msg = format!(
                 "LLM returned {status}: {}",
-                &err_body[..err_body.len().min(500)]
+                truncate_at_char_boundary(&err_body, 500)
             );
             let _ = tx
                 .send(AgentEvent::Error {
@@ -595,27 +639,27 @@ async fn run_inner(
         }
         messages.push(assistant_msg);
 
-        // Execute each tool call (usually just one per round)
-        let mut any_real_work = false;
+        // Execute the round's tool calls (usually just one per round).
+        //
+        // Pass 1 — synchronous bookkeeping in call order. Repeat-call
+        // detection must see earlier calls from the SAME round, so
+        // record_call/record_signal happen here, before anything executes.
+        enum Planned {
+            /// Repeat call — precomputed structured error, never executed.
+            PrecomputedError(String),
+            /// New call — execute against the registry.
+            Execute,
+        }
+        let mut planned: Vec<(Value, Planned)> = Vec::with_capacity(tool_calls.len());
         for tc in &tool_calls {
             let args: Value = serde_json::from_str(&tc.arguments).unwrap_or(Value::Null);
 
-            let _ = tx
-                .send(AgentEvent::ToolCall {
-                    name: tc.name.clone(),
-                    args: args.clone(),
-                })
-                .await;
-
-            // Repeat-call detection — return structured error, don't execute
             let sig = CallSignature {
                 tool: tc.name.clone(),
                 args_normalized: normalize_args(&args),
             };
-            let is_repeat = memory.is_repeat_call(&sig);
-
-            let result = if is_repeat {
-                format!(
+            let plan = if memory.is_repeat_call(&sig) {
+                Planned::PrecomputedError(format!(
                     "Error: this exact tool call was already made in this investigation. \
                      Do not repeat identical queries. Options:\n\
                      - Vary the time window, service, or filters\n\
@@ -623,24 +667,60 @@ async fn run_inner(
                      - If you have enough evidence, produce your final report instead\n\
                      Previous call: {} with args matching this one.",
                     tc.name
-                )
+                ))
             } else {
                 memory.record_call(sig);
                 if let Some(sig_type) = tool_signal_type(&tc.name) {
                     memory.record_signal(sig_type);
                 }
-                match registry.execute(&tc.name, args.clone(), ctx).await {
-                    Ok(data) => {
-                        any_real_work = true;
-                        clip_tool_result(&tc.name, &data)
-                    }
-                    Err(e) => format!("Tool error: {e}"),
-                }
+                Planned::Execute
             };
+            planned.push((args, plan));
+        }
 
-            // Update working memory from this result
-            if !is_repeat {
-                let facts = extract_facts_from_tool_result(&tc.name, &args, &result);
+        // Announce every call (including repeats) in order before execution.
+        for (tc, (args, _)) in tool_calls.iter().zip(&planned) {
+            let _ = tx
+                .send(AgentEvent::ToolCall {
+                    name: tc.name.clone(),
+                    args: args.clone(),
+                })
+                .await;
+        }
+
+        // Pass 2 — run the real calls concurrently: round wall time becomes
+        // max(tool latencies) instead of their sum. Each future yields
+        // (did_real_work, result_text).
+        let outcomes: Vec<(bool, String)> = futures_util::future::join_all(
+            tool_calls.iter().zip(&planned).map(|(tc, (args, plan))| async move {
+                match plan {
+                    Planned::PrecomputedError(msg) => (false, msg.clone()),
+                    Planned::Execute => match registry.execute(&tc.name, args.clone(), ctx).await
+                    {
+                        Ok(data) => (true, clip_tool_result(&tc.name, &data)),
+                        Err(e) => (false, format!("Tool error: {e}")),
+                    },
+                }
+            }),
+        )
+        .await;
+
+        // Pass 3 — apply results in original call order, with the same
+        // per-call sequence as the old sequential loop: memory fact
+        // extraction → empty-result accounting → ToolResult event →
+        // transcript push.
+        let mut any_real_work = false;
+        for ((tc, (args, plan)), (real_work, result)) in
+            tool_calls.iter().zip(&planned).zip(outcomes)
+        {
+            if real_work {
+                any_real_work = true;
+            }
+
+            // Update working memory from this result (skipped for repeats,
+            // matching the previous behavior).
+            if !matches!(plan, Planned::PrecomputedError(_)) {
+                let facts = extract_facts_from_tool_result(&tc.name, args, &result);
                 for svc in facts.services {
                     memory.add_suspect_service(svc);
                 }
@@ -880,15 +960,20 @@ async fn parse_streaming_response(
         let chunk = chunk?;
         buf.extend_from_slice(&chunk);
 
-        // Process every complete line currently in the buffer.
-        while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
-            let line_bytes: Vec<u8> = buf.drain(..=pos).collect();
-            let line = String::from_utf8_lossy(&line_bytes);
+        // Process every complete line currently in the buffer. A cursor scan
+        // with a single drain at the end avoids shifting the whole remaining
+        // buffer to the front once per line.
+        let mut cursor = 0usize;
+        while let Some(rel) = buf[cursor..].iter().position(|&b| b == b'\n') {
+            let end = cursor + rel;
+            let line = String::from_utf8_lossy(&buf[cursor..=end]);
             if process_sse_line(&line, &mut accum, tx).await {
                 done = true;
                 break 'recv; // [DONE] — anything after it is ignored
             }
+            cursor = end + 1;
         }
+        buf.drain(..cursor);
 
         if buf.len() > MAX_LINE_BUFFER {
             return Err(anyhow::anyhow!(
@@ -1032,5 +1117,273 @@ mod tests {
         for (i, c) in contents.iter().enumerate().skip(2) {
             assert_eq!(c, &format!("tool result {i}"));
         }
+    }
+
+    // ── root_cause_gate ──────────────────────────────────────────────────
+
+    /// Memory satisfying every gate criterion: ≥2 signals, ≥2 facts.
+    fn satisfied_memory() -> WorkingMemory {
+        let mut mem = WorkingMemory::new("investigate".to_string());
+        mem.record_signal("logs");
+        mem.record_signal("traces");
+        mem.add_fact("search_logs: 5 errors in api".to_string());
+        mem.add_fact("query_traces: p99 spike at 10:30".to_string());
+        mem
+    }
+
+    #[test]
+    fn gate_rejects_insufficient_depth_with_step_counts() {
+        let mem = satisfied_memory();
+        let msg = root_cause_gate(&mem, 1, 4).expect("gate must reject depth 1 < 4");
+        assert!(msg.contains("Only 1 investigation step(s)"), "mentions current steps: {msg}");
+        assert!(msg.contains("at least 4"), "mentions required min depth: {msg}");
+    }
+
+    #[test]
+    fn gate_rejects_single_signal_and_names_missing_signal_types() {
+        let mut mem = WorkingMemory::new("investigate".to_string());
+        mem.record_signal("logs");
+        mem.add_fact("fact one".to_string());
+        mem.add_fact("fact two".to_string());
+        let msg = root_cause_gate(&mem, 5, 4).expect("gate must reject 1 signal type");
+        assert!(msg.contains("Only 1 signal type(s) checked"), "{msg}");
+        // logs already consulted → the two suggested missing types are traces, metrics
+        assert!(msg.contains("traces, metrics"), "names unconsulted signal types: {msg}");
+    }
+
+    #[test]
+    fn gate_rejects_fewer_than_two_facts() {
+        let mut mem = WorkingMemory::new("investigate".to_string());
+        mem.record_signal("logs");
+        mem.record_signal("metrics");
+        mem.add_fact("only one fact".to_string());
+        let msg = root_cause_gate(&mem, 5, 4).expect("gate must reject <2 facts");
+        assert!(msg.contains("Fewer than 2 confirmed facts"), "{msg}");
+        assert!(msg.contains("(have 1)"), "reports current fact count: {msg}");
+    }
+
+    #[test]
+    fn gate_passes_when_all_criteria_satisfied() {
+        let mem = satisfied_memory();
+        assert_eq!(root_cause_gate(&mem, 4, 4), None, "depth == min_depth must pass");
+        assert_eq!(root_cause_gate(&mem, 10, 4), None);
+    }
+
+    #[test]
+    fn gate_lists_all_gaps_when_everything_is_missing() {
+        let mem = WorkingMemory::new("investigate".to_string());
+        let msg = root_cause_gate(&mem, 0, 4).expect("fresh memory must be rejected");
+        assert!(msg.contains("Only 0 investigation step(s)"), "{msg}");
+        assert!(msg.contains("Only 0 signal type(s)"), "{msg}");
+        assert!(msg.contains("Fewer than 2 confirmed facts"), "{msg}");
+    }
+
+    // ── decide_report_kind ───────────────────────────────────────────────
+
+    #[test]
+    fn question_prefix_yields_question_kind() {
+        // Even a fully satisfied memory: [QUESTION] always wins.
+        let mem = satisfied_memory();
+        let kind = decide_report_kind(&mem, "  [QUESTION] Which env?", 10, 4);
+        assert_eq!(kind, ReportKind::Question);
+    }
+
+    #[test]
+    fn escalated_memory_yields_preliminary() {
+        let mut mem = satisfied_memory();
+        mem.add_suspect_service("api".to_string());
+        mem.escalation_level = 2;
+        let kind = decide_report_kind(&mem, "## Root Cause", 10, 4);
+        assert_eq!(kind, ReportKind::Preliminary);
+    }
+
+    #[test]
+    fn happy_path_yields_final() {
+        let mut mem = satisfied_memory();
+        mem.add_suspect_service("api".to_string());
+        let kind = decide_report_kind(&mem, "## Root Cause", 5, 4);
+        assert_eq!(kind, ReportKind::Final);
+    }
+
+    #[test]
+    fn insufficient_depth_yields_preliminary() {
+        let mut mem = satisfied_memory();
+        mem.add_suspect_service("api".to_string());
+        let kind = decide_report_kind(&mem, "## Root Cause", 3, 4);
+        assert_eq!(kind, ReportKind::Preliminary);
+    }
+
+    // ── LoopBudget ───────────────────────────────────────────────────────
+
+    #[test]
+    fn budget_defaults_when_no_overrides() {
+        let b = LoopBudget::from_overrides(None, None);
+        assert_eq!(b.max_tool_steps, 40);
+        assert_eq!(b.max_llm_calls, 55);
+    }
+
+    #[test]
+    fn budget_low_steps_clamp_to_four_and_calls_floor_at_steps_plus_two() {
+        let b = LoopBudget::from_overrides(Some(1), Some(1));
+        assert_eq!(b.max_tool_steps, 4, "steps clamp up to 4");
+        assert_eq!(b.max_llm_calls, 6, "calls floored at steps + 2");
+
+        // Calls below steps+2 get raised even with default steps.
+        let b = LoopBudget::from_overrides(Some(10), Some(5));
+        assert_eq!(b.max_tool_steps, 10);
+        assert_eq!(b.max_llm_calls, 12);
+    }
+
+    #[test]
+    fn budget_caps_at_200_and_300() {
+        let b = LoopBudget::from_overrides(Some(9999), Some(9999));
+        assert_eq!(b.max_tool_steps, 200);
+        assert_eq!(b.max_llm_calls, 300);
+    }
+
+    #[test]
+    fn budget_min_depth_adapts_to_small_step_budgets() {
+        // Default budget → full MIN_INVESTIGATION_DEPTH.
+        assert_eq!(LoopBudget::default().min_depth(), MIN_INVESTIGATION_DEPTH);
+        // Smallest legal budget (4 steps) → depth shrinks below the constant.
+        assert_eq!(LoopBudget::from_overrides(Some(1), None).min_depth(), 3);
+        // Pathological direct construction still bottoms out at 1.
+        let b = LoopBudget { max_tool_steps: 1, max_llm_calls: 3 };
+        assert_eq!(b.min_depth(), 1);
+    }
+
+    // ── strip_question_prefix ────────────────────────────────────────────
+
+    #[test]
+    fn strip_question_prefix_variants() {
+        assert_eq!(strip_question_prefix("[QUESTION] Which one?"), "Which one?");
+        assert_eq!(strip_question_prefix("  [QUESTION]   Which one?"), "Which one?");
+        assert_eq!(strip_question_prefix("No prefix here"), "No prefix here");
+        // Prefix not at the start is left alone.
+        assert_eq!(
+            strip_question_prefix("answer [QUESTION] mid"),
+            "answer [QUESTION] mid"
+        );
+    }
+
+    // ── tool_signal_type ─────────────────────────────────────────────────
+
+    #[test]
+    fn tool_signal_type_maps_every_arm() {
+        assert_eq!(tool_signal_type("search_logs"), Some("logs"));
+        for t in ["query_traces", "get_trace", "list_services", "service_dependencies"] {
+            assert_eq!(tool_signal_type(t), Some("traces"), "{t}");
+        }
+        assert_eq!(tool_signal_type("query_metrics"), Some("metrics"));
+        for t in ["kube_describe", "kube_events", "get_argocd_app"] {
+            assert_eq!(tool_signal_type(t), Some("kubernetes"), "{t}");
+        }
+        assert_eq!(tool_signal_type("list_deploys"), Some("deploys"));
+        assert_eq!(tool_signal_type("read_skill"), None);
+        assert_eq!(tool_signal_type(""), None);
+    }
+
+    // ── process_sse_line ─────────────────────────────────────────────────
+
+    /// Drive process_sse_line over a sequence of lines and return the final
+    /// accumulator plus all events emitted, plus whether [DONE] was seen.
+    async fn run_lines(lines: &[&str]) -> (StreamAccum, Vec<AgentEvent>, bool) {
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
+        let mut accum = StreamAccum::default();
+        let mut done = false;
+        for line in lines {
+            if process_sse_line(line, &mut accum, &tx).await {
+                done = true;
+            }
+        }
+        drop(tx);
+        let mut events = Vec::new();
+        while let Some(e) = rx.recv().await {
+            events.push(e);
+        }
+        (accum, events, done)
+    }
+
+    #[tokio::test]
+    async fn sse_content_deltas_append_and_emit() {
+        let (accum, events, done) = run_lines(&[
+            r#"data: {"choices":[{"delta":{"content":"Hel"}}]}"#,
+            r#"data: {"choices":[{"delta":{"content":"lo"}}]}"#,
+        ])
+        .await;
+        assert_eq!(accum.content, "Hello");
+        assert!(!done);
+        let deltas: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::ThinkingDelta { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deltas, vec!["Hel", "lo"], "each delta emitted as it arrives");
+    }
+
+    #[tokio::test]
+    async fn sse_tool_call_fragments_accumulate_by_index_across_lines() {
+        let (accum, _events, _done) = run_lines(&[
+            // Tool 0: id + name, then args split over two lines.
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","function":{"name":"search_logs"}}]}}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"service\":"}}]}}]}"#,
+            // Tool 1 arrives interleaved before tool 0 finishes.
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_b","function":{"name":"query_traces","arguments":"{}"}}]}}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"api\"}"}}]}}]}"#,
+        ])
+        .await;
+        assert_eq!(accum.tool_calls.len(), 2);
+        assert_eq!(accum.tool_calls[0].id, "call_a");
+        assert_eq!(accum.tool_calls[0].name, "search_logs");
+        assert_eq!(accum.tool_calls[0].arguments, r#"{"service":"api"}"#);
+        assert_eq!(accum.tool_calls[1].id, "call_b");
+        assert_eq!(accum.tool_calls[1].name, "query_traces");
+        assert_eq!(accum.tool_calls[1].arguments, "{}");
+    }
+
+    #[tokio::test]
+    async fn sse_usage_chunk_is_parsed() {
+        let (accum, _events, _done) = run_lines(&[
+            r#"data: {"choices":[],"usage":{"prompt_tokens":123,"completion_tokens":45}}"#,
+        ])
+        .await;
+        assert_eq!(accum.prompt_tokens, 123);
+        assert_eq!(accum.completion_tokens, 45);
+    }
+
+    #[tokio::test]
+    async fn sse_done_sentinel_is_terminal() {
+        let (accum, _events, done) = run_lines(&["data: [DONE]"]).await;
+        assert!(done);
+        assert_eq!(accum.content, "");
+    }
+
+    #[tokio::test]
+    async fn sse_malformed_json_is_tolerated() {
+        let (accum, events, done) = run_lines(&[
+            "data: {this is not json",
+            r#"data: {"choices":[{"delta":{"content":"ok"}}]}"#,
+        ])
+        .await;
+        assert!(!done);
+        assert_eq!(accum.content, "ok", "parsing continues after a bad line");
+        assert_eq!(events.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn sse_non_data_lines_are_ignored() {
+        let (accum, events, done) = run_lines(&[
+            "",
+            ": keep-alive comment",
+            "event: message",
+            "id: 7",
+        ])
+        .await;
+        assert!(!done);
+        assert_eq!(accum.content, "");
+        assert!(accum.tool_calls.is_empty());
+        assert!(events.is_empty());
     }
 }

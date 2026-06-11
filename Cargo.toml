@@ -51,6 +51,11 @@ chrono = { version = "0.4", features = ["serde"] }
 dotenvy = "0.15"
 uuid = { version = "1", features = ["v4"] }
 
+[dev-dependencies]
+# HTTP oneshot tests: drive the production axum Router without a socket.
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+
 [profile.release]
 lto = true
 codegen-units = 1

@@ -138,6 +138,25 @@ impl ConfigDb {
         Ok(db)
     }
 
+    /// TEST-ONLY constructor: build a ConfigDb whose client points at an
+    /// unroutable localhost port, WITHOUT connecting or running migrations.
+    ///
+    /// The `clickhouse` crate client is lazy — no I/O happens until a query
+    /// is executed — so this is synchronous and infallible. Any query made
+    /// through it fails fast with a connection error.
+    ///
+    /// Exists so integration tests (e.g. `tests/loop_runner_mock.rs`) can
+    /// build a `ToolContext` without a live ClickHouse. NEVER use this in
+    /// production code paths: it is deliberately disconnected and skips the
+    /// owned-table migrations that `open` guarantees.
+    pub fn new_disconnected_for_tests() -> Self {
+        Self {
+            // Port 1 (tcpmux) is unroutable/closed on any sane dev box —
+            // queries error out immediately instead of hanging.
+            client: Client::default().with_url("http://127.0.0.1:1"),
+        }
+    }
+
     /// Create the two sre-agent-owned tables if they do not already exist.
     /// Idempotent — for standalone/first-boot safety. Schemas match query-api.
     async fn run_owned_migrations(&self) -> anyhow::Result<()> {

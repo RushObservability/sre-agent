@@ -120,6 +120,7 @@ async fn main() -> anyhow::Result<()> {
         ch,
         config_db,
         query_api_url,
+        caches: Arc::new(Default::default()),
     };
 
     let port: u16 = std::env::var("SRE_AGENT_PORT")
@@ -175,9 +176,28 @@ async fn investigate(
         ));
     }
 
-    // Build the unified skill store (fresh per request).
-    let skill_store =
-        Arc::new(SkillStore::load_unified(&state.config_db, state.query_api_url.as_deref()).await);
+    // Build the unified skill store, cached for 60s — skill edits show up on
+    // the next investigation within a minute, without paying an HTTP fetch to
+    // query-api (or a config_db scan) on every single request.
+    const SKILL_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+    let cached_skills = {
+        let guard = state.caches.skills.read().await;
+        guard
+            .as_ref()
+            .filter(|(built_at, _)| built_at.elapsed() < SKILL_CACHE_TTL)
+            .map(|(_, store)| store.clone())
+    };
+    let skill_store = match cached_skills {
+        Some(store) => store,
+        None => {
+            let store = Arc::new(
+                SkillStore::load_unified(&state.config_db, state.query_api_url.as_deref()).await,
+            );
+            *state.caches.skills.write().await =
+                Some((std::time::Instant::now(), store.clone()));
+            store
+        }
+    };
 
     // Determine whether this is a new or existing session.
     let is_new_session = req.session_id.is_empty();
@@ -337,11 +357,10 @@ async fn investigate(
             );
         }
 
-        // Inject working memory block into system prompt if present
-        if let Some(ref mem) = restored_memory {
-            system_content.push_str(&format!("\n\n{}", mem.to_prompt_block()));
-        }
-
+        // NOTE: restored working memory is intentionally NOT spliced into this
+        // system message. Mutating message[0] every turn invalidates the LLM
+        // provider's prompt-prefix cache for the whole transcript; the memory
+        // block is appended as a separate trailing system message below instead.
         let system_msg = serde_json::json!({
             "role": "system",
             "content": system_content,
@@ -406,6 +425,25 @@ async fn investigate(
             }));
         }
 
+        // Inject restored working memory as a SEPARATE system message at the
+        // end of the restored history, just before the new user message. The
+        // memory block changes every turn; keeping it at the tail leaves the
+        // original system prompt + history prefix byte-identical across turns
+        // so the provider's prompt cache keeps hitting.
+        if let Some(ref mem) = restored_memory {
+            let mem_msg = serde_json::json!({
+                "role": "system",
+                "content": mem.to_prompt_block(),
+            });
+            let is_trailing_user = msgs
+                .last()
+                .and_then(|m| m.get("role"))
+                .and_then(|r| r.as_str())
+                == Some("user");
+            let insert_at = if is_trailing_user { msgs.len() - 1 } else { msgs.len() };
+            msgs.insert(insert_at, mem_msg);
+        }
+
         msgs
     };
 
@@ -437,21 +475,64 @@ async fn investigate(
     // stored in config_settings) win; env vars are the fallback for
     // deployments without the settings UI; defaults otherwise. Values are
     // untrusted strings either way — LoopBudget::from_overrides clamps them.
-    let budget = {
-        let read = |key: &'static str, env: &'static str| {
-            let db = state.config_db.clone();
-            async move {
-                match db.get_setting(key).await {
-                    Ok(Some(v)) => v.trim().parse::<u32>().ok(),
-                    _ => std::env::var(env).ok().and_then(|v| v.trim().parse::<u32>().ok()),
-                }
-            }
-        };
-        agent::loop_runner::LoopBudget::from_overrides(
-            read("sre_agent_max_tool_steps", "SRE_AGENT_MAX_TOOL_STEPS").await,
-            read("sre_agent_max_llm_calls", "SRE_AGENT_MAX_LLM_CALLS").await,
-        )
+    // Cached for 30s — saves two `config_settings FINAL` scans per request;
+    // operator changes to the budget take effect within half a minute.
+    const BUDGET_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+    let cached_budget = {
+        let guard = state.caches.budget.read().await;
+        guard
+            .as_ref()
+            .filter(|(read_at, _)| read_at.elapsed() < BUDGET_CACHE_TTL)
+            .map(|(_, b)| *b)
     };
+    let budget = match cached_budget {
+        Some(b) => b,
+        None => {
+            let read = |key: &'static str, env: &'static str| {
+                let db = state.config_db.clone();
+                async move {
+                    match db.get_setting(key).await {
+                        Ok(Some(v)) => v.trim().parse::<u32>().ok(),
+                        _ => std::env::var(env).ok().and_then(|v| v.trim().parse::<u32>().ok()),
+                    }
+                }
+            };
+            let b = agent::loop_runner::LoopBudget::from_overrides(
+                read("sre_agent_max_tool_steps", "SRE_AGENT_MAX_TOOL_STEPS").await,
+                read("sre_agent_max_llm_calls", "SRE_AGENT_MAX_LLM_CALLS").await,
+            );
+            *state.caches.budget.write().await = Some((std::time::Instant::now(), b));
+            b
+        }
+    };
+
+    // Fail fast with a setup-oriented message when no LLM is configured —
+    // otherwise the user sees a bare "LLM_API_KEY not set" mid-stream. The
+    // "LLM not configured:" prefix is a stable marker the UI styles as a
+    // setup card. Only env var NAMES are mentioned, never values.
+    if agent::loop_runner::LlmConfig::from_env().is_err() {
+        let _ = tx
+            .send(AgentEvent::Error {
+                message: "LLM not configured: the SRE agent needs an LLM to run investigations. \
+                          Set the LLM_API_KEY environment variable on the sre-agent service \
+                          (optionally LLM_MODEL and LLM_BASE_URL for non-OpenAI providers) \
+                          and restart it. Telemetry browsing in the rest of the app is unaffected."
+                    .to_string(),
+            })
+            .await;
+        drop(tx);
+        let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+        let body_stream = futures_util::StreamExt::map(stream, |event| {
+            Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(event.to_sse_bytes()))
+        });
+        return Ok(Response::builder()
+            .status(200)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .header(header::CACHE_CONTROL, "no-cache")
+            .header(header::CONNECTION, "keep-alive")
+            .body(Body::from_stream(body_stream))
+            .unwrap());
+    }
 
     // Spawn the agent loop in a background task, then persist results
     let config_db = state.config_db.clone();
@@ -489,29 +570,26 @@ async fn investigate(
                         )
                         .await;
 
-                    // Serialize and persist working memory
-                    if let Ok(mem_json) = serde_json::to_string(&final_memory) {
-                        let _ = config_db
-                            .update_session_memory(&session_id_for_task, &mem_json)
-                            .await;
-                    }
-
-                    // Accumulate token usage
+                    // Persist memory + accumulated tokens (+ status for final
+                    // reports) in one read + one versioned insert instead of
+                    // three read-modify-write cycles.
+                    let mem_json = serde_json::to_string(&final_memory)
+                        .unwrap_or_else(|_| "{}".to_string());
+                    let status = if report_kind == agent::stream::ReportKind::Final {
+                        Some("completed")
+                    } else {
+                        None
+                    };
                     let _ = config_db
-                        .update_session_tokens(
+                        .update_session_after_turn(
                             &session_id_for_task,
+                            &mem_json,
                             total_prompt,
                             total_completion,
                             &llm_model_used,
+                            status,
                         )
                         .await;
-
-                    // If the report is final, mark session completed
-                    if report_kind == agent::stream::ReportKind::Final {
-                        let _ = config_db
-                            .update_session_status(&session_id_for_task, "completed")
-                            .await;
-                    }
                 }
             }
             Err(e) => {

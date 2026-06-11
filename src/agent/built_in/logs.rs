@@ -68,7 +68,13 @@ impl Tool for SearchLogs {
         let severity = args.get("severity").and_then(|v| v.as_str()).unwrap_or("");
         let query_text = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
         let around = args.get("around").and_then(|v| v.as_str()).unwrap_or("");
-        let minutes = args.get("minutes").and_then(|v| v.as_u64()).unwrap_or(15);
+        // Clamp the model-supplied window to at most 24h so the LLM can't
+        // request a months-long full scan.
+        let minutes = args
+            .get("minutes")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(15)
+            .clamp(1, 1440);
         let limit = args
             .get("limit")
             .and_then(|v| v.as_u64())

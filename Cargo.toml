@@ -42,8 +42,8 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# HTTP client (for LLM calls)
-reqwest = { version = "0.12", features = ["json"] }
+# HTTP client (for LLM calls; "stream" enables incremental SSE consumption)
+reqwest = { version = "0.12", features = ["json", "stream"] }
 
 # Utilities
 async-trait = "0.1"

@@ -188,6 +188,74 @@ fn strip_question_prefix(content: &str) -> String {
     }
 }
 
+/// Shared HTTP client for LLM calls. Built once per process with explicit
+/// timeouts so a hung LLM backend can never pin a worker forever:
+/// - connect: 10s (fail fast on unreachable backends)
+/// - total: 300s per call (generous for long streamed generations; streaming
+///   reads count against it)
+/// Reusing one client also keeps the TLS connection pool warm across runs.
+fn llm_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(300))
+            .build()
+            .expect("failed to build LLM HTTP client")
+    })
+}
+
+/// Stub text written over old tool results during transcript compaction.
+const COMPACTED_TOOL_RESULT: &str =
+    "[tool result compacted — key facts retained in working memory]";
+
+/// How many most-recent assistant-tool-call rounds keep their full tool
+/// results in the transcript. Older tool results are stubbed — their key
+/// facts already live in working memory (`memory.to_prompt_block()`), so
+/// resending multi-KB raw results every round is pure prompt-token waste.
+const KEEP_RECENT_TOOL_ROUNDS: usize = 6;
+
+/// Replace the content of tool-result messages older than the most recent
+/// `keep_recent_rounds` assistant-tool-call rounds with a one-line stub.
+///
+/// Rounds are counted from the END of the transcript: each assistant message
+/// carrying `tool_calls` marks a round boundary. Tool messages appearing
+/// BEFORE the cutoff round's assistant message are stubbed; everything at or
+/// after it is left intact. System/user/assistant messages are never touched,
+/// and already-stubbed messages are skipped (idempotent).
+fn compact_old_tool_results(messages: &mut [Value], keep_recent_rounds: usize) {
+    // Find the index of the keep_recent_rounds-th most recent assistant
+    // message that carries tool_calls. Tool messages before that index are old.
+    let mut rounds_seen = 0usize;
+    let mut cutoff: Option<usize> = None;
+    for (idx, msg) in messages.iter().enumerate().rev() {
+        let is_assistant_tool_round = msg.get("role").and_then(|r| r.as_str())
+            == Some("assistant")
+            && msg.get("tool_calls").is_some_and(|tc| !tc.is_null());
+        if is_assistant_tool_round {
+            rounds_seen += 1;
+            if rounds_seen == keep_recent_rounds {
+                cutoff = Some(idx);
+                break;
+            }
+        }
+    }
+    let Some(cutoff) = cutoff else {
+        // Fewer than keep_recent_rounds rounds in the transcript — nothing old.
+        return;
+    };
+
+    for msg in messages.iter_mut().take(cutoff) {
+        if msg.get("role").and_then(|r| r.as_str()) != Some("tool") {
+            continue;
+        }
+        if msg.get("content").and_then(|c| c.as_str()) == Some(COMPACTED_TOOL_RESULT) {
+            continue; // already stubbed
+        }
+        msg["content"] = Value::String(COMPACTED_TOOL_RESULT.to_string());
+    }
+}
+
 /// Configuration for the LLM client used by the agent loop.
 /// Decoupled from env vars so tests can point at a mock server.
 #[derive(Debug, Clone)]
@@ -285,8 +353,12 @@ async fn run_inner(
     let api_key = llm.api_key;
     let model = llm.model;
 
-    let client = reqwest::Client::new();
+    let client = llm_client();
     let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
+
+    // Tool definitions are immutable for the whole run — build them once
+    // instead of re-serializing every tool's JSON schema each round.
+    let tool_definitions = Value::Array(registry.definitions());
 
     let mut messages = messages;
 
@@ -328,7 +400,37 @@ async fn run_inner(
     let mut self_review_done = false;
 
     while tool_steps < budget.max_tool_steps && attempts < budget.max_llm_calls {
+        // Client disconnected (SSE receiver dropped) — every send would be
+        // discarded and each further round only burns LLM tokens. Stop now
+        // and hand back the memory gathered so far so the caller persists it.
+        if tx.is_closed() {
+            tracing::info!(
+                session_id,
+                tool_steps,
+                attempts,
+                "client disconnected — aborting investigation early"
+            );
+            let text = format!(
+                "## Preliminary Investigation Report\n\n**Status**: Client disconnected before \
+                 the investigation completed\n\n{}",
+                memory.to_prompt_block()
+            );
+            return Ok((
+                text,
+                ReportKind::Preliminary,
+                memory,
+                total_prompt,
+                total_completion,
+                model,
+            ));
+        }
+
         attempts += 1;
+
+        // Compact tool results older than the recent rounds — their key facts
+        // already live in working memory, so resending the raw payloads every
+        // round is pure prompt-token waste (O(n²) growth over a long run).
+        compact_old_tool_results(&mut messages, KEEP_RECENT_TOOL_ROUNDS);
 
         // Inject working memory as a system message if we have facts to share.
         // This is a fresh view each iteration — the memory persists across compaction.
@@ -345,11 +447,6 @@ async fn run_inner(
 
         // Final round or dead-end: force summary by withholding tools
         let force_final = tool_steps + 1 >= budget.max_tool_steps || force_summary;
-        let tools = if force_final {
-            None
-        } else {
-            Some(registry.definitions())
-        };
 
         let mut body = serde_json::json!({
             "model": model,
@@ -357,8 +454,8 @@ async fn run_inner(
             "stream": true,
             "stream_options": { "include_usage": true },
         });
-        if let Some(tools) = &tools {
-            body["tools"] = Value::Array(tools.clone());
+        if !force_final {
+            body["tools"] = tool_definitions.clone();
         }
 
         let resp = client
@@ -667,94 +764,273 @@ struct ToolCallAccum {
     arguments: String,
 }
 
-/// Parse an OpenAI-compatible streaming response.
-/// Returns (content_text, tool_calls, (prompt_tokens, completion_tokens)).
-async fn parse_streaming_response(
-    resp: reqwest::Response,
-    tx: &mpsc::Sender<AgentEvent>,
-) -> Result<(String, Vec<ToolCallAccum>, (u64, u64))> {
-    let mut content = String::new();
-    let mut tool_calls: Vec<ToolCallAccum> = Vec::new();
-    let mut prompt_tokens = 0u64;
-    let mut completion_tokens = 0u64;
+/// Mutable accumulation state for one streaming LLM response.
+#[derive(Default)]
+struct StreamAccum {
+    content: String,
+    tool_calls: Vec<ToolCallAccum>,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+}
 
-    let full_body = resp.text().await?;
+/// Process one complete SSE line. Forwards content deltas over `tx` as they
+/// arrive and accumulates tool-call fragments and usage. Returns `true` when
+/// the `[DONE]` sentinel is seen. Malformed lines are tolerated (skipped).
+async fn process_sse_line(line: &str, accum: &mut StreamAccum, tx: &mpsc::Sender<AgentEvent>) -> bool {
+    let line = line.trim();
+    if !line.starts_with("data: ") {
+        return false;
+    }
+    let data = &line[6..];
+    if data == "[DONE]" {
+        return true;
+    }
 
-    for line in full_body.lines() {
-        let line = line.trim();
-        if !line.starts_with("data: ") {
-            continue;
-        }
-        let data = &line[6..];
-        if data == "[DONE]" {
-            break;
-        }
+    let chunk: Value = match serde_json::from_str(data) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
 
-        let chunk: Value = match serde_json::from_str(data) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
+    if let Some(usage) = chunk.get("usage") {
+        accum.prompt_tokens = usage
+            .get("prompt_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(accum.prompt_tokens);
+        accum.completion_tokens = usage
+            .get("completion_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(accum.completion_tokens);
+    }
 
-        if let Some(usage) = chunk.get("usage") {
-            prompt_tokens = usage
-                .get("prompt_tokens")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(prompt_tokens);
-            completion_tokens = usage
-                .get("completion_tokens")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(completion_tokens);
-        }
+    let choices = match chunk.get("choices").and_then(|c| c.as_array()) {
+        Some(c) => c,
+        None => return false,
+    };
 
-        let choices = match chunk.get("choices").and_then(|c| c.as_array()) {
-            Some(c) => c,
+    for choice in choices {
+        let delta = match choice.get("delta") {
+            Some(d) => d,
             None => continue,
         };
 
-        for choice in choices {
-            let delta = match choice.get("delta") {
-                Some(d) => d,
-                None => continue,
-            };
+        if let Some(text) = delta.get("content").and_then(|v| v.as_str())
+            && !text.is_empty()
+        {
+            accum.content.push_str(text);
+            let _ = tx
+                .send(AgentEvent::ThinkingDelta {
+                    text: text.to_string(),
+                })
+                .await;
+        }
 
-            if let Some(text) = delta.get("content").and_then(|v| v.as_str())
-                && !text.is_empty()
-            {
-                content.push_str(text);
-                let _ = tx
-                    .send(AgentEvent::ThinkingDelta {
-                        text: text.to_string(),
-                    })
-                    .await;
-            }
+        if let Some(tcs) = delta.get("tool_calls").and_then(|v| v.as_array()) {
+            for tc in tcs {
+                let idx = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
 
-            if let Some(tcs) = delta.get("tool_calls").and_then(|v| v.as_array()) {
-                for tc in tcs {
-                    let idx = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                while accum.tool_calls.len() <= idx {
+                    accum.tool_calls.push(ToolCallAccum {
+                        id: String::new(),
+                        name: String::new(),
+                        arguments: String::new(),
+                    });
+                }
 
-                    while tool_calls.len() <= idx {
-                        tool_calls.push(ToolCallAccum {
-                            id: String::new(),
-                            name: String::new(),
-                            arguments: String::new(),
-                        });
+                if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
+                    accum.tool_calls[idx].id = id.to_string();
+                }
+                if let Some(func) = tc.get("function") {
+                    if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
+                        accum.tool_calls[idx].name = name.to_string();
                     }
-
-                    if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
-                        tool_calls[idx].id = id.to_string();
-                    }
-                    if let Some(func) = tc.get("function") {
-                        if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
-                            tool_calls[idx].name = name.to_string();
-                        }
-                        if let Some(args) = func.get("arguments").and_then(|v| v.as_str()) {
-                            tool_calls[idx].arguments.push_str(args);
-                        }
+                    if let Some(args) = func.get("arguments").and_then(|v| v.as_str()) {
+                        accum.tool_calls[idx].arguments.push_str(args);
                     }
                 }
             }
         }
     }
 
-    Ok((content, tool_calls, (prompt_tokens, completion_tokens)))
+    false
+}
+
+/// Parse an OpenAI-compatible streaming response incrementally.
+///
+/// Consumes the body chunk-by-chunk via `bytes_stream()` so content deltas
+/// reach the SSE channel in real time, rather than buffering the entire
+/// generation (10–60s) before emitting anything.
+/// Returns (content_text, tool_calls, (prompt_tokens, completion_tokens)).
+async fn parse_streaming_response(
+    resp: reqwest::Response,
+    tx: &mpsc::Sender<AgentEvent>,
+) -> Result<(String, Vec<ToolCallAccum>, (u64, u64))> {
+    use futures_util::StreamExt;
+
+    /// Defensive cap on the partial-line accumulation buffer. No legitimate
+    /// SSE line approaches this; if exceeded, the upstream is misbehaving and
+    /// we fail rather than buffer without bound.
+    const MAX_LINE_BUFFER: usize = 4 * 1024 * 1024; // 4 MiB
+
+    let mut accum = StreamAccum::default();
+    let mut buf: Vec<u8> = Vec::new();
+    let mut stream = resp.bytes_stream();
+    let mut done = false;
+
+    'recv: while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        buf.extend_from_slice(&chunk);
+
+        // Process every complete line currently in the buffer.
+        while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+            let line_bytes: Vec<u8> = buf.drain(..=pos).collect();
+            let line = String::from_utf8_lossy(&line_bytes);
+            if process_sse_line(&line, &mut accum, tx).await {
+                done = true;
+                break 'recv; // [DONE] — anything after it is ignored
+            }
+        }
+
+        if buf.len() > MAX_LINE_BUFFER {
+            return Err(anyhow::anyhow!(
+                "LLM stream sent a line larger than {MAX_LINE_BUFFER} bytes — aborting"
+            ));
+        }
+    }
+
+    // Tolerate a final line without a trailing newline (matches the previous
+    // `.lines()` behavior over the fully-buffered body).
+    if !done && !buf.is_empty() {
+        let line = String::from_utf8_lossy(&buf);
+        let _ = process_sse_line(&line, &mut accum, tx).await;
+    }
+
+    Ok((
+        accum.content,
+        accum.tool_calls,
+        (accum.prompt_tokens, accum.completion_tokens),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Build one investigation round: assistant tool-call message + tool result.
+    fn round(n: usize) -> Vec<Value> {
+        vec![
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": format!("call_{n}"),
+                    "type": "function",
+                    "function": {"name": "search_logs", "arguments": "{}"}
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": format!("call_{n}"),
+                "content": format!("tool result {n}")
+            }),
+        ]
+    }
+
+    fn transcript(rounds: usize) -> Vec<Value> {
+        let mut msgs = vec![
+            json!({"role": "system", "content": "You are a test agent."}),
+            json!({"role": "user", "content": "Investigate the outage."}),
+        ];
+        for n in 0..rounds {
+            msgs.extend(round(n));
+        }
+        msgs
+    }
+
+    fn tool_contents(msgs: &[Value]) -> Vec<String> {
+        msgs.iter()
+            .filter(|m| m["role"] == "tool")
+            .map(|m| m["content"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn compaction_stubs_only_old_tool_results() {
+        // 9 rounds, keep 6 → rounds 0..=2 are older than the cutoff (round 3
+        // is the 6th most recent) and get stubbed; rounds 3..=8 stay intact.
+        let mut msgs = transcript(9);
+        compact_old_tool_results(&mut msgs, 6);
+
+        let contents = tool_contents(&msgs);
+        assert_eq!(contents.len(), 9);
+        for (n, c) in contents.iter().enumerate() {
+            if n < 3 {
+                assert_eq!(c, COMPACTED_TOOL_RESULT, "round {n} should be stubbed");
+            } else {
+                assert_eq!(c, &format!("tool result {n}"), "round {n} should be intact");
+            }
+        }
+
+        // System/user/assistant messages are never touched.
+        assert_eq!(msgs[0]["content"], "You are a test agent.");
+        assert_eq!(msgs[1]["content"], "Investigate the outage.");
+        for m in &msgs {
+            if m["role"] == "assistant" {
+                assert!(m.get("tool_calls").is_some(), "assistant tool_calls preserved");
+            }
+        }
+    }
+
+    #[test]
+    fn compaction_noop_when_few_rounds() {
+        let mut msgs = transcript(6);
+        let before = msgs.clone();
+        compact_old_tool_results(&mut msgs, 6);
+        assert_eq!(msgs, before, "exactly keep_recent_rounds rounds → nothing stubbed");
+
+        let mut msgs = transcript(2);
+        let before = msgs.clone();
+        compact_old_tool_results(&mut msgs, 6);
+        assert_eq!(msgs, before, "fewer rounds than keep → nothing stubbed");
+    }
+
+    #[test]
+    fn compaction_is_idempotent_and_advances_with_new_rounds() {
+        let mut msgs = transcript(8);
+        compact_old_tool_results(&mut msgs, 6);
+        let after_first = msgs.clone();
+        compact_old_tool_results(&mut msgs, 6);
+        assert_eq!(msgs, after_first, "second pass must change nothing");
+
+        // A new round arrives → exactly one more old result gets stubbed.
+        msgs.extend(round(8));
+        compact_old_tool_results(&mut msgs, 6);
+        let contents = tool_contents(&msgs);
+        assert_eq!(contents.iter().filter(|c| *c == COMPACTED_TOOL_RESULT).count(), 3);
+        assert_eq!(contents.last().unwrap(), "tool result 8");
+    }
+
+    #[test]
+    fn compaction_skips_mixed_non_tool_messages() {
+        // Interleave system nudges (as the loop does for gate rejections /
+        // dead-end escalations) and verify they survive untouched.
+        let mut msgs = transcript(3);
+        msgs.push(json!({"role": "system", "content": "nudge: try traces"}));
+        for n in 3..8 {
+            msgs.extend(round(n));
+        }
+        compact_old_tool_results(&mut msgs, 6);
+
+        let nudge_intact = msgs
+            .iter()
+            .any(|m| m["role"] == "system" && m["content"] == "nudge: try traces");
+        assert!(nudge_intact, "system nudge must not be stubbed");
+
+        let contents = tool_contents(&msgs);
+        // 8 rounds, keep 6 → rounds 0..=1 stubbed.
+        assert_eq!(contents[0], COMPACTED_TOOL_RESULT);
+        assert_eq!(contents[1], COMPACTED_TOOL_RESULT);
+        for (i, c) in contents.iter().enumerate().skip(2) {
+            assert_eq!(c, &format!("tool result {i}"));
+        }
+    }
 }

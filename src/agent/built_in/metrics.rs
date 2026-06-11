@@ -66,7 +66,13 @@ impl Tool for QueryMetrics {
             .and_then(|v| v.as_str())
             .unwrap_or("");
         let around = args.get("around").and_then(|v| v.as_str()).unwrap_or("");
-        let minutes = args.get("minutes").and_then(|v| v.as_u64()).unwrap_or(30);
+        // Clamp the model-supplied window to at most 24h so the LLM can't
+        // request a months-long full scan.
+        let minutes = args
+            .get("minutes")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(30)
+            .clamp(1, 1440);
 
         let tenant_id = ctx.tenant_id.replace('\'', "\\'");
 

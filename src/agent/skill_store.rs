@@ -233,10 +233,17 @@ impl SkillStore {
 /// Short per-request timeout so a slow or unreachable query-api never stalls an
 /// investigation — the caller logs the error and proceeds with built-ins only.
 async fn fetch_custom_skills_http(base_url: &str) -> anyhow::Result<Vec<CustomSkill>> {
+    // Shared client — keeps the connection pool to query-api warm instead of
+    // paying TCP/TLS setup on every fetch.
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    let client = CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .expect("failed to build skills HTTP client")
+    });
+
     let url = format!("{}/api/v1/custom-skills", base_url.trim_end_matches('/'));
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(3))
-        .build()?;
     let resp = client.get(&url).send().await?;
     if !resp.status().is_success() {
         anyhow::bail!("query-api returned {}", resp.status());

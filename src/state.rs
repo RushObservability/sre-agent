@@ -7,7 +7,11 @@
 use clickhouse::{Client, query::Query};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::time::Instant;
+use tokio::sync::RwLock;
 
+use crate::agent::loop_runner::LoopBudget;
+use crate::agent::skill_store::SkillStore;
 use crate::config_db::ConfigDb;
 
 /// Tri-state flag for whether ClickHouse accepts the `rush_tenant_id` custom setting.
@@ -49,6 +53,19 @@ pub fn tenant_query(ch: &Client, sql: &str, tenant_id: &str) -> Query {
     }
 }
 
+/// Short-TTL caches for per-request setup work. Both values are cheap to
+/// rebuild and only need bounded staleness: skills can lag edits by up to a
+/// minute, budget settings by 30s — acceptable for both, and it removes a
+/// fresh HTTP fetch plus two `config_settings FINAL` scans from every
+/// investigation start.
+#[derive(Default)]
+pub struct RuntimeCaches {
+    /// (built_at, store) — refreshed when older than 60s.
+    pub skills: RwLock<Option<(Instant, Arc<SkillStore>)>>,
+    /// (read_at, budget) — refreshed when older than 30s.
+    pub budget: RwLock<Option<(Instant, LoopBudget)>>,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub ch: Client,
@@ -59,4 +76,6 @@ pub struct AppState {
     /// `None`, the agent falls back to reading custom skills from the local
     /// config_db (useful for local dev and tests).
     pub query_api_url: Option<String>,
+    /// Short-TTL caches for per-request setup (skill store, loop budget).
+    pub caches: Arc<RuntimeCaches>,
 }

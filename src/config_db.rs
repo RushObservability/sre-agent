@@ -490,38 +490,6 @@ impl ConfigDb {
         }
     }
 
-    /// Update the working memory JSON for a session (read-modify-write).
-    pub async fn update_session_memory(
-        &self,
-        id: &str,
-        working_memory_json: &str,
-    ) -> anyhow::Result<()> {
-        let existing = match self.get_session(id).await? {
-            Some(s) => s,
-            None => return Ok(()),
-        };
-        let now = Self::now_str();
-        let ver = Self::next_version();
-        self.client
-            .query("INSERT INTO config_investigation_sessions (id, tenant_id, title, status, template_id, created_by, created_at, updated_at, working_memory, prompt_tokens, completion_tokens, llm_model, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)")
-            .bind(&existing.id)
-            .bind(&existing.tenant_id)
-            .bind(&existing.title)
-            .bind(&existing.status)
-            .bind(&existing.template_id)
-            .bind(&existing.created_by)
-            .bind(&existing.created_at)
-            .bind(&now)
-            .bind(working_memory_json)
-            .bind(existing.prompt_tokens)
-            .bind(existing.completion_tokens)
-            .bind(&existing.llm_model)
-            .bind(ver)
-            .execute()
-            .await?;
-        Ok(())
-    }
-
     /// Update the status of a session (active, completed, archived).
     pub async fn update_session_status(&self, id: &str, status: &str) -> anyhow::Result<()> {
         let existing = match self.get_session(id).await? {
@@ -578,33 +546,43 @@ impl ConfigDb {
         Ok(())
     }
 
-    /// Accumulate token usage for a session (additive — called after each agent turn).
-    pub async fn update_session_tokens(
+    /// End-of-turn finalization in a single read + single versioned insert.
+    ///
+    /// Replaces the old `update_session_memory` + `update_session_tokens`
+    /// (+ `update_session_status`) sequence, which performed one
+    /// `SELECT … FINAL` and one full-row INSERT *each* (3–4 FINAL scans and
+    /// row versions per turn, with clobber races between them). Token counts
+    /// are additive; `status: None` keeps the existing status.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_session_after_turn(
         &self,
-        id: &str,
-        prompt: u64,
-        completion: u64,
+        session_id: &str,
+        memory_json: &str,
+        prompt_tokens: u64,
+        completion_tokens: u64,
         model: &str,
+        status: Option<&str>,
     ) -> anyhow::Result<()> {
-        let existing = match self.get_session(id).await? {
+        let existing = match self.get_session(session_id).await? {
             Some(s) => s,
             None => return Ok(()),
         };
         let now = Self::now_str();
         let ver = Self::next_version();
-        let new_prompt = existing.prompt_tokens + prompt as i64;
-        let new_completion = existing.completion_tokens + completion as i64;
+        let new_prompt = existing.prompt_tokens + prompt_tokens as i64;
+        let new_completion = existing.completion_tokens + completion_tokens as i64;
+        let status = status.unwrap_or(&existing.status);
         self.client
             .query("INSERT INTO config_investigation_sessions (id, tenant_id, title, status, template_id, created_by, created_at, updated_at, working_memory, prompt_tokens, completion_tokens, llm_model, version, is_deleted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)")
             .bind(&existing.id)
             .bind(&existing.tenant_id)
             .bind(&existing.title)
-            .bind(&existing.status)
+            .bind(status)
             .bind(&existing.template_id)
             .bind(&existing.created_by)
             .bind(&existing.created_at)
             .bind(&now)
-            .bind(&existing.working_memory)
+            .bind(memory_json)
             .bind(new_prompt)
             .bind(new_completion)
             .bind(model)

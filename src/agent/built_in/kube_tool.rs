@@ -5,6 +5,19 @@ use kube::discovery::ApiResource;
 use kube::{Api, Client, api::ListParams};
 use serde_json::{Value, json};
 
+/// Process-wide Kubernetes client, built once on first use. The kubeconfig /
+/// in-cluster service account doesn't change at runtime, so rebuilding the
+/// client (config discovery + connection setup) on every tool call is pure
+/// overhead. `kube::Client` is cheaply cloneable. Failures are NOT cached —
+/// `get_or_try_init` leaves the cell empty so the next call retries.
+pub(crate) async fn shared_kube_client() -> Result<Client, kube::Error> {
+    static KUBE_CLIENT: tokio::sync::OnceCell<Client> = tokio::sync::OnceCell::const_new();
+    KUBE_CLIENT
+        .get_or_try_init(|| async { Client::try_default().await })
+        .await
+        .cloned()
+}
+
 pub struct KubeDescribe;
 
 #[async_trait::async_trait]
@@ -53,7 +66,7 @@ impl Tool for KubeDescribe {
             return Ok("'name' is required. Use '*' to list all resources.".to_string());
         }
 
-        let client = match Client::try_default().await {
+        let client = match shared_kube_client().await {
             Ok(c) => c,
             Err(e) => return Ok(format!("Cannot connect to Kubernetes: {e}")),
         };
@@ -304,7 +317,7 @@ impl Tool for KubeEvents {
             return Ok("'namespace' is required.".to_string());
         }
 
-        let client = match Client::try_default().await {
+        let client = match shared_kube_client().await {
             Ok(c) => c,
             Err(e) => return Ok(format!("Cannot connect to Kubernetes: {e}")),
         };

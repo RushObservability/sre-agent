@@ -141,6 +141,7 @@ mod tests {
                 ch,
                 config_db,
                 query_api_url: None,
+                caches: Arc::new(Default::default()),
             },
             skill_store,
             tenant_id: "default".to_string(),

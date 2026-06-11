@@ -35,7 +35,7 @@ impl Tool for GetArgocdApp {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("name is required"))?;
 
-        let client = match kube::Client::try_default().await {
+        let client = match crate::agent::built_in::kube_tool::shared_kube_client().await {
             Ok(c) => c,
             Err(e) => {
                 return Ok(format!(

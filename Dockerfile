@@ -1,4 +1,5 @@
-FROM rust:1.87-slim AS builder
+# 1.88+ required: the agent uses `let`-chains (if let … && …), stabilized in Rust 1.88.
+FROM rust:1.90-slim AS builder
 
 RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
 
@@ -8,7 +9,9 @@ COPY src ./src
 
 RUN cargo build --release
 
-FROM debian:bookworm-slim
+# Must match the builder's Debian release: rust:1.90-slim is built on trixie
+# (glibc 2.39); bookworm (glibc 2.36) can't run the binary ("GLIBC_2.39 not found").
+FROM debian:trixie-slim
 
 RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
 

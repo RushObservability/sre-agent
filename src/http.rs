@@ -85,6 +85,16 @@ struct InvestigateRequest {
     /// Template ID for new sessions. Ignored on follow-ups.
     #[serde(default)]
     template_id: String,
+    /// User-chosen model for this investigation. Validated server-side against
+    /// the admin policy (`sre_agent_allowed_models`); a disallowed value falls
+    /// back to the default. Empty = use the policy/env default.
+    #[serde(default)]
+    model: String,
+    /// User-chosen thinking level (minimal/low/medium/high). Honored only when
+    /// the resolved model is a reasoning model AND the level is allowed for it
+    /// by the policy; otherwise ignored.
+    #[serde(default)]
+    reasoning_effort: String,
 }
 
 async fn healthz() -> Json<serde_json::Value> {
@@ -267,7 +277,17 @@ async fn investigate(
             None
         };
 
-        let mut system_content = agent::prompt::system_prompt(&skill_store.catalog(), &req.scopes);
+        // GitOps controllers enabled for this environment, derived from the same
+        // env vars the tools use (set by the helm chart when argocd/fluxcd.enabled).
+        let mut gitops: Vec<String> = Vec::new();
+        if std::env::var("ARGOCD_NAMESPACE").is_ok() {
+            gitops.push("argocd".to_string());
+        }
+        if std::env::var("FLUXCD_NAMESPACE").is_ok() {
+            gitops.push("flux".to_string());
+        }
+        let mut system_content =
+            agent::prompt::system_prompt(&skill_store.catalog(), &req.scopes, &gitops);
 
         // Append template modifier if present
         if let Some(tmpl) = template {
@@ -448,9 +468,10 @@ async fn investigate(
         let _ = tx
             .send(AgentEvent::Error {
                 message: "LLM not configured: the SRE agent needs an LLM to run investigations. \
-                          Set the LLM_API_KEY environment variable on the sre-agent service \
-                          (optionally LLM_MODEL and LLM_BASE_URL for non-OpenAI providers) \
-                          and restart it. Telemetry browsing in the rest of the app is unaffected."
+                          Set the OPENAI_API_KEY (or OPENAI_KEY / LLM_API_KEY) environment variable \
+                          on the sre-agent service (optionally LLM_BASE_URL for non-OpenAI providers; \
+                          the model is selectable in Settings → SRE Agent) and restart it. \
+                          Telemetry browsing in the rest of the app is unaffected."
                     .to_string(),
             })
             .await;
@@ -473,9 +494,96 @@ async fn investigate(
     let session_id_for_task = session_id.clone();
     let session_mode_for_task = session_mode;
     let restored_mem = restored_memory;
+
+    // Resolve the LLM config under the admin model/thinking policy. The API key
+    // always comes from the environment (OPENAI_API_KEY / OPENAI_KEY / LLM_API_KEY);
+    // only the model + thinking level are governed here. Two-tier governance:
+    //   - ADMIN defines the allowed models + per-model thinking levels
+    //     (`sre_agent_allowed_models` JSON) and a default model (`sre_agent_model`).
+    //   - USER picks a model + thinking level PER investigation (req.model /
+    //     req.reasoning_effort), validated against that policy. A hand-crafted
+    //     request with a disallowed model/level falls back to the default — the
+    //     client can't bypass the policy.
+    let mut llm = agent::loop_runner::LlmConfig::from_env()
+        .expect("LLM config checked above");
+
+    // Parse the allowed-models policy. Empty/missing/bad → no policy (preserve
+    // pre-governance behavior: honor the `sre_agent_model` default setting / env).
+    let allowed = state
+        .config_db
+        .get_setting("sre_agent_allowed_models")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|raw| {
+            let raw = raw.trim();
+            if raw.is_empty() {
+                None
+            } else {
+                serde_json::from_str::<Vec<serde_json::Value>>(raw).ok()
+            }
+        })
+        .unwrap_or_default();
+
+    // Default model setting (admin's chosen default; may be empty → env default).
+    let default_model = state
+        .config_db
+        .get_setting("sre_agent_model")
+        .await
+        .ok()
+        .flatten()
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+
+    if allowed.is_empty() {
+        // No policy configured: keep today's behavior — the `sre_agent_model`
+        // default setting overrides the env model when set; no thinking control.
+        if !default_model.is_empty() {
+            llm.model = default_model.clone();
+        }
+        llm.reasoning_effort = None;
+    } else {
+        // Build the allowed id set and the per-id allowed thinking levels.
+        let allowed_ids: Vec<String> = allowed
+            .iter()
+            .filter_map(|m| m.get("id").and_then(|v| v.as_str()).map(|s| s.trim().to_string()))
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        // Resolve the model: a user pick if it's allowed; else the default if
+        // allowed; else the allowed list's first entry; else the env default.
+        let req_model = req.model.trim().to_string();
+        let resolved_model = if !req_model.is_empty() && allowed_ids.iter().any(|id| id == &req_model) {
+            Some(req_model)
+        } else if !default_model.is_empty() && allowed_ids.iter().any(|id| id == &default_model) {
+            Some(default_model)
+        } else {
+            allowed_ids.first().cloned()
+        };
+        if let Some(model) = resolved_model {
+            llm.model = model;
+        }
+
+        // Resolve the thinking level: honored only when the resolved model is a
+        // reasoning model AND the requested level is in THAT model's allowed list.
+        llm.reasoning_effort = None;
+        let req_effort = req.reasoning_effort.trim();
+        if !req_effort.is_empty() && agent::loop_runner::is_reasoning_model(&llm.model) {
+            let model_levels: Vec<String> = allowed
+                .iter()
+                .find(|m| m.get("id").and_then(|v| v.as_str()).map(|s| s.trim()) == Some(llm.model.as_str()))
+                .and_then(|m| m.get("reasoning").and_then(|v| v.as_array()))
+                .map(|arr| arr.iter().filter_map(|l| l.as_str()).map(|s| s.trim().to_string()).collect())
+                .unwrap_or_default();
+            if model_levels.iter().any(|l| l == req_effort) {
+                llm.reasoning_effort = Some(req_effort.to_string());
+            }
+        }
+    }
+
     tokio::spawn(async move {
         let result =
-            agent::loop_runner::run_with_session(messages, &registry, &tool_ctx, &tx, restored_mem, &session_id_for_task, budget)
+            agent::loop_runner::run_with_config_and_budget(messages, &registry, &tool_ctx, &tx, llm, restored_mem, &session_id_for_task, budget)
                 .await;
 
         match result {

@@ -267,6 +267,75 @@ Do NOT stop after just checking the ArgoCD app state. Always:
 5. Only then form your conclusion"#,
     });
 
+    m.insert("flux_unhealthy", Skill {
+        name: "flux_unhealthy",
+        title: "FluxCD Unhealthy Resource Investigation",
+        description: "Playbook for diagnosing Flux v2 Kustomizations/HelmReleases that are not Ready, stalled, or failing to reconcile",
+        content: r#"# FluxCD Unhealthy Resource Investigation Playbook
+
+Flux v2 has no single "Application". The deployments are **Kustomizations**
+(kustomize.toolkit.fluxcd.io) and **HelmReleases** (helm.toolkit.fluxcd.io);
+their inputs are **Sources** (GitRepository/OCIRepository/HelmRepository/Bucket).
+Every resource has a `Ready` condition (True/False/Unknown) and a `suspend` flag.
+
+## Quick Assessment
+1. Call `get_flux_resource` with the kind (Kustomization or HelmRelease) and name
+2. Read the `Ready` condition message — Flux usually states the exact failure
+3. Check `Suspended` — a suspended resource will not reconcile (often the answer)
+4. Compare `Last applied revision` vs `Last attempted revision` — a mismatch means a reconcile is failing
+
+## Diagnostic Checklist
+- [ ] Is `Ready` False? What does the message/reason say?
+- [ ] Is it Suspended? (paused — won't pick up new commits)
+- [ ] Does the Source it references (sourceRef) reconcile cleanly? Call `get_flux_resource` on that GitRepository/OCIRepository/HelmRepository.
+- [ ] Applied revision != attempted revision? (apply/build is failing)
+- [ ] Any `dependsOn` that is itself not Ready? (a dependency gate is blocking it)
+- [ ] Error logs from the workloads in the target namespace? (use search_logs)
+- [ ] Did a recent deploy/commit correlate with the change? (use list_deploys)
+
+## Root Cause Patterns
+
+### Pattern: Source not Ready (Git/OCI/Helm repository)
+-> The Kustomization/HelmRelease can't fetch its desired state.
+-> Causes: auth failure, bad URL/ref, tag/branch missing, TLS/cert errors, registry rate limit.
+-> Call `get_flux_resource` on the referenced source and read its Ready message.
+
+### Pattern: Kustomization build/apply failing
+-> Ready False with a "build failed" / "apply failed" message.
+-> Causes: invalid YAML, missing namespace, server-side apply conflict, admission webhook rejection, pruned resource still referenced.
+-> Read the message; then `kube_events` (warnings_only) in the target namespace.
+
+### Pattern: HelmRelease upgrade/install failed
+-> Ready False with a Helm error ("upgrade retries exhausted", "install failed").
+-> Causes: bad values, chart version missing, hook job failing, immutable field change.
+-> Check the HelmRelease conditions and the workloads it created.
+
+### Pattern: Suspended
+-> `suspend: true` — reconciliation paused. New commits are ignored by design.
+-> Confirm whether this is intentional before chasing other causes.
+
+### Pattern: Stuck Reconciling / stalled
+-> A `Reconciling` condition stays True, or a `Stalled` condition appears.
+-> Causes: dependency not Ready, health checks never passing, timeout too low.
+-> Check `dependsOn` resources and the workloads' pod states.
+
+## Key Queries
+- Resource state: `get_flux_resource` with kind + name (+ optional namespace)
+- Its source: `get_flux_resource` on the sourceRef kind/name
+- Pod status: `kube_describe` kind=pod, name + namespace (container states, restarts, OOMKill)
+- K8s events: `kube_events` with the target namespace, warnings_only=true
+- Service logs: `search_logs` for the affected service around the change time
+- Recent deploys: `list_deploys`
+
+## Investigation depth
+Do NOT stop at the Flux resource status. Always:
+1. Determine whether the failure is in the Source, the build/apply, or the workloads
+2. If a Source is unhealthy, that is usually the root cause — investigate it first
+3. Describe the failing pods/deployments in the target namespace
+4. Read namespace events and logs
+5. Only then form your conclusion"#,
+    });
+
     m.insert("throughput_anomaly", Skill {
         name: "throughput_anomaly",
         title: "Throughput Anomaly Investigation",

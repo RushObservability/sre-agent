@@ -9,8 +9,50 @@ use crate::models::anomaly::{AnomalyEvent, AnomalyRule};
 /// `scopes` lists the signal types the caller has access to (e.g.,
 /// `["logs", "traces"]` or `["all"]`). The prompt tells the model which
 /// signals are in scope so it avoids calling tools that will be denied.
-pub fn system_prompt(skill_catalog: &str, scopes: &[String]) -> String {
+///
+/// `gitops` lists the GitOps controllers enabled for this environment
+/// (`"argocd"` and/or `"flux"`, derived from the `ARGOCD_NAMESPACE` /
+/// `FLUXCD_NAMESPACE` env vars). The prompt steers the model to the matching
+/// tool/skill and tells it not to use a controller that isn't enabled.
+/// Render the GITOPS guidance block for the system prompt, naming the enabled
+/// controllers and pointing the model at the matching tool + skill.
+fn build_gitops_section(gitops: &[String]) -> String {
+    let has = |g: &str| gitops.iter().any(|x| x == g);
+    let enabled = if gitops.is_empty() {
+        "none".to_string()
+    } else {
+        gitops.join(", ")
+    };
+    let mut s = format!(
+        "## GITOPS\nGitOps controllers enabled in this environment: {enabled}.\nUse only the controller(s) listed above; do not call a tool for a controller that is not enabled.\n\n"
+    );
+    if has("argocd") {
+        s.push_str(
+            "When investigating ArgoCD issues (load the `argocd_unhealthy` skill):\n\
+1. Get the app state with `get_argocd_app` to find unhealthy resources\n\
+2. `kube_describe` the unhealthy pods/deployments (conditions, container states, restart reasons)\n\
+3. `kube_events` for Warning events; `search_logs` for the affected service\n\n",
+        );
+    }
+    if has("flux") {
+        s.push_str(
+            "When investigating FluxCD (Flux v2) issues (load the `flux_unhealthy` skill):\n\
+1. Get the resource state with `get_flux_resource` (kind=Kustomization|HelmRelease, name)\n\
+2. If its referenced Source is not Ready, investigate that first (`get_flux_resource` on the GitRepository/OCIRepository/HelmRepository)\n\
+3. `kube_describe`/`kube_events` the workloads in the target namespace; `search_logs` for the affected service\n\n",
+        );
+    }
+    if !has("argocd") && !has("flux") {
+        s.push_str(
+            "No GitOps controller is enabled — rely on kube_describe, kube_events, logs, traces, metrics, and deploys.\n\n",
+        );
+    }
+    s
+}
+
+pub fn system_prompt(skill_catalog: &str, scopes: &[String], gitops: &[String]) -> String {
     let scopes_display = scopes.join(", ");
+    let gitops_section = build_gitops_section(gitops);
     format!(
         r#"<PERSISTENCE>
 You have abundant context window and tool budget. Do NOT rush to conclude.
@@ -37,6 +79,7 @@ Understand the scope before diving in.
 - What metric is anomalous? (error rate, latency, throughput)
 - When did it start? Check for deploy correlation first — `list_deploys` is cheap.
 - Use `list_services` to get a system-wide health snapshot.
+- Call `search_past_incidents` with the affected service/symptom — prior resolved investigations are strong **priors** for likely root causes. Treat them as leads to verify with fresh evidence, NOT as facts; the current incident may differ.
 
 ### Phase 2: HYPOTHESIZE
 Before calling any more tools, state your top 1–3 hypotheses. Rank by likelihood.
@@ -47,16 +90,29 @@ Common root cause categories:
 - **Infrastructure** — resource exhaustion, network issues
 - **Data/config change** — bad config push, schema migration, feature flag
 
+#### Maintain a HYPOTHESIS LEDGER
+Keep an explicit, ranked ledger of every competing hypothesis and update it as evidence
+arrives. Restate it (a compact markdown table) at the start of Phase 2, again whenever a
+tool result changes your beliefs, and one final time in Phase 4. Columns:
+
+| # | Hypothesis | Status (open/supported/refuted) | Supporting evidence | Contradicting evidence | Confidence (low/med/high) |
+
+Rules for the ledger:
+- A hypothesis only becomes **supported** with a concrete tool result cited in "Supporting evidence" (service, timestamp, value) — never on intuition.
+- Actively record **contradicting** evidence too; a hypothesis with strong contradicting evidence must be marked **refuted**, not silently dropped.
+- Never raise a hypothesis to **high** confidence while a plausible competing hypothesis is still **open**. Resolve the competition with a discriminating tool call.
+- Prefer the tool call that best **discriminates** between your top two hypotheses next.
+
 ### Phase 3: GATHER EVIDENCE
 Test hypotheses systematically. For each tool call:
-1. State which hypothesis you're testing
-2. Explain what you expect to find
+1. State which ledger hypothesis you're testing (by #)
+2. Explain what you expect to find if it's true vs. false
 3. Call the tool
-4. Interpret the result — confirm, refute, or refine your hypothesis
+4. Interpret the result — confirm, refute, or refine — and **update the ledger row** (status, evidence, confidence)
 
 Investigation heuristics:
 - **Latency spike?** → Check p99 vs p50 spread. If both moved, it's systemic. If only p99, look for outlier paths.
-- **Error rate increase?** → Search logs for ERROR, then check if errors cluster on one endpoint or span across services.
+- **Error rate increase?** → Error rate is a **trace/span** signal, not a log signal. The error counts in `list_services` come from spans (`status = STATUS_CODE_ERROR`), so drill in with `query_traces` (service set, `status=error`) FIRST — it returns the failing endpoints, HTTP status codes, and sample trace IDs. THEN correlate with `search_logs` for stack traces/messages, and check if errors cluster on one endpoint or span across services. **Critical:** many services emit HTTP-error spans (4xx/5xx) without ever writing an ERROR-severity log line, and some emit logs with an empty `SeverityText`. An empty `search_logs(severity=ERROR)` therefore does NOT mean "no errors" — trust the span error count from `list_services`/`query_traces` and investigate the traces. If severity-filtered log search is empty, retry `search_logs` for the service with NO severity filter (and a `query` text like the failing path) before concluding logs are silent.
 - **Throughput drop?** → Check upstream services — the problem may be that requests aren't arriving, not that they're failing.
 - **Cascading failure?** → Use `service_dependencies` to trace the call graph. Errors propagate upstream.
 
@@ -66,11 +122,27 @@ Before concluding, verify your root cause with at least one independent signal:
 - If you suspect a deploy, compare error rates before/after the deploy timestamp.
 - If a dependency is failing, check that the dependency's own metrics confirm the issue.
 
+Restate the final HYPOTHESIS LEDGER here so the winning hypothesis and the refuted alternatives are explicit.
+
+### Phase 4.5: REFLECT (mandatory self-critique — do this before any final report)
+Stop and challenge your own conclusion. Write a short "Reflection" answering each:
+1. **What would refute my top hypothesis?** Have I actually looked for that evidence, or only confirming evidence? (Avoid confirmation bias.)
+2. **Could a still-open competing hypothesis explain the SAME evidence?** If so, run one more discriminating tool call instead of concluding.
+3. **Correlation vs causation** — is the "cause" just something that moved at the same time (e.g. a deploy that's coincidental)? What rules out coincidence?
+4. **Symptom vs root cause (decisive rule)** — if the failing/slow spans are an entry/edge service's (e.g. a gateway/API/BFF) calls *to a downstream dependency*, the gateway is the SYMPTOM and the dependency is the cause — do NOT name the gateway as the root cause. Trace to the dependency that is actually misbehaving and ask "why is IT failing?". The true root cause is the deepest service that is itself broken — typically the one that (a) went silent / stopped emitting spans, (b) is returning errors of its own (not just propagating), or (c) is itself slow (its own span durations rose, not just its caller's). Use `service_dependencies` + per-service span/error/latency to confirm which hop owns the failure.
+5. **Unexplained evidence** — is there any confirmed fact the conclusion does NOT account for? If yes, the conclusion is incomplete.
+6. **Is a simpler explanation available?** Prefer the hypothesis that explains the most evidence with the fewest assumptions.
+
+If the reflection surfaces a gap, return to Phase 3 and gather more — do not conclude. Only proceed when the reflection passes. State the reflection (briefly) in the final report's Evidence section.
+
 ### Phase 5: CONCLUDE
 Structure your final summary:
 
 ## Root Cause
-One clear sentence. Name the service, the failure mode, and when it started.
+One clear, COMMITTED sentence naming three things: (1) the single culprit **service** (the deepest service that is itself broken — not an edge/gateway that is merely propagating downstream failures), (2) the specific **failure mechanism** (e.g. "process down/unreachable", "CPU/resource exhaustion → its own latency rose", "error regression after deploy <v>", "dependency X failing"), and (3) **when** it started.
+- COMMIT to one cause. Do NOT hedge with "may be", "potential", "possibly", "likely a dependency issue", or a list of maybes — if the evidence is incomplete, say so explicitly as a "Confidence: preliminary" note, but still state your single best-supported cause and mechanism.
+- Never name a gateway / API / edge service as the root cause when its failures are on calls to a downstream service — name that downstream service.
+- The mechanism must be specific enough to act on; "performance degradation" or "an issue in service X" is NOT an acceptable mechanism.
 
 ## Evidence
 Bullet list of specific findings with timestamps and metric values.
@@ -103,11 +175,7 @@ You have read-only access to the Kubernetes cluster:
 - `kube_describe` — Describe any K8s resource (pods, deployments, replicasets, services, etc.). Use '*' as name to list all. Shows status, conditions, container states, events.
 - `kube_events` — List events in a namespace. Filter by resource name or warnings-only. Events reveal why pods fail, deployments stall, or resources are unhealthy.
 
-When investigating ArgoCD issues, use these to dig into the actual K8s state:
-1. Get the ArgoCD app state with `get_argocd_app` to find unhealthy resources
-2. Use `kube_describe` on unhealthy pods/deployments to see conditions, container states, restart reasons
-3. Use `kube_events` to see Warning events that explain failures
-4. Check logs with `search_logs` for the affected service
+{gitops_section}
 
 ## WORKING MEMORY
 
@@ -281,9 +349,33 @@ mod tests {
         vec!["all".to_string()]
     }
 
+    fn all_gitops() -> Vec<String> {
+        vec!["argocd".to_string(), "flux".to_string()]
+    }
+
+    #[test]
+    fn gitops_section_reflects_enabled_controllers() {
+        // Both enabled → both tools named.
+        let both = system_prompt(&sample_catalog(), &all_scopes(), &all_gitops());
+        assert!(both.contains("## GITOPS"));
+        assert!(both.contains("get_argocd_app"));
+        assert!(both.contains("get_flux_resource"));
+
+        // Flux only → no argo tool.
+        let flux = system_prompt(&sample_catalog(), &all_scopes(), &["flux".to_string()]);
+        assert!(flux.contains("get_flux_resource"));
+        assert!(!flux.contains("get_argocd_app"));
+
+        // None → neither, with a fallback note.
+        let none = system_prompt(&sample_catalog(), &all_scopes(), &[]);
+        assert!(!none.contains("get_argocd_app"));
+        assert!(!none.contains("get_flux_resource"));
+        assert!(none.contains("No GitOps controller is enabled"));
+    }
+
     #[test]
     fn system_prompt_contains_all_key_sections() {
-        let p = system_prompt(&sample_catalog(), &all_scopes());
+        let p = system_prompt(&sample_catalog(), &all_scopes(), &all_gitops());
         assert!(p.contains("INVESTIGATION METHODOLOGY"));
         assert!(p.contains("WORKING MEMORY"));
         assert!(p.contains("REPEAT DETECTION"));
@@ -297,14 +389,14 @@ mod tests {
     #[test]
     fn system_prompt_includes_scopes() {
         let scopes = vec!["logs".to_string(), "traces".to_string()];
-        let p = system_prompt(&sample_catalog(), &scopes);
+        let p = system_prompt(&sample_catalog(), &scopes, &all_gitops());
         assert!(p.contains("logs, traces"));
         assert!(p.contains("SIGNAL SCOPES"));
     }
 
     #[test]
     fn system_prompt_includes_catalog_text() {
-        let p = system_prompt(&sample_catalog(), &all_scopes());
+        let p = system_prompt(&sample_catalog(), &all_scopes(), &all_gitops());
         for skill in [
             "error_rate_spike",
             "latency_degradation",
@@ -322,7 +414,7 @@ mod tests {
 
     #[test]
     fn system_prompt_has_persistence_at_top_and_bottom() {
-        let p = system_prompt(&sample_catalog(), &all_scopes());
+        let p = system_prompt(&sample_catalog(), &all_scopes(), &all_gitops());
         // Should appear twice — open tag at top and bottom
         let count = p.matches("<PERSISTENCE>").count();
         assert_eq!(count, 2, "expected PERSISTENCE block at top and bottom");
@@ -330,7 +422,7 @@ mod tests {
 
     #[test]
     fn system_prompt_has_no_scarcity_language() {
-        let p = system_prompt(&sample_catalog(), &all_scopes());
+        let p = system_prompt(&sample_catalog(), &all_scopes(), &all_gitops());
         // The prompt should not expose any hard tool-step budgets to the
         // model — abundance framing is fine, scarcity numbers are not.
         assert!(!p.contains("max 25"));
@@ -342,7 +434,7 @@ mod tests {
     #[test]
     fn system_prompt_is_substantial() {
         // A short system prompt is a sign of broken code
-        assert!(system_prompt(&sample_catalog(), &all_scopes()).len() > 2000);
+        assert!(system_prompt(&sample_catalog(), &all_scopes(), &all_gitops()).len() > 2000);
     }
 
     #[test]

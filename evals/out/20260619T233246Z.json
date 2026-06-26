@@ -1,0 +1,64 @@
+{
+  "run_id": "20260619T233246Z",
+  "started_at": "2026-06-19T23:32:46.001705+00:00",
+  "case_count": 3,
+  "ac1_rate": 0.3333333333333333,
+  "ac3_rate": 1.0,
+  "reason_accuracy": 0.0,
+  "avg_tool_calls": 77.33333333333333,
+  "cases": [
+    {
+      "id": "articles-down-cascade",
+      "source": "seeded",
+      "ac1": true,
+      "ac3": true,
+      "reason_match": false,
+      "reason_why": "The agent blames database-induced latency within the articles service, while the ground truth is that the articles process was down/frozen and not serving or emitting telemetry.",
+      "candidates": [
+        "articles",
+        "gateway"
+      ],
+      "ground_truth_service": "articles",
+      "report_kind": "final",
+      "tool_calls": 77,
+      "prompt_tokens": 390792,
+      "completion_tokens": 53981
+    },
+    {
+      "id": "media-cpu-latency",
+      "source": "seeded",
+      "ac1": false,
+      "ac3": true,
+      "reason_match": false,
+      "reason_why": "The agent attributes the issue to gateway-side egress/resource contention and refutes media slowness, whereas the ground truth is CPU-throttling of the media service causing latency that the gateway inherits.",
+      "candidates": [
+        "gateway",
+        "media",
+        "articles",
+        "users"
+      ],
+      "ground_truth_service": "media",
+      "report_kind": "final",
+      "tool_calls": 82,
+      "prompt_tokens": 466123,
+      "completion_tokens": 74212
+    },
+    {
+      "id": "users-down-cascade",
+      "source": "seeded",
+      "ac1": false,
+      "ac3": true,
+      "reason_match": false,
+      "reason_why": "The agent blames a gateway pre-call dependency being slow/hanging, while the true root cause was the users backend being down and not serving requests.",
+      "candidates": [
+        "gateway",
+        "users"
+      ],
+      "ground_truth_service": "users",
+      "report_kind": "final",
+      "tool_calls": 73,
+      "prompt_tokens": 468307,
+      "completion_tokens": 72593
+    }
+  ]
+}

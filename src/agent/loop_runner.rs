@@ -110,7 +110,9 @@ fn tool_signal_type(tool_name: &str) -> Option<&'static str> {
             Some("traces")
         }
         "query_metrics" => Some("metrics"),
-        "kube_describe" | "kube_events" | "get_argocd_app" => Some("kubernetes"),
+        "kube_describe" | "kube_events" | "get_argocd_app" | "get_flux_resource" => {
+            Some("kubernetes")
+        }
         "list_deploys" => Some("deploys"),
         _ => None,
     }
@@ -268,6 +270,8 @@ struct ChatRequest<'a> {
     stream_options: StreamOptions,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<&'a Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<&'a str>,
 }
 
 #[derive(serde::Serialize)]
@@ -277,26 +281,52 @@ struct StreamOptions {
 
 /// Configuration for the LLM client used by the agent loop.
 /// Decoupled from env vars so tests can point at a mock server.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct LlmConfig {
     pub base_url: String,
     pub api_key: String,
     pub model: String,
+    /// Reasoning effort for thinking models (minimal/low/medium/high). Only sent to the
+    /// API when the model is a reasoning model — non-reasoning models reject it.
+    pub reasoning_effort: Option<String>,
+}
+
+/// Heuristic: does this model support the `reasoning_effort` parameter (OpenAI gpt-5 / o-series)?
+pub fn is_reasoning_model(model: &str) -> bool {
+    let m = model.trim().to_ascii_lowercase();
+    m.starts_with("gpt-5")
+        || m.starts_with("o1")
+        || m.starts_with("o3")
+        || m.starts_with("o4")
 }
 
 impl LlmConfig {
     /// Construct from environment variables:
+    /// - API key: `OPENAI_API_KEY` → `OPENAI_KEY` → `LLM_API_KEY` (first set wins; required)
     /// - LLM_BASE_URL (default: https://api.openai.com)
-    /// - LLM_API_KEY (required)
-    /// - LLM_MODEL (default: gpt-4o)
+    /// - LLM_MODEL (default: gpt-4o) — overridable at runtime by the `sre_agent_model` setting
     pub fn from_env() -> Result<Self> {
+        let api_key = Self::api_key_from_env().ok_or_else(|| {
+            anyhow::anyhow!("no LLM API key set (OPENAI_API_KEY / OPENAI_KEY / LLM_API_KEY)")
+        })?;
         Ok(Self {
             base_url: std::env::var("LLM_BASE_URL")
                 .unwrap_or_else(|_| "https://api.openai.com".to_string()),
-            api_key: std::env::var("LLM_API_KEY")
-                .map_err(|_| anyhow::anyhow!("LLM_API_KEY not set"))?,
+            api_key,
             model: std::env::var("LLM_MODEL").unwrap_or_else(|_| "gpt-4o".to_string()),
+            reasoning_effort: std::env::var("LLM_REASONING_EFFORT")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
         })
+    }
+
+    /// Resolve the API key from the accepted env vars, in priority order. OpenAI-branded
+    /// names are preferred; `LLM_API_KEY` is kept for backward compatibility.
+    pub fn api_key_from_env() -> Option<String> {
+        ["OPENAI_API_KEY", "OPENAI_KEY", "LLM_API_KEY"]
+            .into_iter()
+            .find_map(|k| std::env::var(k).ok().filter(|v| !v.trim().is_empty()))
     }
 }
 
@@ -388,6 +418,12 @@ async fn run_inner(
     let base_url = llm.base_url;
     let api_key = llm.api_key;
     let model = llm.model;
+    // Only thinking models accept reasoning_effort; others 400 on it.
+    let reasoning_effort: Option<String> = if is_reasoning_model(&model) {
+        llm.reasoning_effort
+    } else {
+        None
+    };
 
     let client = llm_client();
     let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
@@ -493,6 +529,7 @@ async fn run_inner(
                 stream: true,
                 stream_options: StreamOptions { include_usage: true },
                 tools: if force_final { None } else { Some(&tool_definitions) },
+                reasoning_effort: reasoning_effort.as_deref(),
             };
             client
                 .post(&url)
@@ -1275,7 +1312,7 @@ mod tests {
             assert_eq!(tool_signal_type(t), Some("traces"), "{t}");
         }
         assert_eq!(tool_signal_type("query_metrics"), Some("metrics"));
-        for t in ["kube_describe", "kube_events", "get_argocd_app"] {
+        for t in ["kube_describe", "kube_events", "get_argocd_app", "get_flux_resource"] {
             assert_eq!(tool_signal_type(t), Some("kubernetes"), "{t}");
         }
         assert_eq!(tool_signal_type("list_deploys"), Some("deploys"));

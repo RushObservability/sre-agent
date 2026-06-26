@@ -1,0 +1,64 @@
+{
+  "run_id": "20260619T225823Z",
+  "started_at": "2026-06-19T22:58:23.902812+00:00",
+  "case_count": 3,
+  "ac1_rate": 0.3333333333333333,
+  "ac3_rate": 1.0,
+  "reason_accuracy": 0.0,
+  "avg_tool_calls": 26.333333333333332,
+  "cases": [
+    {
+      "id": "articles-down-cascade",
+      "source": "seeded",
+      "ac1": false,
+      "ac3": true,
+      "reason_match": false,
+      "reason_why": "The agent's conclusion attributes the issue to malformed search queries from the articles service, rather than identifying the articles backend becoming unavailable as the root cause.",
+      "candidates": [
+        "gateway",
+        "articles",
+        "users"
+      ],
+      "ground_truth_service": "articles",
+      "report_kind": "final",
+      "tool_calls": 17,
+      "prompt_tokens": 91243,
+      "completion_tokens": 2585
+    },
+    {
+      "id": "media-cpu-latency",
+      "source": "seeded",
+      "ac1": true,
+      "ac3": true,
+      "reason_match": false,
+      "reason_why": "The agent suggests potential dependency issues or resource exhaustion but does not conclusively identify CPU starvation in the media service as the underlying cause.",
+      "candidates": [
+        "media",
+        "notifications",
+        "gateway"
+      ],
+      "ground_truth_service": "media",
+      "report_kind": "final",
+      "tool_calls": 34,
+      "prompt_tokens": 116201,
+      "completion_tokens": 1753
+    },
+    {
+      "id": "users-down-cascade",
+      "source": "seeded",
+      "ac1": false,
+      "ac3": true,
+      "reason_match": false,
+      "reason_why": "The agent identifies gateway performance degradation as the root cause, whereas the ground truth is that the users backend became unavailable, indicating a different failing component and failure mechanism.",
+      "candidates": [
+        "gateway",
+        "users"
+      ],
+      "ground_truth_service": "users",
+      "report_kind": "final",
+      "tool_calls": 28,
+      "prompt_tokens": 121334,
+      "completion_tokens": 2929
+    }
+  ]
+}

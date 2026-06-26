@@ -288,6 +288,15 @@ pub fn extract_facts_from_tool_result(
                 }
             }
         }
+        "get_flux_resource" => {
+            // Extract the Ready / Suspended line
+            for line in result.lines().take(10) {
+                if line.starts_with("Ready:") || line.starts_with("Suspended:") {
+                    out.summary = Some(line.trim().to_string());
+                    break;
+                }
+            }
+        }
         "kube_describe" => {
             // Extract pod phase / container state
             for line in result.lines().take(20) {
@@ -329,6 +338,7 @@ pub fn clip_tool_result(tool_name: &str, result: &str) -> String {
         "list_deploys" => 2000,
         "get_anomaly_context" => 2000,
         "get_argocd_app" => 3000,
+        "get_flux_resource" => 3000,
         "kube_describe" => 2500,
         "kube_events" => 2500,
         "load_skill" => 6000, // skills are intentional content

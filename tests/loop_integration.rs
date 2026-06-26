@@ -33,6 +33,7 @@ fn llm_for(server: &common::MockServer) -> LlmConfig {
         base_url: server.base_url.clone(),
         api_key: "sk-test".to_string(),
         model: "gpt-4o".to_string(),
+        reasoning_effort: None,
     }
 }
 
@@ -87,7 +88,9 @@ async fn earns_final_report() {
             args: json!({"service": "checkout"}),
             call_id: "call_4".to_string(),
         },
-        Script::Final("## Root Cause\napi error_rate spiked after connection refusals.".to_string()),
+        Script::Final(
+            "## Root Cause\napi error_rate spiked after connection refusals.".to_string(),
+        ),
         Script::Final(
             "## Root Cause\napi error_rate spiked after connection refusals. Confidence: high."
                 .to_string(),
@@ -114,7 +117,10 @@ async fn earns_final_report() {
     drop(tx);
 
     assert_eq!(kind, ReportKind::Final, "gate criteria met → Final report");
-    assert!(text.contains("Confidence: high"), "accepted text is the post-review one: {text}");
+    assert!(
+        text.contains("Confidence: high"),
+        "accepted text is the post-review one: {text}"
+    );
     assert_eq!(
         server.calls(),
         6,
@@ -306,7 +312,11 @@ async fn compaction_visible_on_wire() {
     // passes), then conclusion → critique → accepted conclusion.
     let mut scripts: Vec<Script> = (0..8)
         .map(|i| {
-            let name = if i % 2 == 0 { "search_logs" } else { "query_metrics" };
+            let name = if i % 2 == 0 {
+                "search_logs"
+            } else {
+                "query_metrics"
+            };
             Script::ToolCall {
                 name: name.to_string(),
                 args: json!({"service": format!("svc{i}")}),
@@ -314,8 +324,12 @@ async fn compaction_visible_on_wire() {
             }
         })
         .collect();
-    scripts.push(Script::Final("## Root Cause\nsvc0 cascading failure.".to_string()));
-    scripts.push(Script::Final("## Root Cause\nsvc0 cascading failure. Confidence: high.".to_string()));
+    scripts.push(Script::Final(
+        "## Root Cause\nsvc0 cascading failure.".to_string(),
+    ));
+    scripts.push(Script::Final(
+        "## Root Cause\nsvc0 cascading failure. Confidence: high.".to_string(),
+    ));
     let server = start_mock(scripts).await;
 
     let registry = evidence_registry();
@@ -338,7 +352,11 @@ async fn compaction_visible_on_wire() {
     let _ = collect_events(&mut rx).await;
 
     assert_eq!(kind, ReportKind::Final);
-    assert_eq!(server.calls(), 10, "8 tool rounds + critique round + accepted = 10 calls");
+    assert_eq!(
+        server.calls(),
+        10,
+        "8 tool rounds + critique round + accepted = 10 calls"
+    );
 
     // Inspect tool messages in the LAST request body, in transcript order.
     let requests = server.recorded_requests();
@@ -350,13 +368,29 @@ async fn compaction_visible_on_wire() {
         .filter(|m| m["role"] == "tool")
         .map(|m| m["content"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(tool_contents.len(), 8, "all 8 tool messages present in transcript");
+    assert_eq!(
+        tool_contents.len(),
+        8,
+        "all 8 tool messages present in transcript"
+    );
 
-    let stubbed = tool_contents.iter().filter(|c| *c == COMPACTED_STUB).count();
-    assert!(stubbed >= 1, "at least one old tool result must be compacted");
-    assert_eq!(stubbed, 2, "8 rounds with keep=6 → exactly the 2 oldest stubbed");
+    let stubbed = tool_contents
+        .iter()
+        .filter(|c| *c == COMPACTED_STUB)
+        .count();
+    assert!(
+        stubbed >= 1,
+        "at least one old tool result must be compacted"
+    );
+    assert_eq!(
+        stubbed, 2,
+        "8 rounds with keep=6 → exactly the 2 oldest stubbed"
+    );
     assert_eq!(tool_contents[0], COMPACTED_STUB, "oldest round stubbed");
-    assert_eq!(tool_contents[1], COMPACTED_STUB, "second-oldest round stubbed");
+    assert_eq!(
+        tool_contents[1], COMPACTED_STUB,
+        "second-oldest round stubbed"
+    );
     for (i, c) in tool_contents.iter().enumerate().skip(2) {
         assert!(
             c.contains("Found 7 log entries") || c.contains("Latest=0.42"),
@@ -432,8 +466,7 @@ async fn parallel_round_ordering() {
             .position(pred)
             .unwrap_or_else(|| panic!("expected event not found in {events:?}"))
     };
-    let call_a =
-        pos(&|e| matches!(e, AgentEvent::ToolCall { name, .. } if name == "search_logs"));
+    let call_a = pos(&|e| matches!(e, AgentEvent::ToolCall { name, .. } if name == "search_logs"));
     let call_b =
         pos(&|e| matches!(e, AgentEvent::ToolCall { name, .. } if name == "query_metrics"));
     let result_a =
@@ -463,7 +496,11 @@ async fn parallel_round_ordering() {
         .filter(|m| m["role"] == "tool")
         .map(|m| m["tool_call_id"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(tool_ids, vec!["call_a", "call_b"], "transcript tool messages in call order");
+    assert_eq!(
+        tool_ids,
+        vec!["call_a", "call_b"],
+        "transcript tool messages in call order"
+    );
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -527,14 +564,13 @@ async fn sse_parser_torture() {
     let mut scripts = vec![Script::RawChunks(chunks)];
     // Let the run finish: conclusion → 3 gate bounces → critique → accepted.
     for _ in 0..5 {
-        scripts.push(Script::Final("## Root Cause\nTorture survived.".to_string()));
+        scripts.push(Script::Final(
+            "## Root Cause\nTorture survived.".to_string(),
+        ));
     }
     let server = start_mock(scripts).await;
 
-    let registry = make_registry(vec![(
-        "search_logs",
-        "Found 1 log entry.".to_string(),
-    )]);
+    let registry = make_registry(vec![("search_logs", "Found 1 log entry.".to_string())]);
     let ctx = make_ctx().await;
     let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
 
@@ -563,7 +599,10 @@ async fn sse_parser_torture() {
         })
         .take(1) // round 1 emitted exactly one delta line for the content
         .collect();
-    assert_eq!(streamed, "café ☃ snow", "multibyte content reassembled across chunk cuts");
+    assert_eq!(
+        streamed, "café ☃ snow",
+        "multibyte content reassembled across chunk cuts"
+    );
 
     // The tool call reassembled correctly: right name, exact args.
     let tool_args = events.iter().find_map(|e| match e {
@@ -578,9 +617,9 @@ async fn sse_parser_torture() {
 
     // The run continued past the torture round and completed normally.
     assert!(
-        events
-            .iter()
-            .any(|e| matches!(e, AgentEvent::Summary { text, .. } if text.contains("Torture survived"))),
+        events.iter().any(
+            |e| matches!(e, AgentEvent::Summary { text, .. } if text.contains("Torture survived"))
+        ),
         "run completes after the torture response"
     );
 }

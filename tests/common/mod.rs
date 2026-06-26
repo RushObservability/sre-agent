@@ -334,8 +334,7 @@ impl Tool for SleepTool {
 pub async fn make_ctx() -> ToolContext {
     let ch = clickhouse::Client::default().with_url("http://127.0.0.1:1");
     let config_db = Arc::new(sre_agent::config_db::ConfigDb::new_disconnected_for_tests());
-    let skill_store =
-        Arc::new(sre_agent::agent::skill_store::SkillStore::load(&config_db).await);
+    let skill_store = Arc::new(sre_agent::agent::skill_store::SkillStore::load(&config_db).await);
     ToolContext {
         state: sre_agent::AppState {
             ch,

@@ -134,8 +134,7 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let skill_store =
-            Arc::new(crate::agent::skill_store::SkillStore::load(&config_db).await);
+        let skill_store = Arc::new(crate::agent::skill_store::SkillStore::load(&config_db).await);
         ToolContext {
             state: crate::AppState {
                 ch,

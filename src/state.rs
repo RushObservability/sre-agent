@@ -21,7 +21,10 @@ static ROW_POLICY_SUPPORTED: AtomicU8 = AtomicU8::new(0);
 /// Probe ClickHouse once at startup to see if custom_settings_prefixes includes 'rush_'.
 pub async fn probe_row_policy_support(ch: &Client) {
     #[derive(clickhouse::Row, serde::Deserialize)]
-    struct Probe { n: u8 }
+    #[allow(dead_code)] // field populated by ClickHouse row deserialization; only the query success matters
+    struct Probe {
+        n: u8,
+    }
     let result = ch
         .query("SELECT 1 AS n")
         .with_option("rush_tenant_id", "probe")
@@ -29,7 +32,9 @@ pub async fn probe_row_policy_support(ch: &Client) {
         .await;
     match result {
         Ok(_) => {
-            tracing::info!("ClickHouse accepts rush_tenant_id custom setting — row policies enforcing");
+            tracing::info!(
+                "ClickHouse accepts rush_tenant_id custom setting — row policies enforcing"
+            );
             ROW_POLICY_SUPPORTED.store(1, Ordering::Relaxed);
         }
         Err(_) => {

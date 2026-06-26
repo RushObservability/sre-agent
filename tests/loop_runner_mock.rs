@@ -65,6 +65,7 @@ async fn loop_completes_with_single_final_answer() {
         base_url: server.base_url.clone(),
         api_key: "sk-test".to_string(),
         model: "gpt-4o".to_string(),
+        reasoning_effort: None,
     };
 
     run_with_config(initial_messages("Investigate"), &registry, &ctx, &tx, llm)
@@ -143,6 +144,7 @@ async fn loop_executes_tool_call_then_finalizes() {
         base_url: server.base_url.clone(),
         api_key: "sk-test".to_string(),
         model: "gpt-4o".to_string(),
+        reasoning_effort: None,
     };
 
     run_with_config(
@@ -187,8 +189,14 @@ async fn loop_executes_tool_call_then_finalizes() {
     let requests = server.recorded_requests();
     assert_eq!(requests.len(), 6);
     let last = requests.last().unwrap();
-    assert_eq!(count_messages_containing(last, "system", GATE_GAP_MARKER), 3);
-    assert_eq!(count_messages_containing(last, "system", CRITIQUE_MARKER), 1);
+    assert_eq!(
+        count_messages_containing(last, "system", GATE_GAP_MARKER),
+        3
+    );
+    assert_eq!(
+        count_messages_containing(last, "system", CRITIQUE_MARKER),
+        1
+    );
 }
 
 #[tokio::test]
@@ -217,6 +225,7 @@ async fn repeat_call_detection_rejects_duplicate_tool_calls() {
         base_url: server.base_url.clone(),
         api_key: "sk-test".to_string(),
         model: "gpt-4o".to_string(),
+        reasoning_effort: None,
     };
 
     run_with_config(initial_messages("Investigate"), &registry, &ctx, &tx, llm)
@@ -276,6 +285,7 @@ async fn empty_response_triggers_retry_without_burning_tool_budget() {
         base_url: server.base_url.clone(),
         api_key: "sk-test".to_string(),
         model: "gpt-4o".to_string(),
+        reasoning_effort: None,
     };
 
     run_with_config(initial_messages("Investigate"), &registry, &ctx, &tx, llm)
@@ -310,6 +320,12 @@ async fn empty_response_triggers_retry_without_burning_tool_budget() {
         2,
         "expected one retry notice per empty response"
     );
-    assert_eq!(count_messages_containing(last, "system", GATE_GAP_MARKER), 3);
-    assert_eq!(count_messages_containing(last, "system", CRITIQUE_MARKER), 1);
+    assert_eq!(
+        count_messages_containing(last, "system", GATE_GAP_MARKER),
+        3
+    );
+    assert_eq!(
+        count_messages_containing(last, "system", CRITIQUE_MARKER),
+        1
+    );
 }

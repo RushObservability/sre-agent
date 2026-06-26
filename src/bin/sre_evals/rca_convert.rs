@@ -140,8 +140,12 @@ fn rcaeval_from_csv(raw: &str) -> Result<Vec<OutCase>> {
     let idx = |name: &str| cols.iter().position(|c| c == name);
 
     let i_case = idx("case_id").or_else(|| idx("case")).or_else(|| idx("id"));
-    let i_service = idx("service").or_else(|| idx("component")).context("RCAEval CSV missing `service`/`component` column")?;
-    let i_fault = idx("fault_type").or_else(|| idx("fault")).or_else(|| idx("type"));
+    let i_service = idx("service")
+        .or_else(|| idx("component"))
+        .context("RCAEval CSV missing `service`/`component` column")?;
+    let i_fault = idx("fault_type")
+        .or_else(|| idx("fault"))
+        .or_else(|| idx("type"));
     let i_resource = idx("resource").or_else(|| idx("metric"));
     let i_time = idx("inject_time").or_else(|| idx("timestamp"));
 
@@ -210,8 +214,12 @@ fn openrca_from_csv(raw: &str) -> Result<Vec<OutCase>> {
     let header = lines.next().context("empty OpenRCA CSV")?;
     let cols: Vec<String> = header.split(',').map(|c| c.trim().to_lowercase()).collect();
     let idx = |name: &str| cols.iter().position(|c| c == name);
-    let i_dt = idx("datetime").or_else(|| idx("time")).or_else(|| idx("timestamp"));
-    let i_comp = idx("component").or_else(|| idx("service")).context("OpenRCA CSV missing `component` column")?;
+    let i_dt = idx("datetime")
+        .or_else(|| idx("time"))
+        .or_else(|| idx("timestamp"));
+    let i_comp = idx("component")
+        .or_else(|| idx("service"))
+        .context("OpenRCA CSV missing `component` column")?;
     let i_reason = idx("reason").or_else(|| idx("cause"));
 
     let mut out = Vec::new();
@@ -221,8 +229,13 @@ fn openrca_from_csv(raw: &str) -> Result<Vec<OutCase>> {
             Some(s) if !s.is_empty() => s.to_string(),
             _ => continue,
         };
-        let reason = i_reason.and_then(|i| fields.get(i)).map(|s| s.to_string()).unwrap_or_default();
-        let around = i_dt.and_then(|i| fields.get(i)).and_then(|s| parse_openrca_datetime(s));
+        let reason = i_reason
+            .and_then(|i| fields.get(i))
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        let around = i_dt
+            .and_then(|i| fields.get(i))
+            .and_then(|s| parse_openrca_datetime(s));
         out.push(build_openrca_case(
             format!("openrca_{row_i}"),
             &component,
@@ -254,7 +267,11 @@ fn build_case(
     OutCase {
         id,
         description: Some("Imported from RCAEval — verify service name and reason.".to_string()),
-        input: OutInput { kind: "question".to_string(), text, around },
+        input: OutInput {
+            kind: "question".to_string(),
+            text,
+            around,
+        },
         ground_truth: OutGroundTruth {
             root_cause_service: service.to_string(),
             reason,
@@ -282,7 +299,11 @@ fn build_openrca_case(
     OutCase {
         id,
         description: Some("Imported from OpenRCA — verify component name and reason.".to_string()),
-        input: OutInput { kind: "question".to_string(), text, around },
+        input: OutInput {
+            kind: "question".to_string(),
+            text,
+            around,
+        },
         ground_truth: OutGroundTruth {
             root_cause_service: component.to_string(),
             reason,

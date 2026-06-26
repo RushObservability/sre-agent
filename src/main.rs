@@ -37,14 +37,8 @@ async fn main() -> anyhow::Result<()> {
 
     // ConfigDb uses the session-default database (`default`), matching query-api —
     // config_* tables live there, not in `observability` (which holds telemetry data).
-    let config_db = Arc::new(
-        ConfigDb::open(
-            &clickhouse_url,
-            &clickhouse_user,
-            &clickhouse_password,
-        )
-        .await?,
-    );
+    let config_db =
+        Arc::new(ConfigDb::open(&clickhouse_url, &clickhouse_user, &clickhouse_password).await?);
     tracing::info!(
         "sre-agent config db opened against ClickHouse at {clickhouse_url} (config tables in default database)"
     );

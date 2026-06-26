@@ -263,10 +263,10 @@ mod tests {
     /// query-api `config_*` schema; the rendering/catalog assertions are also
     /// covered by the pure-logic tests that follow, which need no database.
     async fn live_store() -> SkillStore {
-        let url = std::env::var("CLICKHOUSE_URL")
-            .unwrap_or_else(|_| "http://localhost:8123".to_string());
-        let database = std::env::var("CLICKHOUSE_DATABASE")
-            .unwrap_or_else(|_| "observability".to_string());
+        let url =
+            std::env::var("CLICKHOUSE_URL").unwrap_or_else(|_| "http://localhost:8123".to_string());
+        let database =
+            std::env::var("CLICKHOUSE_DATABASE").unwrap_or_else(|_| "observability".to_string());
         let user = std::env::var("CLICKHOUSE_USER").unwrap_or_else(|_| "default".to_string());
         let password = std::env::var("CLICKHOUSE_PASSWORD").unwrap_or_default();
         let db = Arc::new(ConfigDb::open(&url, &user, &password).await.unwrap());

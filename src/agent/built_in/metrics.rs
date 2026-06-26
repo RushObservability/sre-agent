@@ -194,13 +194,21 @@ impl Tool for QueryMetrics {
             format!("last {minutes}m")
         };
 
-        let Some((query, label)) =
-            build_query_metrics_sql(service, metric, metric_name, around, minutes, &ctx.tenant_id)
-        else {
+        let Some((query, label)) = build_query_metrics_sql(
+            service,
+            metric,
+            metric_name,
+            around,
+            minutes,
+            &ctx.tenant_id,
+        ) else {
             return Ok("Provide either 'service' + 'metric' or 'metric_name'.".to_string());
         };
 
-        let rows: Vec<MetricRow> = crate::state::tenant_query(&ctx.state.ch, &query, &ctx.tenant_id).fetch_all().await?;
+        let rows: Vec<MetricRow> =
+            crate::state::tenant_query(&ctx.state.ch, &query, &ctx.tenant_id)
+                .fetch_all()
+                .await?;
 
         if rows.is_empty() {
             return Ok(format!("No data for {label} ({time_desc})."));
@@ -267,7 +275,10 @@ mod tests {
             build_query_metrics_sql("O'Brien", "error_rate", "", "", 30, "ten'ant").unwrap();
         assert!(sql.contains("service_name = 'O''Brien'"), "{sql}");
         assert!(sql.contains("tenant_id = 'ten''ant'"), "{sql}");
-        assert!(!sql.contains("\\'"), "no backslash quote escaping anywhere: {sql}");
+        assert!(
+            !sql.contains("\\'"),
+            "no backslash quote escaping anywhere: {sql}"
+        );
     }
 
     #[test]
@@ -288,7 +299,10 @@ mod tests {
             "default",
         )
         .unwrap();
-        assert!(sql.contains("toDateTime64('2025-01-15 10:30:00', 9)"), "{sql}");
+        assert!(
+            sql.contains("toDateTime64('2025-01-15 10:30:00', 9)"),
+            "{sql}"
+        );
         assert!(!sql.contains("now() - INTERVAL"), "{sql}");
     }
 }

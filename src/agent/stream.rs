@@ -33,9 +33,7 @@ pub enum AgentEvent {
     #[serde(rename = "error")]
     Error { message: String },
     #[serde(rename = "session_created")]
-    SessionCreated {
-        session_id: String,
-    },
+    SessionCreated { session_id: String },
     #[serde(rename = "done")]
     Done {
         rounds: u32,

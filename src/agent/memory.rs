@@ -10,13 +10,13 @@ use std::collections::HashSet;
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct WorkingMemory {
     pub task: String,
-    pub suspect_services: Vec<String>,         // LRU, max 8
-    pub confirmed_facts: Vec<String>,          // max 10
-    pub ruled_out: Vec<String>,                // max 10
+    pub suspect_services: Vec<String>, // LRU, max 8
+    pub confirmed_facts: Vec<String>,  // max 10
+    pub ruled_out: Vec<String>,        // max 10
     #[serde(skip)]
     pub recent_tool_calls: Vec<CallSignature>, // transient: per-turn repeat detection
     #[serde(skip)]
-    pub consecutive_empty_results: u32,        // transient: per-turn dead-end detection
+    pub consecutive_empty_results: u32, // transient: per-turn dead-end detection
     /// Hypotheses we explored and ruled out (LRU, max 5). Used to discourage
     /// re-exploring dead ends across escalation rounds.
     pub failed_hypotheses: Vec<String>,
@@ -671,7 +671,11 @@ mod tests {
         let s = "…".repeat(100); // 300 bytes
         for max in 0..=s.len() {
             let t = truncate_at_char_boundary(&s, max);
-            assert!(t.len() <= max, "result must be ≤{max} bytes, got {}", t.len());
+            assert!(
+                t.len() <= max,
+                "result must be ≤{max} bytes, got {}",
+                t.len()
+            );
             assert!(s.starts_with(t));
         }
         // Same for a 4-byte emoji.

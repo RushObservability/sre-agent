@@ -137,8 +137,7 @@ async fn investigate(
             let store = Arc::new(
                 SkillStore::load_unified(&state.config_db, state.query_api_url.as_deref()).await,
             );
-            *state.caches.skills.write().await =
-                Some((std::time::Instant::now(), store.clone()));
+            *state.caches.skills.write().await = Some((std::time::Instant::now(), store.clone()));
             store
         }
     };
@@ -169,7 +168,13 @@ async fn investigate(
         };
         state
             .config_db
-            .create_session(&session_id, &req.tenant_id, &auto_title, "", &req.template_id)
+            .create_session(
+                &session_id,
+                &req.tenant_id,
+                &auto_title,
+                "",
+                &req.template_id,
+            )
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     } else if !is_new_session && session_mode {
@@ -202,7 +207,9 @@ async fn investigate(
             match serde_json::from_str::<WorkingMemory>(&session.working_memory) {
                 Ok(mem) => restored_memory = Some(mem),
                 Err(e) => {
-                    tracing::warn!("failed to deserialize working memory for session {session_id}: {e}");
+                    tracing::warn!(
+                        "failed to deserialize working memory for session {session_id}: {e}"
+                    );
                 }
             }
         }
@@ -394,7 +401,11 @@ async fn investigate(
                 .and_then(|m| m.get("role"))
                 .and_then(|r| r.as_str())
                 == Some("user");
-            let insert_at = if is_trailing_user { msgs.len() - 1 } else { msgs.len() };
+            let insert_at = if is_trailing_user {
+                msgs.len() - 1
+            } else {
+                msgs.len()
+            };
             msgs.insert(insert_at, mem_msg);
         }
 
@@ -447,7 +458,9 @@ async fn investigate(
                 async move {
                     match db.get_setting(key).await {
                         Ok(Some(v)) => v.trim().parse::<u32>().ok(),
-                        _ => std::env::var(env).ok().and_then(|v| v.trim().parse::<u32>().ok()),
+                        _ => std::env::var(env)
+                            .ok()
+                            .and_then(|v| v.trim().parse::<u32>().ok()),
                     }
                 }
             };
@@ -504,8 +517,7 @@ async fn investigate(
     //     req.reasoning_effort), validated against that policy. A hand-crafted
     //     request with a disallowed model/level falls back to the default — the
     //     client can't bypass the policy.
-    let mut llm = agent::loop_runner::LlmConfig::from_env()
-        .expect("LLM config checked above");
+    let mut llm = agent::loop_runner::LlmConfig::from_env().expect("LLM config checked above");
 
     // Parse the allowed-models policy. Empty/missing/bad → no policy (preserve
     // pre-governance behavior: honor the `sre_agent_model` default setting / env).
@@ -546,14 +558,20 @@ async fn investigate(
         // Build the allowed id set and the per-id allowed thinking levels.
         let allowed_ids: Vec<String> = allowed
             .iter()
-            .filter_map(|m| m.get("id").and_then(|v| v.as_str()).map(|s| s.trim().to_string()))
+            .filter_map(|m| {
+                m.get("id")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.trim().to_string())
+            })
             .filter(|s| !s.is_empty())
             .collect();
 
         // Resolve the model: a user pick if it's allowed; else the default if
         // allowed; else the allowed list's first entry; else the env default.
         let req_model = req.model.trim().to_string();
-        let resolved_model = if !req_model.is_empty() && allowed_ids.iter().any(|id| id == &req_model) {
+        let resolved_model = if !req_model.is_empty()
+            && allowed_ids.iter().any(|id| id == &req_model)
+        {
             Some(req_model)
         } else if !default_model.is_empty() && allowed_ids.iter().any(|id| id == &default_model) {
             Some(default_model)
@@ -571,9 +589,17 @@ async fn investigate(
         if !req_effort.is_empty() && agent::loop_runner::is_reasoning_model(&llm.model) {
             let model_levels: Vec<String> = allowed
                 .iter()
-                .find(|m| m.get("id").and_then(|v| v.as_str()).map(|s| s.trim()) == Some(llm.model.as_str()))
+                .find(|m| {
+                    m.get("id").and_then(|v| v.as_str()).map(|s| s.trim())
+                        == Some(llm.model.as_str())
+                })
                 .and_then(|m| m.get("reasoning").and_then(|v| v.as_array()))
-                .map(|arr| arr.iter().filter_map(|l| l.as_str()).map(|s| s.trim().to_string()).collect())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|l| l.as_str())
+                        .map(|s| s.trim().to_string())
+                        .collect()
+                })
                 .unwrap_or_default();
             if model_levels.iter().any(|l| l == req_effort) {
                 llm.reasoning_effort = Some(req_effort.to_string());
@@ -582,12 +608,27 @@ async fn investigate(
     }
 
     tokio::spawn(async move {
-        let result =
-            agent::loop_runner::run_with_config_and_budget(messages, &registry, &tool_ctx, &tx, llm, restored_mem, &session_id_for_task, budget)
-                .await;
+        let result = agent::loop_runner::run_with_config_and_budget(
+            messages,
+            &registry,
+            &tool_ctx,
+            &tx,
+            llm,
+            restored_mem,
+            &session_id_for_task,
+            budget,
+        )
+        .await;
 
         match result {
-            Ok((summary_text, report_kind, final_memory, total_prompt, total_completion, llm_model_used)) => {
+            Ok((
+                summary_text,
+                report_kind,
+                final_memory,
+                total_prompt,
+                total_completion,
+                llm_model_used,
+            )) => {
                 // Persist assistant turn and updated working memory
                 if session_mode_for_task {
                     let turn_index = config_db
@@ -615,8 +656,8 @@ async fn investigate(
                     // Persist memory + accumulated tokens (+ status for final
                     // reports) in one read + one versioned insert instead of
                     // three read-modify-write cycles.
-                    let mem_json = serde_json::to_string(&final_memory)
-                        .unwrap_or_else(|_| "{}".to_string());
+                    let mem_json =
+                        serde_json::to_string(&final_memory).unwrap_or_else(|_| "{}".to_string());
                     let status = if report_kind == agent::stream::ReportKind::Final {
                         Some("completed")
                     } else {

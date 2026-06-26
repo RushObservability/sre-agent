@@ -34,7 +34,10 @@ pub struct LoopBudget {
 
 impl Default for LoopBudget {
     fn default() -> Self {
-        Self { max_tool_steps: DEFAULT_MAX_TOOL_STEPS, max_llm_calls: DEFAULT_MAX_ATTEMPTS }
+        Self {
+            max_tool_steps: DEFAULT_MAX_TOOL_STEPS,
+            max_llm_calls: DEFAULT_MAX_ATTEMPTS,
+        }
     }
 }
 
@@ -43,18 +46,25 @@ impl LoopBudget {
     /// agent functional (too low → it can't investigate; absurdly high → no
     /// cost protection at all).
     pub fn from_overrides(max_tool_steps: Option<u32>, max_llm_calls: Option<u32>) -> Self {
-        let steps = max_tool_steps.unwrap_or(DEFAULT_MAX_TOOL_STEPS).clamp(4, 200);
+        let steps = max_tool_steps
+            .unwrap_or(DEFAULT_MAX_TOOL_STEPS)
+            .clamp(4, 200);
         // LLM calls must exceed tool steps or the loop dies on retries first.
         let calls = max_llm_calls
             .unwrap_or(DEFAULT_MAX_ATTEMPTS)
             .clamp(steps.saturating_add(2), 300);
-        Self { max_tool_steps: steps, max_llm_calls: calls }
+        Self {
+            max_tool_steps: steps,
+            max_llm_calls: calls,
+        }
     }
 
     /// Minimum tool steps the root-cause gate demands before accepting a
     /// final answer — adapts downward when the operator sets a small budget.
     fn min_depth(&self) -> u32 {
-        MIN_INVESTIGATION_DEPTH.min(self.max_tool_steps.saturating_sub(1)).max(1)
+        MIN_INVESTIGATION_DEPTH
+            .min(self.max_tool_steps.saturating_sub(1))
+            .max(1)
     }
 }
 
@@ -106,9 +116,7 @@ fn decide_report_kind(
 fn tool_signal_type(tool_name: &str) -> Option<&'static str> {
     match tool_name {
         "search_logs" => Some("logs"),
-        "query_traces" | "get_trace" | "list_services" | "service_dependencies" => {
-            Some("traces")
-        }
+        "query_traces" | "get_trace" | "list_services" | "service_dependencies" => Some("traces"),
         "query_metrics" => Some("metrics"),
         "kube_describe" | "kube_events" | "get_argocd_app" | "get_flux_resource" => {
             Some("kubernetes")
@@ -138,8 +146,11 @@ fn root_cause_gate(memory: &WorkingMemory, tool_steps: u32, min_depth: u32) -> O
 
     let unique_signals = memory.unique_signal_count();
     if unique_signals < MIN_SIGNAL_TYPES {
-        let consulted: std::collections::HashSet<&str> =
-            memory.signals_consulted.iter().map(|s| s.as_str()).collect();
+        let consulted: std::collections::HashSet<&str> = memory
+            .signals_consulted
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
         let missing: Vec<&str> = ["logs", "traces", "metrics"]
             .iter()
             .copied()
@@ -176,7 +187,10 @@ fn root_cause_gate(memory: &WorkingMemory, tool_steps: u32, min_depth: u32) -> O
          You MUST check additional signals before producing a final report. \
          Do not repeat queries you've already made — try a different service, \
          time window, or signal type.",
-        gaps.iter().map(|g| format!("- {g}")).collect::<Vec<_>>().join("\n")
+        gaps.iter()
+            .map(|g| format!("- {g}"))
+            .collect::<Vec<_>>()
+            .join("\n")
     ))
 }
 
@@ -196,6 +210,7 @@ fn strip_question_prefix(content: &str) -> String {
 /// - connect: 10s (fail fast on unreachable backends)
 /// - total: 300s per call (generous for long streamed generations; streaming
 ///   reads count against it)
+///
 /// Reusing one client also keeps the TLS connection pool warm across runs.
 fn llm_client() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
@@ -232,8 +247,7 @@ fn compact_old_tool_results(messages: &mut [Value], keep_recent_rounds: usize) {
     let mut rounds_seen = 0usize;
     let mut cutoff: Option<usize> = None;
     for (idx, msg) in messages.iter().enumerate().rev() {
-        let is_assistant_tool_round = msg.get("role").and_then(|r| r.as_str())
-            == Some("assistant")
+        let is_assistant_tool_round = msg.get("role").and_then(|r| r.as_str()) == Some("assistant")
             && msg.get("tool_calls").is_some_and(|tc| !tc.is_null());
         if is_assistant_tool_round {
             rounds_seen += 1;
@@ -294,10 +308,7 @@ pub struct LlmConfig {
 /// Heuristic: does this model support the `reasoning_effort` parameter (OpenAI gpt-5 / o-series)?
 pub fn is_reasoning_model(model: &str) -> bool {
     let m = model.trim().to_ascii_lowercase();
-    m.starts_with("gpt-5")
-        || m.starts_with("o1")
-        || m.starts_with("o3")
-        || m.starts_with("o4")
+    m.starts_with("gpt-5") || m.starts_with("o1") || m.starts_with("o3") || m.starts_with("o4")
 }
 
 impl LlmConfig {
@@ -350,8 +361,17 @@ pub async fn run_with_config(
     tx: &mpsc::Sender<AgentEvent>,
     llm: LlmConfig,
 ) -> Result<()> {
-    let (_, _, _, _, _, _) =
-        run_inner(messages, registry, ctx, tx, llm, None, "", LoopBudget::default()).await?;
+    let (_, _, _, _, _, _) = run_inner(
+        messages,
+        registry,
+        ctx,
+        tx,
+        llm,
+        None,
+        "",
+        LoopBudget::default(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -396,7 +416,17 @@ pub async fn run_with_config_and_budget(
     session_id: &str,
     budget: LoopBudget,
 ) -> Result<(String, ReportKind, WorkingMemory, u64, u64, String)> {
-    run_inner(messages, registry, ctx, tx, llm, restored_memory, session_id, budget).await
+    run_inner(
+        messages,
+        registry,
+        ctx,
+        tx,
+        llm,
+        restored_memory,
+        session_id,
+        budget,
+    )
+    .await
 }
 
 /// Core agent loop implementation.
@@ -527,8 +557,14 @@ async fn run_inner(
                 model: &model,
                 messages: &messages,
                 stream: true,
-                stream_options: StreamOptions { include_usage: true },
-                tools: if force_final { None } else { Some(&tool_definitions) },
+                stream_options: StreamOptions {
+                    include_usage: true,
+                },
+                tools: if force_final {
+                    None
+                } else {
+                    Some(&tool_definitions)
+                },
                 reasoning_effort: reasoning_effort.as_deref(),
             };
             client
@@ -649,7 +685,14 @@ async fn run_inner(
                     model: model.clone(),
                 })
                 .await;
-            return Ok((display_text, kind, memory, total_prompt, total_completion, model));
+            return Ok((
+                display_text,
+                kind,
+                memory,
+                total_prompt,
+                total_completion,
+                model,
+            ));
         }
 
         // Record assistant message with tool calls
@@ -728,19 +771,21 @@ async fn run_inner(
         // Pass 2 — run the real calls concurrently: round wall time becomes
         // max(tool latencies) instead of their sum. Each future yields
         // (did_real_work, result_text).
-        let outcomes: Vec<(bool, String)> = futures_util::future::join_all(
-            tool_calls.iter().zip(&planned).map(|(tc, (args, plan))| async move {
-                match plan {
-                    Planned::PrecomputedError(msg) => (false, msg.clone()),
-                    Planned::Execute => match registry.execute(&tc.name, args.clone(), ctx).await
-                    {
-                        Ok(data) => (true, clip_tool_result(&tc.name, &data)),
-                        Err(e) => (false, format!("Tool error: {e}")),
-                    },
-                }
-            }),
-        )
-        .await;
+        let outcomes: Vec<(bool, String)> =
+            futures_util::future::join_all(tool_calls.iter().zip(&planned).map(
+                |(tc, (args, plan))| async move {
+                    match plan {
+                        Planned::PrecomputedError(msg) => (false, msg.clone()),
+                        Planned::Execute => {
+                            match registry.execute(&tc.name, args.clone(), ctx).await {
+                                Ok(data) => (true, clip_tool_result(&tc.name, &data)),
+                                Err(e) => (false, format!("Tool error: {e}")),
+                            }
+                        }
+                    }
+                },
+            ))
+            .await;
 
         // Pass 3 — apply results in original call order, with the same
         // per-call sequence as the old sequential loop: memory fact
@@ -841,11 +886,12 @@ async fn run_inner(
     // the user sees what we learned and can follow up. This branch should be
     // rare because the escalation ladder above usually forces an earlier
     // summary, but we still need a safety net for runaway loops.
-    let termination_reason = if attempts >= budget.max_llm_calls && tool_steps < budget.max_tool_steps {
-        "Too many parse failures or repeat calls"
-    } else {
-        "Exhausted internal investigation budget"
-    };
+    let termination_reason =
+        if attempts >= budget.max_llm_calls && tool_steps < budget.max_tool_steps {
+            "Too many parse failures or repeat calls"
+        } else {
+            "Exhausted internal investigation budget"
+        };
 
     let text = format!(
         "## Preliminary Investigation Report\n\n**Status**: {}\n\n{}\n\n\
@@ -872,7 +918,14 @@ async fn run_inner(
         })
         .await;
 
-    Ok((text, ReportKind::Preliminary, memory, total_prompt, total_completion, model))
+    Ok((
+        text,
+        ReportKind::Preliminary,
+        memory,
+        total_prompt,
+        total_completion,
+        model,
+    ))
 }
 
 struct ToolCallAccum {
@@ -893,7 +946,11 @@ struct StreamAccum {
 /// Process one complete SSE line. Forwards content deltas over `tx` as they
 /// arrive and accumulates tool-call fragments and usage. Returns `true` when
 /// the `[DONE]` sentinel is seen. Malformed lines are tolerated (skipped).
-async fn process_sse_line(line: &str, accum: &mut StreamAccum, tx: &mpsc::Sender<AgentEvent>) -> bool {
+async fn process_sse_line(
+    line: &str,
+    accum: &mut StreamAccum,
+    tx: &mpsc::Sender<AgentEvent>,
+) -> bool {
     let line = line.trim();
     if !line.starts_with("data: ") {
         return false;
@@ -1097,7 +1154,10 @@ mod tests {
         assert_eq!(msgs[1]["content"], "Investigate the outage.");
         for m in &msgs {
             if m["role"] == "assistant" {
-                assert!(m.get("tool_calls").is_some(), "assistant tool_calls preserved");
+                assert!(
+                    m.get("tool_calls").is_some(),
+                    "assistant tool_calls preserved"
+                );
             }
         }
     }
@@ -1107,7 +1167,10 @@ mod tests {
         let mut msgs = transcript(6);
         let before = msgs.clone();
         compact_old_tool_results(&mut msgs, 6);
-        assert_eq!(msgs, before, "exactly keep_recent_rounds rounds → nothing stubbed");
+        assert_eq!(
+            msgs, before,
+            "exactly keep_recent_rounds rounds → nothing stubbed"
+        );
 
         let mut msgs = transcript(2);
         let before = msgs.clone();
@@ -1127,7 +1190,13 @@ mod tests {
         msgs.extend(round(8));
         compact_old_tool_results(&mut msgs, 6);
         let contents = tool_contents(&msgs);
-        assert_eq!(contents.iter().filter(|c| *c == COMPACTED_TOOL_RESULT).count(), 3);
+        assert_eq!(
+            contents
+                .iter()
+                .filter(|c| *c == COMPACTED_TOOL_RESULT)
+                .count(),
+            3
+        );
         assert_eq!(contents.last().unwrap(), "tool result 8");
     }
 
@@ -1172,8 +1241,14 @@ mod tests {
     fn gate_rejects_insufficient_depth_with_step_counts() {
         let mem = satisfied_memory();
         let msg = root_cause_gate(&mem, 1, 4).expect("gate must reject depth 1 < 4");
-        assert!(msg.contains("Only 1 investigation step(s)"), "mentions current steps: {msg}");
-        assert!(msg.contains("at least 4"), "mentions required min depth: {msg}");
+        assert!(
+            msg.contains("Only 1 investigation step(s)"),
+            "mentions current steps: {msg}"
+        );
+        assert!(
+            msg.contains("at least 4"),
+            "mentions required min depth: {msg}"
+        );
     }
 
     #[test]
@@ -1185,7 +1260,10 @@ mod tests {
         let msg = root_cause_gate(&mem, 5, 4).expect("gate must reject 1 signal type");
         assert!(msg.contains("Only 1 signal type(s) checked"), "{msg}");
         // logs already consulted → the two suggested missing types are traces, metrics
-        assert!(msg.contains("traces, metrics"), "names unconsulted signal types: {msg}");
+        assert!(
+            msg.contains("traces, metrics"),
+            "names unconsulted signal types: {msg}"
+        );
     }
 
     #[test]
@@ -1196,13 +1274,20 @@ mod tests {
         mem.add_fact("only one fact".to_string());
         let msg = root_cause_gate(&mem, 5, 4).expect("gate must reject <2 facts");
         assert!(msg.contains("Fewer than 2 confirmed facts"), "{msg}");
-        assert!(msg.contains("(have 1)"), "reports current fact count: {msg}");
+        assert!(
+            msg.contains("(have 1)"),
+            "reports current fact count: {msg}"
+        );
     }
 
     #[test]
     fn gate_passes_when_all_criteria_satisfied() {
         let mem = satisfied_memory();
-        assert_eq!(root_cause_gate(&mem, 4, 4), None, "depth == min_depth must pass");
+        assert_eq!(
+            root_cause_gate(&mem, 4, 4),
+            None,
+            "depth == min_depth must pass"
+        );
         assert_eq!(root_cause_gate(&mem, 10, 4), None);
     }
 
@@ -1285,7 +1370,10 @@ mod tests {
         // Smallest legal budget (4 steps) → depth shrinks below the constant.
         assert_eq!(LoopBudget::from_overrides(Some(1), None).min_depth(), 3);
         // Pathological direct construction still bottoms out at 1.
-        let b = LoopBudget { max_tool_steps: 1, max_llm_calls: 3 };
+        let b = LoopBudget {
+            max_tool_steps: 1,
+            max_llm_calls: 3,
+        };
         assert_eq!(b.min_depth(), 1);
     }
 
@@ -1294,7 +1382,10 @@ mod tests {
     #[test]
     fn strip_question_prefix_variants() {
         assert_eq!(strip_question_prefix("[QUESTION] Which one?"), "Which one?");
-        assert_eq!(strip_question_prefix("  [QUESTION]   Which one?"), "Which one?");
+        assert_eq!(
+            strip_question_prefix("  [QUESTION]   Which one?"),
+            "Which one?"
+        );
         assert_eq!(strip_question_prefix("No prefix here"), "No prefix here");
         // Prefix not at the start is left alone.
         assert_eq!(
@@ -1308,11 +1399,21 @@ mod tests {
     #[test]
     fn tool_signal_type_maps_every_arm() {
         assert_eq!(tool_signal_type("search_logs"), Some("logs"));
-        for t in ["query_traces", "get_trace", "list_services", "service_dependencies"] {
+        for t in [
+            "query_traces",
+            "get_trace",
+            "list_services",
+            "service_dependencies",
+        ] {
             assert_eq!(tool_signal_type(t), Some("traces"), "{t}");
         }
         assert_eq!(tool_signal_type("query_metrics"), Some("metrics"));
-        for t in ["kube_describe", "kube_events", "get_argocd_app", "get_flux_resource"] {
+        for t in [
+            "kube_describe",
+            "kube_events",
+            "get_argocd_app",
+            "get_flux_resource",
+        ] {
             assert_eq!(tool_signal_type(t), Some("kubernetes"), "{t}");
         }
         assert_eq!(tool_signal_type("list_deploys"), Some("deploys"));
@@ -1357,7 +1458,11 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(deltas, vec!["Hel", "lo"], "each delta emitted as it arrives");
+        assert_eq!(
+            deltas,
+            vec!["Hel", "lo"],
+            "each delta emitted as it arrives"
+        );
     }
 
     #[tokio::test]
@@ -1411,13 +1516,8 @@ mod tests {
 
     #[tokio::test]
     async fn sse_non_data_lines_are_ignored() {
-        let (accum, events, done) = run_lines(&[
-            "",
-            ": keep-alive comment",
-            "event: message",
-            "id: 7",
-        ])
-        .await;
+        let (accum, events, done) =
+            run_lines(&["", ": keep-alive comment", "event: message", "id: 7"]).await;
         assert!(!done);
         assert_eq!(accum.content, "");
         assert!(accum.tool_calls.is_empty());

@@ -124,11 +124,7 @@ impl ConfigDb {
     /// default database (`default`), exactly like query-api's ConfigDb. The telemetry
     /// data tables (spans, logs, …) live in `observability`, but config does
     /// NOT. Setting a database here would point the agent at empty/wrong tables.
-    pub async fn open(
-        url: &str,
-        user: &str,
-        password: &str,
-    ) -> anyhow::Result<Self> {
+    pub async fn open(url: &str, user: &str, password: &str) -> anyhow::Result<Self> {
         let client = Client::default()
             .with_url(url)
             .with_user(user)
@@ -410,8 +406,11 @@ impl ConfigDb {
         struct Row {
             value: String,
         }
-        let result = self.client
-            .query("SELECT value FROM config_settings FINAL WHERE key = ? AND is_deleted = 0 LIMIT 1")
+        let result = self
+            .client
+            .query(
+                "SELECT value FROM config_settings FINAL WHERE key = ? AND is_deleted = 0 LIMIT 1",
+            )
             .bind(key)
             .fetch_one::<Row>()
             .await;
@@ -716,7 +715,8 @@ impl ConfigDb {
         struct Count {
             n: u64,
         }
-        let row = self.client
+        let row = self
+            .client
             .query("SELECT count() AS n FROM config_investigation_turns WHERE session_id = ?")
             .bind(session_id)
             .fetch_one::<Count>()
@@ -765,13 +765,11 @@ mod tests {
     /// with query-api's `config_*` schema present; run with
     /// `cargo test -- --ignored` against a live instance.
     async fn live_db() -> ConfigDb {
-        let url = std::env::var("CLICKHOUSE_URL")
-            .unwrap_or_else(|_| "http://localhost:8123".to_string());
+        let url =
+            std::env::var("CLICKHOUSE_URL").unwrap_or_else(|_| "http://localhost:8123".to_string());
         let user = std::env::var("CLICKHOUSE_USER").unwrap_or_else(|_| "default".to_string());
         let password = std::env::var("CLICKHOUSE_PASSWORD").unwrap_or_default();
-        ConfigDb::open(&url, &user, &password)
-            .await
-            .unwrap()
+        ConfigDb::open(&url, &user, &password).await.unwrap()
     }
 
     #[tokio::test]
@@ -819,12 +817,28 @@ mod tests {
         let sid = uuid::Uuid::new_v4().to_string();
         db.create_session(&sid, "t", "", "", "").await.unwrap();
         assert_eq!(db.count_turns(&sid).await.unwrap(), 0);
-        db.add_turn(&uuid::Uuid::new_v4().to_string(), &sid, 0, "user", "q", "[]", "")
-            .await
-            .unwrap();
-        db.add_turn(&uuid::Uuid::new_v4().to_string(), &sid, 1, "assistant", "a", "[]", "final")
-            .await
-            .unwrap();
+        db.add_turn(
+            &uuid::Uuid::new_v4().to_string(),
+            &sid,
+            0,
+            "user",
+            "q",
+            "[]",
+            "",
+        )
+        .await
+        .unwrap();
+        db.add_turn(
+            &uuid::Uuid::new_v4().to_string(),
+            &sid,
+            1,
+            "assistant",
+            "a",
+            "[]",
+            "final",
+        )
+        .await
+        .unwrap();
         assert_eq!(db.count_turns(&sid).await.unwrap(), 2);
         let turns = db.get_turns(&sid).await.unwrap();
         assert_eq!(turns.len(), 2);

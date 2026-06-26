@@ -169,13 +169,17 @@ async fn main() -> Result<()> {
     match subcommand {
         "run" => run_command(&args[1..]).await,
         "convert-rcaeval" => {
-            let path = args.get(1).context("convert-rcaeval requires a <labels-file> argument")?;
+            let path = args
+                .get(1)
+                .context("convert-rcaeval requires a <labels-file> argument")?;
             let yaml = rca_convert::convert_rcaeval(Path::new(path))?;
             print!("{yaml}");
             Ok(())
         }
         "convert-openrca" => {
-            let path = args.get(1).context("convert-openrca requires a <labels-file> argument")?;
+            let path = args
+                .get(1)
+                .context("convert-openrca requires a <labels-file> argument")?;
             let yaml = rca_convert::convert_openrca(Path::new(path))?;
             print!("{yaml}");
             Ok(())
@@ -220,9 +224,14 @@ fn parse_flags(args: &[String]) -> HashMap<String, String> {
 
 async fn run_command(args: &[String]) -> Result<()> {
     let flags = parse_flags(args);
-    let cases_path =
-        flags.get("cases").cloned().unwrap_or_else(|| "evals/cases.yaml".to_string());
-    let out_dir = flags.get("out").cloned().unwrap_or_else(|| "evals/out".to_string());
+    let cases_path = flags
+        .get("cases")
+        .cloned()
+        .unwrap_or_else(|| "evals/cases.yaml".to_string());
+    let out_dir = flags
+        .get("out")
+        .cloned()
+        .unwrap_or_else(|| "evals/out".to_string());
     let limit: Option<usize> = flags.get("limit").and_then(|v| v.parse().ok());
 
     // ── Load cases ──────────────────────────────────────────────────────
@@ -285,12 +294,17 @@ async fn run_command(args: &[String]) -> Result<()> {
     let n = results.len() as f64;
     let ac1_rate = results.iter().filter(|r| r.ac1).count() as f64 / n;
     let ac3_rate = results.iter().filter(|r| r.ac3).count() as f64 / n;
-    let reason_scored: Vec<&CaseResult> =
-        results.iter().filter(|r| r.reason_match.is_some()).collect();
+    let reason_scored: Vec<&CaseResult> = results
+        .iter()
+        .filter(|r| r.reason_match.is_some())
+        .collect();
     let reason_accuracy = if reason_scored.is_empty() {
         0.0
     } else {
-        reason_scored.iter().filter(|r| r.reason_match == Some(true)).count() as f64
+        reason_scored
+            .iter()
+            .filter(|r| r.reason_match == Some(true))
+            .count() as f64
             / reason_scored.len() as f64
     };
     let avg_tool_calls = results.iter().map(|r| r.tool_calls as f64).sum::<f64>() / n;
@@ -307,8 +321,7 @@ async fn run_command(args: &[String]) -> Result<()> {
     };
 
     // ── Write JSON + markdown ───────────────────────────────────────────
-    std::fs::create_dir_all(&out_dir)
-        .with_context(|| format!("creating output dir {out_dir}"))?;
+    std::fs::create_dir_all(&out_dir).with_context(|| format!("creating output dir {out_dir}"))?;
     let json_path = PathBuf::from(&out_dir).join(format!("{run_id}.json"));
     let md_path = PathBuf::from(&out_dir).join(format!("{run_id}.md"));
     std::fs::write(&json_path, serde_json::to_string_pretty(&report)?)
@@ -347,7 +360,9 @@ async fn build_app_state() -> Result<AppState> {
     let config_db =
         Arc::new(ConfigDb::open(&clickhouse_url, &clickhouse_user, &clickhouse_password).await?);
 
-    let query_api_url = std::env::var("QUERY_API_URL").ok().filter(|v| !v.trim().is_empty());
+    let query_api_url = std::env::var("QUERY_API_URL")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
 
     Ok(AppState {
         ch,
@@ -507,18 +522,19 @@ async fn run_one_case(
 fn extract_candidates(report: &str, vocabulary: &[String]) -> Vec<String> {
     let mut ranked: Vec<String> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let push = |svc: String, ranked: &mut Vec<String>, seen: &mut std::collections::HashSet<String>| {
-        let key = svc.to_lowercase();
-        if seen.insert(key) {
-            ranked.push(svc);
-        }
-    };
+    let push =
+        |svc: String, ranked: &mut Vec<String>, seen: &mut std::collections::HashSet<String>| {
+            let key = svc.to_lowercase();
+            if seen.insert(key) {
+                ranked.push(svc);
+            }
+        };
 
     // 1. Root Cause section — first vocabulary match wins the top rank.
     if let Some(section) = extract_section(report, "Root Cause") {
-        for svc in match_services(&section, vocabulary) {
+        // only the first named service in the Root Cause section
+        if let Some(svc) = match_services(&section, vocabulary).into_iter().next() {
             push(svc, &mut ranked, &mut seen);
-            break; // only the first named service in the Root Cause section
         }
     }
 
@@ -639,8 +655,10 @@ fn ledger_ranked_services(report: &str, vocabulary: &[String]) -> Vec<String> {
         if joined.contains("hypothesis") && joined.contains("status") {
             continue; // header
         }
-        if cells.iter().all(|c| c.chars().all(|ch| ch == '-' || ch == ':' || ch.is_whitespace()))
-        {
+        if cells.iter().all(|c| {
+            c.chars()
+                .all(|ch| ch == '-' || ch == ':' || ch.is_whitespace())
+        }) {
             continue; // separator row
         }
 
@@ -668,13 +686,15 @@ fn ledger_ranked_services(report: &str, vocabulary: &[String]) -> Vec<String> {
         } else {
             1 // open / unknown
         };
-        rows.push(Row { services, conf, status });
+        rows.push(Row {
+            services,
+            conf,
+            status,
+        });
     }
 
     // Stable sort: highest (status_weight, confidence) first. Refuted rows sink.
-    rows.sort_by(|a, b| {
-        (b.status, b.conf).cmp(&(a.status, a.conf))
-    });
+    rows.sort_by(|a, b| (b.status, b.conf).cmp(&(a.status, a.conf)));
 
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -720,11 +740,10 @@ impl Scorer {
     /// Compute (AC@1, AC@3) for a ranked candidate list. The ground-truth
     /// service OR any `related` service counts as correct.
     fn localization(&self, case: &EvalCase, candidates: &[String]) -> (bool, bool) {
-        let acceptable: std::collections::HashSet<String> = std::iter::once(
-            case.ground_truth.root_cause_service.to_lowercase(),
-        )
-        .chain(case.ground_truth.related.iter().map(|s| s.to_lowercase()))
-        .collect();
+        let acceptable: std::collections::HashSet<String> =
+            std::iter::once(case.ground_truth.root_cause_service.to_lowercase())
+                .chain(case.ground_truth.related.iter().map(|s| s.to_lowercase()))
+                .collect();
 
         let hit_at = |k: usize| {
             candidates
@@ -774,7 +793,10 @@ impl Scorer {
             "stream": false,
         });
 
-        let url = format!("{}/v1/chat/completions", self.llm.base_url.trim_end_matches('/'));
+        let url = format!(
+            "{}/v1/chat/completions",
+            self.llm.base_url.trim_end_matches('/')
+        );
         let resp = self
             .http
             .post(&url)
@@ -808,7 +830,9 @@ fn parse_judge_json(content: &str) -> Result<(bool, String)> {
         content
     };
     let v: Value = serde_json::from_str(json_slice).context("judge did not return valid JSON")?;
-    let m = v["match"].as_bool().context("judge JSON missing boolean `match`")?;
+    let m = v["match"]
+        .as_bool()
+        .context("judge JSON missing boolean `match`")?;
     let why = v["why"].as_str().unwrap_or("").to_string();
     Ok((m, why))
 }
@@ -828,7 +852,10 @@ fn render_markdown(report: &RunReport) -> String {
         "- **Reason accuracy**: {:.1}% (LLM judge)\n",
         report.reason_accuracy * 100.0
     ));
-    s.push_str(&format!("- Avg tool calls: {:.1}\n\n", report.avg_tool_calls));
+    s.push_str(&format!(
+        "- Avg tool calls: {:.1}\n\n",
+        report.avg_tool_calls
+    ));
 
     s.push_str("## Per-case\n\n");
     s.push_str("| Case | Source | AC@1 | AC@3 | Reason | Kind | Tools | Top candidate |\n");
@@ -839,7 +866,11 @@ fn render_markdown(report: &RunReport) -> String {
             Some(false) => "✗",
             None => "—",
         };
-        let top = c.candidates.first().cloned().unwrap_or_else(|| "—".to_string());
+        let top = c
+            .candidates
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "—".to_string());
         s.push_str(&format!(
             "| {} | {} | {} | {} | {} | {} | {} | {} |\n",
             c.id,
@@ -920,7 +951,11 @@ mod tests {
         EvalCase {
             id: "t".into(),
             description: None,
-            input: CaseInput { kind: "question".into(), text: "x".into(), around: None },
+            input: CaseInput {
+                kind: "question".into(),
+                text: "x".into(),
+                around: None,
+            },
             window: None,
             ground_truth: GroundTruth {
                 root_cause_service: root.into(),
@@ -937,6 +972,7 @@ mod tests {
             base_url: "http://x".into(),
             api_key: "k".into(),
             model: "m".into(),
+            reasoning_effort: None,
         });
         let case = case_with("payments", &["gateway"]);
 
@@ -956,18 +992,25 @@ mod tests {
         // not in top 3 → neither.
         let (a1, a3) = scorer.localization(
             &case,
-            &["users".into(), "media".into(), "notifications".into(), "payments".into()],
+            &[
+                "users".into(),
+                "media".into(),
+                "notifications".into(),
+                "payments".into(),
+            ],
         );
         assert!(!a1 && !a3);
     }
 
     #[test]
     fn parse_judge_json_tolerates_fences() {
-        let (m, why) = parse_judge_json("```json\n{\"match\": true, \"why\": \"same cause\"}\n```").unwrap();
+        let (m, why) =
+            parse_judge_json("```json\n{\"match\": true, \"why\": \"same cause\"}\n```").unwrap();
         assert!(m);
         assert_eq!(why, "same cause");
 
-        let (m, _) = parse_judge_json("The verdict: {\"match\": false, \"why\": \"diff\"}").unwrap();
+        let (m, _) =
+            parse_judge_json("The verdict: {\"match\": false, \"why\": \"diff\"}").unwrap();
         assert!(!m);
     }
 }

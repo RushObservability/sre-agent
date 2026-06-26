@@ -119,7 +119,10 @@ impl Tool for ListServices {
             .clamp(1, 1440);
         let query = build_list_services_sql(minutes, &ctx.tenant_id);
 
-        let rows: Vec<ServiceRow> = crate::state::tenant_query(&ctx.state.ch, &query, &ctx.tenant_id).fetch_all().await?;
+        let rows: Vec<ServiceRow> =
+            crate::state::tenant_query(&ctx.state.ch, &query, &ctx.tenant_id)
+                .fetch_all()
+                .await?;
 
         if rows.is_empty() {
             return Ok(format!("No service traffic in last {minutes}m."));
@@ -199,7 +202,9 @@ impl Tool for ServiceDependencies {
             .clamp(1, 1440);
         let query = build_service_dependencies_sql(service, minutes, &ctx.tenant_id);
 
-        let rows: Vec<DepRow> = crate::state::tenant_query(&ctx.state.ch, &query, &ctx.tenant_id).fetch_all().await?;
+        let rows: Vec<DepRow> = crate::state::tenant_query(&ctx.state.ch, &query, &ctx.tenant_id)
+            .fetch_all()
+            .await?;
 
         if rows.is_empty() {
             return Ok(format!("No cross-service calls found in last {minutes}m."));
@@ -232,7 +237,10 @@ mod tests {
         let sql = build_list_services_sql(999_999, "ten'ant");
         assert!(sql.contains("INTERVAL 1440 MINUTE"), "{sql}");
         assert!(sql.contains("tenant_id = 'ten''ant'"), "{sql}");
-        assert!(!sql.contains("\\'"), "no backslash quote escaping anywhere: {sql}");
+        assert!(
+            !sql.contains("\\'"),
+            "no backslash quote escaping anywhere: {sql}"
+        );
     }
 
     #[test]
@@ -254,6 +262,9 @@ mod tests {
         assert!(sql.contains("INTERVAL 1440 MINUTE"), "{sql}");
         assert!(sql.contains("parent.service_name = 'O''Brien'"), "{sql}");
         assert!(sql.contains("child.tenant_id = 'ten''ant'"), "{sql}");
-        assert!(!sql.contains("\\'"), "no backslash quote escaping anywhere: {sql}");
+        assert!(
+            !sql.contains("\\'"),
+            "no backslash quote escaping anywhere: {sql}"
+        );
     }
 }

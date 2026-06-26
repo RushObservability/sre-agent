@@ -150,10 +150,11 @@ impl Tool for QueryTraces {
             .unwrap_or(20)
             .min(100);
 
-        let query =
-            build_query_traces_sql(service, status, around, minutes, limit, &ctx.tenant_id);
+        let query = build_query_traces_sql(service, status, around, minutes, limit, &ctx.tenant_id);
 
-        let rows: Vec<TraceRow> = crate::state::tenant_query(&ctx.state.ch, &query, &ctx.tenant_id).fetch_all().await?;
+        let rows: Vec<TraceRow> = crate::state::tenant_query(&ctx.state.ch, &query, &ctx.tenant_id)
+            .fetch_all()
+            .await?;
 
         if rows.is_empty() {
             return Ok("No matching spans found.".to_string());
@@ -285,7 +286,9 @@ impl Tool for GetTrace {
 
         let query = build_get_trace_sql(trace_id, &ctx.tenant_id);
 
-        let rows: Vec<SpanRow> = crate::state::tenant_query(&ctx.state.ch, &query, &ctx.tenant_id).fetch_all().await?;
+        let rows: Vec<SpanRow> = crate::state::tenant_query(&ctx.state.ch, &query, &ctx.tenant_id)
+            .fetch_all()
+            .await?;
 
         if rows.is_empty() {
             return Ok(format!("No spans found for trace {trace_id}"));
@@ -335,7 +338,10 @@ mod tests {
         let sql = build_query_traces_sql("O'Brien", "error", "", 15, 20, "ten'ant");
         assert!(sql.contains("service_name = 'O''Brien'"), "{sql}");
         assert!(sql.contains("tenant_id = 'ten''ant'"), "{sql}");
-        assert!(!sql.contains("\\'"), "no backslash quote escaping anywhere: {sql}");
+        assert!(
+            !sql.contains("\\'"),
+            "no backslash quote escaping anywhere: {sql}"
+        );
     }
 
     #[test]
@@ -355,7 +361,10 @@ mod tests {
         assert!(sql.contains("LIMIT 20"), "{sql}");
 
         let capped = build_query_traces_sql("", "", "", 15, 9_999, "default");
-        assert!(capped.contains("LIMIT 100"), "limit capped at 100: {capped}");
+        assert!(
+            capped.contains("LIMIT 100"),
+            "limit capped at 100: {capped}"
+        );
     }
 
     #[test]

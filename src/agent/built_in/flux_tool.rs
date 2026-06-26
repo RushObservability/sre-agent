@@ -128,7 +128,10 @@ impl Tool for GetFluxResource {
             .and_then(|v| v.as_str())
             .unwrap_or("");
 
-        let suspended = spec.get("suspend").and_then(|v| v.as_bool()).unwrap_or(false);
+        let suspended = spec
+            .get("suspend")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let source_ref = spec
             .get("sourceRef")
             .or_else(|| spec.pointer("/chart/spec/sourceRef"))

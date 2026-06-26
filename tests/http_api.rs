@@ -116,7 +116,10 @@ async fn investigate_without_llm_env_streams_not_configured_error() {
         text.contains("LLM not configured"),
         "first SSE frames must carry the setup error, got: {text}"
     );
-    assert!(text.starts_with("data: "), "SSE framing expected, got: {text}");
+    assert!(
+        text.starts_with("data: "),
+        "SSE framing expected, got: {text}"
+    );
 }
 
 /// Listing sessions against the disconnected ConfigDb must fail fast with a
@@ -127,7 +130,11 @@ async fn list_sessions_disconnected_db_returns_500_fast() {
     let app = test_router();
     let resp = tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        app.oneshot(Request::get("/api/v1/sessions").body(Body::empty()).unwrap()),
+        app.oneshot(
+            Request::get("/api/v1/sessions")
+                .body(Body::empty())
+                .unwrap(),
+        ),
     )
     .await
     .expect("disconnected DB must fail fast, not hang")

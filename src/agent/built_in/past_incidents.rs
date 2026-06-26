@@ -47,7 +47,11 @@ impl Tool for SearchPastIncidents {
     }
 
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String> {
-        let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("").trim();
+        let query = args
+            .get("query")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
         let limit = args
             .get("limit")
             .and_then(|v| v.as_u64())
@@ -88,7 +92,11 @@ impl Tool for SearchPastIncidents {
         for (sc, s) in &scored {
             out.push_str(&format!(
                 "### {}\n- when: {}\n- match score: {}\n- recorded findings:\n{}\n\n",
-                if s.title.is_empty() { "(untitled investigation)" } else { &s.title },
+                if s.title.is_empty() {
+                    "(untitled investigation)"
+                } else {
+                    &s.title
+                },
                 s.created_at,
                 sc,
                 excerpt(&s.working_memory),
@@ -104,8 +112,21 @@ impl Tool for SearchPastIncidents {
 /// Lowercase alphanumeric tokens of length ≥ 3, minus a few stopwords.
 fn tokenize(s: &str) -> Vec<String> {
     const STOP: &[&str] = &[
-        "the", "and", "for", "with", "this", "that", "from", "high", "low", "error", "errors",
-        "issue", "service", "investigation", "incident",
+        "the",
+        "and",
+        "for",
+        "with",
+        "this",
+        "that",
+        "from",
+        "high",
+        "low",
+        "error",
+        "errors",
+        "issue",
+        "service",
+        "investigation",
+        "incident",
     ];
     s.to_lowercase()
         .split(|c: char| !c.is_alphanumeric())
@@ -139,6 +160,10 @@ fn excerpt(mem: &str) -> String {
         return "  (no recorded findings)".to_string();
     }
     let trimmed: String = m.chars().take(EXCERPT_CHARS).collect();
-    let suffix = if m.chars().count() > EXCERPT_CHARS { "…" } else { "" };
+    let suffix = if m.chars().count() > EXCERPT_CHARS {
+        "…"
+    } else {
+        ""
+    };
     format!("```\n{trimmed}{suffix}\n```")
 }

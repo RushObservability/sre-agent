@@ -167,7 +167,9 @@ impl Tool for SearchLogs {
             &ctx.tenant_id,
         );
 
-        let rows: Vec<LogRow> = crate::state::tenant_query(&ctx.state.ch, &sql, &ctx.tenant_id).fetch_all().await?;
+        let rows: Vec<LogRow> = crate::state::tenant_query(&ctx.state.ch, &sql, &ctx.tenant_id)
+            .fetch_all()
+            .await?;
 
         if rows.is_empty() {
             return Ok("No matching logs found.".to_string());
@@ -256,7 +258,10 @@ mod tests {
         assert!(sql.contains("ServiceName = 'O''Brien'"), "{sql}");
         assert!(sql.contains("tenant_id = 'ten''ant'"), "{sql}");
         assert!(sql.contains("'%o''clock%'"), "{sql}");
-        assert!(!sql.contains("\\'"), "no backslash quote escaping anywhere: {sql}");
+        assert!(
+            !sql.contains("\\'"),
+            "no backslash quote escaping anywhere: {sql}"
+        );
     }
 
     #[test]
@@ -273,13 +278,19 @@ mod tests {
         assert!(sql.contains("LIMIT 50"), "{sql}");
 
         let capped = build_search_logs_sql("", "", "", "", 15, 9_999, "default");
-        assert!(capped.contains("LIMIT 200"), "limit capped at 200: {capped}");
+        assert!(
+            capped.contains("LIMIT 200"),
+            "limit capped at 200: {capped}"
+        );
     }
 
     #[test]
     fn around_replaces_relative_window() {
         let sql = build_search_logs_sql("", "", "", "2025-01-15T10:30:00Z", 15, 50, "default");
-        assert!(sql.contains("toDateTime64('2025-01-15 10:30:00', 9)"), "{sql}");
+        assert!(
+            sql.contains("toDateTime64('2025-01-15 10:30:00', 9)"),
+            "{sql}"
+        );
         assert!(!sql.contains("now() - INTERVAL"), "{sql}");
     }
 }

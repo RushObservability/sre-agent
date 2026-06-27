@@ -13,7 +13,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       # Pin to the repo's rust-toolchain.toml channel and install the components
       # for THAT toolchain. Using @stable installed rustfmt/clippy for the latest
       # stable, but rust-toolchain.toml forces 1.88.0 — so `cargo fmt`/`clippy`

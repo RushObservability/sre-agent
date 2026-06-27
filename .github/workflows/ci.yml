@@ -13,16 +13,16 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       # Pin to the repo's rust-toolchain.toml channel and install the components
       # for THAT toolchain. Using @stable installed rustfmt/clippy for the latest
       # stable, but rust-toolchain.toml forces 1.88.0 — so `cargo fmt`/`clippy`
       # ran under 1.88.0, which had no components ("cargo-fmt is not installed").
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: 1.88.0
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Check formatting
         run: cargo fmt --check
       - name: Clippy

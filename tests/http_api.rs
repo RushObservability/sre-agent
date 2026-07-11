@@ -14,6 +14,8 @@ use sre_agent::AppState;
 use sre_agent::config_db::ConfigDb;
 use sre_agent::http::router;
 
+const INTERNAL_TOKEN: &str = "test-internal-token";
+
 /// Build the production router on a fully disconnected AppState — the same
 /// pattern as tests/common::make_ctx (no live backends, fail-fast queries).
 fn test_router() -> axum::Router {
@@ -21,6 +23,7 @@ fn test_router() -> axum::Router {
         ch: clickhouse::Client::default().with_url("http://127.0.0.1:1"),
         config_db: Arc::new(ConfigDb::new_disconnected_for_tests()),
         query_api_url: None,
+        internal_auth_token: INTERNAL_TOKEN.to_string(),
         caches: Arc::new(Default::default()),
     };
     router(state)
@@ -41,6 +44,22 @@ async fn healthz_returns_200_ok() {
 }
 
 #[tokio::test]
+async fn agent_api_rejects_requests_without_internal_token() {
+    let app = test_router();
+    let resp = app
+        .oneshot(
+            Request::post("/api/v1/investigate")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn investigate_with_empty_fields_returns_400() {
     // No event_id, no question, no session_id, no prior_messages → the
     // handler must reject before touching any backend.
@@ -49,6 +68,7 @@ async fn investigate_with_empty_fields_returns_400() {
         .oneshot(
             Request::post("/api/v1/investigate")
                 .header(header::CONTENT_TYPE, "application/json")
+                .header("x-rush-internal-token", INTERNAL_TOKEN)
                 .body(Body::from("{}"))
                 .unwrap(),
         )
@@ -94,6 +114,7 @@ async fn investigate_without_llm_env_streams_not_configured_error() {
         .oneshot(
             Request::post("/api/v1/investigate")
                 .header(header::CONTENT_TYPE, "application/json")
+                .header("x-rush-internal-token", INTERNAL_TOKEN)
                 .body(Body::from(req_body.to_string()))
                 .unwrap(),
         )
@@ -132,6 +153,7 @@ async fn list_sessions_disconnected_db_returns_500_fast() {
         std::time::Duration::from_secs(5),
         app.oneshot(
             Request::get("/api/v1/sessions")
+                .header("x-rush-internal-token", INTERNAL_TOKEN)
                 .body(Body::empty())
                 .unwrap(),
         ),

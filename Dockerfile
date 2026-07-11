@@ -15,7 +15,11 @@ FROM debian:trixie-slim
 
 RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
 
+RUN groupadd --system appgroup && useradd --system --gid appgroup --no-create-home appuser
+
 COPY --from=builder /app/target/release/sre-agent /usr/local/bin/sre-agent
+
+USER appuser
 
 EXPOSE 8081
 

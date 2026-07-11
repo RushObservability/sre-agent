@@ -53,10 +53,18 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("QUERY_API_URL not set; custom skills will read from local config_db");
     }
 
+    let internal_auth_token = std::env::var("SRE_AGENT_INTERNAL_TOKEN")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!(
+            "SRE_AGENT_INTERNAL_TOKEN must be set; refusing to expose the SRE agent without internal authentication"
+        ))?;
+
     let state = AppState {
         ch,
         config_db,
         query_api_url,
+        internal_auth_token,
         caches: Arc::new(Default::default()),
     };
 

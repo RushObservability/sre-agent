@@ -140,6 +140,7 @@ mod tests {
                 ch,
                 config_db,
                 query_api_url: None,
+                internal_auth_token: "test-not-an-http-server".to_string(),
                 caches: Arc::new(Default::default()),
             },
             skill_store,

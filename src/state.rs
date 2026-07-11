@@ -81,6 +81,9 @@ pub struct AppState {
     /// `None`, the agent falls back to reading custom skills from the local
     /// config_db (useful for local dev and tests).
     pub query_api_url: Option<String>,
+    /// Shared secret required on every non-health HTTP request. Only query-api
+    /// receives this value in a production deployment.
+    pub internal_auth_token: String,
     /// Short-TTL caches for per-request setup (skill store, loop budget).
     pub caches: Arc<RuntimeCaches>,
 }

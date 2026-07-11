@@ -368,6 +368,7 @@ async fn build_app_state() -> Result<AppState> {
         ch,
         config_db,
         query_api_url,
+        internal_auth_token: "evals-not-an-http-server".to_string(),
         caches: Arc::new(Default::default()),
     })
 }

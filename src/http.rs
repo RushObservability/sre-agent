@@ -8,14 +8,14 @@ use axum::{
     Json, Router,
     body::Body,
     extract::{Path, Query, State},
-    http::{StatusCode, header},
+    http::{HeaderMap, StatusCode, header},
+    middleware::Next,
     response::Response,
     routing::{delete, get, post},
 };
 use serde::Deserialize;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::agent;
@@ -30,7 +30,10 @@ use crate::state::AppState;
 /// layers, with the given state attached. This is the exact app served by
 /// `main()`.
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    // query-api is the authenticated public boundary. The agent only accepts
+    // calls carrying its internal credential, even when reached inside the
+    // cluster directly.
+    let protected = Router::new()
         .route("/api/v1/investigate", post(investigate))
         // Session management
         .route("/api/v1/sessions", get(list_sessions))
@@ -41,10 +44,37 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/investigation-templates",
             get(list_investigation_templates),
         )
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_internal_token,
+        ));
+
+    Router::new()
+        .merge(protected)
         .route("/healthz", get(healthz))
-        .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
+}
+
+async fn require_internal_token(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    req: axum::extract::Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    use subtle::ConstantTimeEq;
+
+    let supplied = headers
+        .get("x-rush-internal-token")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    let expected = state.internal_auth_token.as_bytes();
+    let valid =
+        supplied.as_bytes().len() == expected.len() && supplied.as_bytes().ct_eq(expected).into();
+    if !valid {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    Ok(next.run(req).await)
 }
 
 fn default_tenant() -> String {

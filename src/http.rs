@@ -69,8 +69,7 @@ async fn require_internal_token(
         .and_then(|value| value.to_str().ok())
         .unwrap_or("");
     let expected = state.internal_auth_token.as_bytes();
-    let valid =
-        supplied.as_bytes().len() == expected.len() && supplied.as_bytes().ct_eq(expected).into();
+    let valid = supplied.len() == expected.len() && supplied.as_bytes().ct_eq(expected).into();
     if !valid {
         return Err(StatusCode::UNAUTHORIZED);
     }

@@ -173,11 +173,10 @@ fn is_empty_hypothesis(value: &str) -> bool {
 /// gap message if the agent shouldn't be allowed to conclude yet, or `None`
 /// if the conclusion is sufficiently grounded.
 ///
-/// The gate checks four criteria:
+/// The gate checks three criteria:
 /// 1. Minimum investigation depth (at least MIN_INVESTIGATION_DEPTH real tool steps).
 /// 2. Multi-signal coverage (at least MIN_SIGNAL_TYPES distinct signal types).
 /// 3. Minimum confirmed evidence (at least 2 concrete result-backed records).
-/// 4. At least one explicitly ruled-out alternative hypothesis.
 fn root_cause_gate(memory: &WorkingMemory, tool_steps: u32, min_depth: u32) -> Option<String> {
     let mut gaps: Vec<String> = Vec::new();
 
@@ -219,14 +218,6 @@ fn root_cause_gate(memory: &WorkingMemory, tool_steps: u32, min_depth: u32) -> O
              Run targeted queries that return timestamps, values, IDs, or specific messages before concluding.",
             memory.evidence.len()
         ));
-    }
-
-    if memory.ruled_out.is_empty() && memory.failed_hypotheses.is_empty() {
-        gaps.push(
-            "No competing hypothesis has been explicitly ruled out. Test one plausible \
-             alternative and record what evidence refuted it before concluding."
-                .to_string(),
-        );
     }
 
     if gaps.is_empty() {

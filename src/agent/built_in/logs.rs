@@ -10,6 +10,7 @@ pub struct SearchLogs;
 /// escaped with the ClickHouse-standard doubled single quote (`''`); the
 /// model-supplied `minutes`/`limit` are clamped here so a hostile value can
 /// never widen the scan window or row count.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_search_logs_sql(
     service: &str,
     severity: &str,

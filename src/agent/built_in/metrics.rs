@@ -12,6 +12,7 @@ pub struct QueryMetrics;
 /// `metric_name`, `service`) is escaped with the ClickHouse-standard doubled
 /// single quote (`''`); the model-supplied `minutes` is clamped here so a
 /// hostile value can never widen the scan window.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_query_metrics_sql(
     service: &str,
     metric: &str,

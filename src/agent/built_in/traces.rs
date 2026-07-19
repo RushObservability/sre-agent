@@ -10,6 +10,7 @@ pub struct QueryTraces;
 /// escaped with the ClickHouse-standard doubled single quote (`''`); the
 /// model-supplied `minutes`/`limit` are clamped here so a hostile value can
 /// never widen the scan window or row count.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_query_traces_sql(
     service: &str,
     status: &str,

@@ -6,7 +6,7 @@
 
 use axum::{
     Json, Router,
-    body::Body,
+    body::{Body, Bytes},
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode, header},
     middleware::Next,
@@ -129,6 +129,33 @@ struct InvestigateRequest {
 
 async fn healthz() -> Json<serde_json::Value> {
     Json(serde_json::json!({"status": "ok"}))
+}
+
+/// Convert agent events into an SSE body and emit a comment heartbeat while
+/// the agent is waiting on a tool or provider response. Without heartbeats,
+/// an otherwise healthy investigation can be dropped by an idle proxy before
+/// the next evidence event arrives.
+fn sse_body(rx: mpsc::Receiver<AgentEvent>) -> Body {
+    let heartbeat = tokio::time::interval_at(
+        tokio::time::Instant::now() + std::time::Duration::from_secs(15),
+        std::time::Duration::from_secs(15),
+    );
+    let stream =
+        futures_util::stream::unfold((rx, heartbeat), |(mut rx, mut heartbeat)| async move {
+            tokio::select! {
+                event = rx.recv() => event.map(|event| {
+                    (
+                        Ok::<_, std::convert::Infallible>(Bytes::from(event.to_sse_bytes())),
+                        (rx, heartbeat),
+                    )
+                }),
+                _ = heartbeat.tick() => Some((
+                    Ok::<_, std::convert::Infallible>(Bytes::from_static(b": keep-alive\n\n")),
+                    (rx, heartbeat),
+                )),
+            }
+        });
+    Body::from_stream(stream)
 }
 
 // ── Investigate handler (session-aware) ──
@@ -519,16 +546,12 @@ async fn investigate(
             })
             .await;
         drop(tx);
-        let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-        let body_stream = futures_util::StreamExt::map(stream, |event| {
-            Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(event.to_sse_bytes()))
-        });
         return Ok(Response::builder()
             .status(200)
             .header(header::CONTENT_TYPE, "text/event-stream")
             .header(header::CACHE_CONTROL, "no-cache")
             .header(header::CONNECTION, "keep-alive")
-            .body(Body::from_stream(body_stream))
+            .body(sse_body(rx))
             .unwrap());
     }
 
@@ -716,12 +739,7 @@ async fn investigate(
     });
 
     // Convert the receiver into an SSE byte stream
-    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-    let body_stream = futures_util::StreamExt::map(stream, |event| {
-        Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(event.to_sse_bytes()))
-    });
-
-    let body = Body::from_stream(body_stream);
+    let body = sse_body(rx);
 
     Ok(Response::builder()
         .status(200)

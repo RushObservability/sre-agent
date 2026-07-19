@@ -14,7 +14,10 @@ pub(crate) fn build_search_logs_sql(
     service: &str,
     severity: &str,
     query_text: &str,
+    trace_id: &str,
+    span_id: &str,
     around: &str,
+    around_minutes: u64,
     minutes: u64,
     limit: u64,
     tenant_id: &str,
@@ -22,6 +25,7 @@ pub(crate) fn build_search_logs_sql(
     // Clamp the model-supplied window to at most 24h so the LLM can't
     // request a months-long full scan.
     let minutes = minutes.clamp(1, 1440);
+    let around_minutes = around_minutes.clamp(1, 720);
     let limit = limit.min(200);
     let tenant_id = tenant_id.replace('\'', "''");
 
@@ -33,8 +37,8 @@ pub(crate) fn build_search_logs_sql(
             .trim_end_matches('Z')
             .to_string();
         vec![
-            format!("Timestamp >= toDateTime64('{ts}', 9) - INTERVAL 5 MINUTE"),
-            format!("Timestamp <= toDateTime64('{ts}', 9) + INTERVAL 5 MINUTE"),
+            format!("Timestamp >= toDateTime64('{ts}', 9) - INTERVAL {around_minutes} MINUTE"),
+            format!("Timestamp <= toDateTime64('{ts}', 9) + INTERVAL {around_minutes} MINUTE"),
         ]
     } else {
         vec![format!("Timestamp >= now() - INTERVAL {minutes} MINUTE")]
@@ -59,13 +63,19 @@ pub(crate) fn build_search_logs_sql(
         conditions.push(format!("SeverityText IN ({in_list})"));
     }
     if !query_text.is_empty() {
+        let q = query_text
+            .to_lowercase()
+            .replace('\'', "''")
+            .replace('%', "\\%");
         conditions.push(format!(
-            "lower(Body) LIKE '%{}%'",
-            query_text
-                .to_lowercase()
-                .replace('\'', "''")
-                .replace('%', "\\%")
+            "(lower(Body) LIKE '%{q}%' OR lower(toString(LogAttributes)) LIKE '%{q}%' OR lower(toString(ResourceAttributes)) LIKE '%{q}%')"
         ));
+    }
+    if !trace_id.is_empty() {
+        conditions.push(format!("TraceId = '{}'", trace_id.replace('\'', "''")));
+    }
+    if !span_id.is_empty() {
+        conditions.push(format!("SpanId = '{}'", span_id.replace('\'', "''")));
     }
 
     let where_clause = conditions.join(" AND ");
@@ -74,7 +84,10 @@ pub(crate) fn build_search_logs_sql(
                 ServiceName AS service_name, \
                 SeverityText AS severity, \
                 Body AS body, \
-                TraceId AS trace_id \
+                TraceId AS trace_id, \
+                SpanId AS span_id, \
+                toString(LogAttributes) AS log_attributes, \
+                toString(ResourceAttributes) AS resource_attributes \
          FROM logs \
          WHERE {where_clause} \
          ORDER BY Timestamp DESC \
@@ -90,6 +103,9 @@ struct LogRow {
     severity: String,
     body: String,
     trace_id: String,
+    span_id: String,
+    log_attributes: String,
+    resource_attributes: String,
 }
 
 #[async_trait::async_trait]
@@ -118,11 +134,23 @@ impl Tool for SearchLogs {
                 },
                 "query": {
                     "type": "string",
-                    "description": "Text search in log body (case-insensitive substring match)"
+                    "description": "Text search across the log body and structured attributes (case-insensitive substring match)"
+                },
+                "trace_id": {
+                    "type": "string",
+                    "description": "Filter to logs correlated with this trace ID"
+                },
+                "span_id": {
+                    "type": "string",
+                    "description": "Filter to logs correlated with this span ID"
                 },
                 "around": {
                     "type": "string",
                     "description": "ISO 8601 timestamp to center the search on (e.g. '2025-01-15T10:30:00Z'). Searches ±5 minutes around this time. Use this when investigating a specific event. Overrides 'minutes'."
+                },
+                "around_minutes": {
+                    "type": "integer",
+                    "description": "Window on each side of 'around' in minutes (default 5, max 720)"
                 },
                 "minutes": {
                     "type": "integer",
@@ -143,7 +171,14 @@ impl Tool for SearchLogs {
         let service = args.get("service").and_then(|v| v.as_str()).unwrap_or("");
         let severity = args.get("severity").and_then(|v| v.as_str()).unwrap_or("");
         let query_text = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
+        let trace_id = args.get("trace_id").and_then(|v| v.as_str()).unwrap_or("");
+        let span_id = args.get("span_id").and_then(|v| v.as_str()).unwrap_or("");
         let around = args.get("around").and_then(|v| v.as_str()).unwrap_or("");
+        let around_minutes = args
+            .get("around_minutes")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(5)
+            .clamp(1, 720);
         // Clamp the model-supplied window to at most 24h so the LLM can't
         // request a months-long full scan.
         let minutes = args
@@ -161,7 +196,10 @@ impl Tool for SearchLogs {
             service,
             severity,
             query_text,
+            trace_id,
+            span_id,
             around,
+            around_minutes,
             minutes,
             limit,
             &ctx.tenant_id,
@@ -180,17 +218,13 @@ impl Tool for SearchLogs {
             std::collections::HashMap::new();
         for r in &rows {
             // Use first 120 chars as pattern key
-            let key = if r.body.len() > 120 {
-                &r.body[..120]
-            } else {
-                &r.body
-            };
+            let key = crate::agent::memory::truncate_at_char_boundary(&r.body, 120);
             *pattern_counts.entry(key.to_string()).or_default() += 1;
         }
 
         let total = rows.len();
         let time_desc = if !around.is_empty() {
-            format!("±5m around {around}")
+            format!("±{around_minutes}m around {around}")
         } else {
             format!("last {minutes}m")
         };
@@ -211,21 +245,33 @@ impl Tool for SearchLogs {
         let mut seen = std::collections::HashSet::new();
         let mut shown = 0;
         for r in &rows {
-            let key = if r.body.len() > 120 {
-                &r.body[..120]
-            } else {
-                &r.body
-            };
+            let key = crate::agent::memory::truncate_at_char_boundary(&r.body, 120);
             if seen.insert(key.to_string()) {
                 out.push_str(&format!(
-                    "  [{ts}] [{sev}] {svc}: {body}\n",
+                    "  [{ts}] [{sev}] {svc}: {body}{correlation}{attrs}\n",
                     ts = r.timestamp,
                     sev = r.severity,
                     svc = r.service_name,
                     body = if r.body.len() > 300 {
-                        format!("{}...", &r.body[..300])
+                        format!(
+                            "{}...",
+                            crate::agent::memory::truncate_at_char_boundary(&r.body, 300)
+                        )
                     } else {
                         r.body.clone()
+                    },
+                    correlation = if r.trace_id.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" [trace={} span={}]", r.trace_id, r.span_id)
+                    },
+                    attrs = if r.log_attributes.is_empty() || r.log_attributes == "{}" {
+                        String::new()
+                    } else {
+                        format!(
+                            " attrs={}",
+                            crate::agent::memory::truncate_at_char_boundary(&r.log_attributes, 240)
+                        )
                     },
                 ));
                 shown += 1;
@@ -245,16 +291,16 @@ mod tests {
 
     #[test]
     fn service_filter_present_when_set_absent_when_empty() {
-        let with = build_search_logs_sql("api", "", "", "", 15, 50, "default");
+        let with = build_search_logs_sql("api", "", "", "", "", "", 5, 15, 50, "default");
         assert!(with.contains("ServiceName = 'api'"));
 
-        let without = build_search_logs_sql("", "", "", "", 15, 50, "default");
+        let without = build_search_logs_sql("", "", "", "", "", "", 5, 15, 50, "default");
         assert!(!without.contains("ServiceName ="));
     }
 
     #[test]
     fn single_quotes_are_doubled_never_backslash_escaped() {
-        let sql = build_search_logs_sql("O'Brien", "", "o'clock", "", 15, 50, "ten'ant");
+        let sql = build_search_logs_sql("O'Brien", "", "o'clock", "", "", "", 5, 15, 50, "ten'ant");
         assert!(sql.contains("ServiceName = 'O''Brien'"), "{sql}");
         assert!(sql.contains("tenant_id = 'ten''ant'"), "{sql}");
         assert!(sql.contains("'%o''clock%'"), "{sql}");
@@ -266,18 +312,18 @@ mod tests {
 
     #[test]
     fn severity_fallthrough_value_is_escaped() {
-        let sql = build_search_logs_sql("", "bo'gus", "", "", 15, 50, "default");
+        let sql = build_search_logs_sql("", "bo'gus", "", "", "", "", 5, 15, 50, "default");
         assert!(sql.contains("SeverityText IN ('bo''gus')"), "{sql}");
         assert!(!sql.contains("\\'"), "{sql}");
     }
 
     #[test]
     fn minutes_clamp_to_1440_and_limit_present() {
-        let sql = build_search_logs_sql("", "", "", "", 999_999, 50, "default");
+        let sql = build_search_logs_sql("", "", "", "", "", "", 5, 999_999, 50, "default");
         assert!(sql.contains("INTERVAL 1440 MINUTE"), "{sql}");
         assert!(sql.contains("LIMIT 50"), "{sql}");
 
-        let capped = build_search_logs_sql("", "", "", "", 15, 9_999, "default");
+        let capped = build_search_logs_sql("", "", "", "", "", "", 5, 15, 9_999, "default");
         assert!(
             capped.contains("LIMIT 200"),
             "limit capped at 200: {capped}"
@@ -286,11 +332,32 @@ mod tests {
 
     #[test]
     fn around_replaces_relative_window() {
-        let sql = build_search_logs_sql("", "", "", "2025-01-15T10:30:00Z", 15, 50, "default");
+        let sql = build_search_logs_sql(
+            "",
+            "",
+            "",
+            "",
+            "",
+            "2025-01-15T10:30:00Z",
+            5,
+            15,
+            50,
+            "default",
+        );
         assert!(
             sql.contains("toDateTime64('2025-01-15 10:30:00', 9)"),
             "{sql}"
         );
         assert!(!sql.contains("now() - INTERVAL"), "{sql}");
+    }
+
+    #[test]
+    fn correlation_filters_and_attribute_search_are_present() {
+        let sql = build_search_logs_sql(
+            "", "", "timeout", "trace-1", "span-2", "", 5, 15, 50, "default",
+        );
+        assert!(sql.contains("TraceId = 'trace-1'"), "{sql}");
+        assert!(sql.contains("SpanId = 'span-2'"), "{sql}");
+        assert!(sql.contains("LogAttributes"), "{sql}");
     }
 }

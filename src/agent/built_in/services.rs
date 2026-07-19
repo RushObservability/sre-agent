@@ -19,7 +19,8 @@ pub(crate) fn build_list_services_sql(minutes: u64, tenant_id: &str) -> String {
     format!(
         "SELECT service_name, \
                 count() AS total, \
-                countIf(status = 'STATUS_CODE_ERROR') AS errors, \
+                countIf(status IN ('STATUS_CODE_ERROR', 'ERROR') OR http_status_code >= 500) AS errors, \
+                if(count() = 0, 0, 100.0 * countIf(status IN ('STATUS_CODE_ERROR', 'ERROR') OR http_status_code >= 500) / count()) AS error_pct, \
                 quantile(0.5)(duration_ns) / 1e6 AS p50_ms, \
                 quantile(0.99)(duration_ns) / 1e6 AS p99_ms \
          FROM spans \
@@ -27,7 +28,7 @@ pub(crate) fn build_list_services_sql(minutes: u64, tenant_id: &str) -> String {
            AND timestamp >= now() - INTERVAL {minutes} MINUTE \
            AND service_name != '' \
          GROUP BY service_name \
-         ORDER BY total DESC \
+         ORDER BY error_pct DESC, total DESC \
          LIMIT 100"
     )
 }
@@ -58,7 +59,10 @@ pub(crate) fn build_service_dependencies_sql(
     // Join spans with itself on parent_span_id to find cross-service calls
     format!(
         "SELECT parent.service_name AS caller, child.service_name AS callee, \
-                count() AS call_count \
+                count() AS call_count, \
+                countIf(child.status IN ('STATUS_CODE_ERROR', 'ERROR') OR child.http_status_code >= 500) AS errors, \
+                if(count() = 0, 0, 100.0 * countIf(child.status IN ('STATUS_CODE_ERROR', 'ERROR') OR child.http_status_code >= 500) / count()) AS error_pct, \
+                quantile(0.99)(child.duration_ns) / 1e6 AS p99_ms \
          FROM spans AS child \
          INNER JOIN spans AS parent ON child.parent_span_id = parent.span_id \
             AND parent.trace_id = child.trace_id \
@@ -69,7 +73,7 @@ pub(crate) fn build_service_dependencies_sql(
            AND parent.service_name != child.service_name \
          {service_filter}\
          GROUP BY caller, callee \
-         ORDER BY call_count DESC \
+         ORDER BY error_pct DESC, call_count DESC \
          LIMIT 50"
     )
 }
@@ -79,6 +83,7 @@ struct ServiceRow {
     service_name: String,
     total: u64,
     errors: u64,
+    error_pct: f64,
     p50_ms: f64,
     p99_ms: f64,
 }
@@ -130,7 +135,7 @@ impl Tool for ListServices {
 
         let mut out = format!("Services in last {minutes}m:\n\n");
         out.push_str(&format!(
-            "{:<25} {:>8} {:>8} {:>6} {:>10} {:>10}\n",
+            "{:<25} {:>8} {:>8} {:>7} {:>10} {:>10}\n",
             "Service", "Requests", "Errors", "Err%", "p50(ms)", "p99(ms)"
         ));
         out.push_str(&"-".repeat(75));
@@ -143,8 +148,13 @@ impl Tool for ListServices {
                 0.0
             };
             out.push_str(&format!(
-                "{:<25} {:>8} {:>8} {:>5.1}% {:>10.1} {:>10.1}\n",
-                r.service_name, r.total, r.errors, err_pct, r.p50_ms, r.p99_ms
+                "{:<25} {:>8} {:>8} {:>6.1}% {:>10.1} {:>10.1}\n",
+                r.service_name,
+                r.total,
+                r.errors,
+                r.error_pct.max(err_pct),
+                r.p50_ms,
+                r.p99_ms
             ));
         }
 
@@ -159,6 +169,9 @@ struct DepRow {
     caller: String,
     callee: String,
     call_count: u64,
+    errors: u64,
+    error_pct: f64,
+    p99_ms: f64,
 }
 
 #[async_trait::async_trait]
@@ -213,8 +226,8 @@ impl Tool for ServiceDependencies {
         let mut out = format!("Service dependencies (last {minutes}m):\n\n");
         for r in &rows {
             out.push_str(&format!(
-                "  {} → {} ({} calls)\n",
-                r.caller, r.callee, r.call_count
+                "  {} → {} ({} calls, {} errors, {:.1}% error, p99={:.1}ms)\n",
+                r.caller, r.callee, r.call_count, r.errors, r.error_pct, r.p99_ms
             ));
         }
         Ok(out)

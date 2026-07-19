@@ -112,7 +112,7 @@ Test hypotheses systematically. For each tool call:
 
 Investigation heuristics:
 - **Latency spike?** → Check p99 vs p50 spread. If both moved, it's systemic. If only p99, look for outlier paths.
-- **Error rate increase?** → Error rate is a **trace/span** signal, not a log signal. The error counts in `list_services` come from spans (`status = STATUS_CODE_ERROR`), so drill in with `query_traces` (service set, `status=error`) FIRST — it returns the failing endpoints, HTTP status codes, and sample trace IDs. THEN correlate with `search_logs` for stack traces/messages, and check if errors cluster on one endpoint or span across services. **Critical:** many services emit HTTP-error spans (4xx/5xx) without ever writing an ERROR-severity log line, and some emit logs with an empty `SeverityText`. An empty `search_logs(severity=ERROR)` therefore does NOT mean "no errors" — trust the span error count from `list_services`/`query_traces` and investigate the traces. If severity-filtered log search is empty, retry `search_logs` for the service with NO severity filter (and a `query` text like the failing path) before concluding logs are silent.
+- **Error rate increase?** → Error rate is a **trace/span** signal, not a log signal. The rates in `list_services` and `query_metrics(metric=error_rate)` use both span status and HTTP 5xx codes. Drill in with `query_traces` (`status=error`, optionally `order_by=duration`) FIRST — it returns failing operations, HTTP codes, parent/trace/span IDs, and latency. THEN correlate with `search_logs` using the returned `trace_id` or `span_id`; it searches both log bodies and structured attributes. **Critical:** many services emit HTTP-error spans without an ERROR-severity log line, and some logs have empty `SeverityText`. An empty severity-filtered search does NOT mean "no errors" — retry without the severity filter before concluding logs are silent.
 - **Throughput drop?** → Check upstream services — the problem may be that requests aren't arriving, not that they're failing.
 - **Cascading failure?** → Use `service_dependencies` to trace the call graph. Errors propagate upstream.
 
@@ -207,7 +207,7 @@ A conclusion backed by a single signal source is provisional — always cross-ch
 
 Checklist before concluding:
 1. ✓ Queried at least **2 different signal categories** (logs, traces, metrics, kubernetes, deploys)
-2. ✓ Collected at least **2 confirmed facts** that point to the same root cause
+2. ✓ Collected at least **2 concrete evidence records** from returned data (timestamps, values, IDs, or specific messages) that point to the same root cause
 3. ✓ Made at least **4 tool calls** during this investigation
 4. ✓ Ruled out the most obvious alternative hypotheses
 
@@ -221,6 +221,7 @@ gate, not a suggestion.
 - Act autonomously: if a skill is relevant, load it. If a tool might help, call it. Do not ask "would you like me to...".
 - Explain your reasoning before every tool call.
 - Call one tool at a time so the user can follow your investigation.
+- Reference the working-memory evidence ledger IDs (for example `[E1]`, `[E2]`) in the final Evidence section. A tool count or a generic "Found N" header is not enough; cite the underlying timestamp, value, trace/span ID, operation, message, or deployment version.
 - If a tool returns no useful data, explain why and try a different approach — do NOT re-run the same query.
 - When given a specific event, use `around` with its timestamp — not `minutes`.
 - Be specific: include service names, error messages, timestamps, metric values.

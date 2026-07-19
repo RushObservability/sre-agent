@@ -31,6 +31,20 @@ pub struct WorkingMemory {
     /// turns so the root-cause gate can require cross-signal confirmation.
     /// LRU-capped at 10.
     pub signals_consulted: Vec<String>,
+    /// Concrete result-backed evidence records. These are intentionally
+    /// compact so they can survive persisted-session compaction while still
+    /// giving the root-cause gate something stronger than a tool-call count.
+    #[serde(default)]
+    pub evidence: Vec<EvidenceItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EvidenceItem {
+    pub id: String,
+    pub signal: String,
+    pub tool: String,
+    pub service: String,
+    pub summary: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -93,6 +107,26 @@ impl WorkingMemory {
             return;
         }
         Self::remember(&mut self.signals_consulted, signal.to_string(), 10);
+    }
+
+    /// Add a compact, result-backed evidence item. Unlike `record_signal`,
+    /// this should only be called after a tool returned meaningful data.
+    pub fn add_evidence(&mut self, signal: &str, tool: &str, service: &str, summary: String) {
+        if signal.is_empty() || tool.is_empty() || summary.is_empty() {
+            return;
+        }
+        let summary = crate::agent::memory::truncate_at_char_boundary(&summary, 360).to_string();
+        let item = EvidenceItem {
+            id: format!("E{}", self.evidence.len() + 1),
+            signal: signal.to_string(),
+            tool: tool.to_string(),
+            service: service.to_string(),
+            summary,
+        };
+        self.evidence.push(item);
+        if self.evidence.len() > 20 {
+            self.evidence.drain(..self.evidence.len() - 20);
+        }
     }
 
     /// Number of distinct signal types that have returned real data.
@@ -158,6 +192,20 @@ impl WorkingMemory {
                 sorted.len(),
                 sorted.join(", ")
             ));
+        }
+        if !self.evidence.is_empty() {
+            out.push_str("**Evidence ledger:**\n");
+            for item in self.evidence.iter().rev().take(10).rev() {
+                let service = if item.service.is_empty() {
+                    String::new()
+                } else {
+                    format!(" service={}", item.service)
+                };
+                out.push_str(&format!(
+                    "- [{}] {} via {}{}: {}\n",
+                    item.id, item.signal, item.tool, service, item.summary
+                ));
+            }
         }
         if self.escalation_level > 0 {
             let stage_hint = match self.escalation_level {
@@ -239,44 +287,89 @@ pub fn extract_facts_from_tool_result(
         out.services.insert(svc.to_string());
     }
 
-    // Detect empty/no-data results
+    // Detect empty/no-data/blocked results. A successful HTTP response that
+    // says "Access denied" is still not usable evidence.
     let low = result.to_lowercase();
     if low.contains("no matching")
         || low.contains("no data")
         || low.contains("not found")
         || low.contains("no spans found")
         || low.contains("no logs found")
+        || low.contains("no service traffic")
+        || low.contains("no cross-service calls")
+        || low.contains("no deploys")
     {
         out.empty_result = true;
     }
+    let blocked = low.starts_with("access denied") || low.starts_with("tool error:");
 
     // Tool-specific summarization
     match tool_name {
         "search_logs" => {
-            // Extract "Found N log entries" and top error patterns
+            // Keep the count plus one timestamped/correlated sample. A count
+            // alone is useful for navigation but is not enough to support a
+            // causal conclusion.
             if let Some(first_line) = result.lines().next()
                 && first_line.contains("Found")
             {
-                out.summary = Some(first_line.to_string());
+                let detail = result
+                    .lines()
+                    .find(|line| line.contains("] [") && line.contains(":"))
+                    .map(str::trim)
+                    .unwrap_or("");
+                out.summary = Some(if detail.is_empty() {
+                    first_line.to_string()
+                } else {
+                    format!("{first_line} sample={detail}")
+                });
             }
         }
         "query_traces" => {
             if let Some(first_line) = result.lines().next()
                 && first_line.contains("Found")
             {
-                out.summary = Some(first_line.to_string());
+                let latency = result
+                    .lines()
+                    .find(|line| line.trim_start().starts_with("Latency:"))
+                    .map(str::trim)
+                    .unwrap_or("");
+                out.summary = Some(if latency.is_empty() {
+                    first_line.to_string()
+                } else {
+                    format!("{first_line} {latency}")
+                });
             }
         }
         "query_metrics" => {
             // Metrics output has "Latest=X Avg=Y Min=Z Max=W"
-            for line in result.lines().take(5) {
-                if line.contains("Latest=")
-                    || line.contains("error_rate")
-                    || line.contains("latency")
-                {
-                    out.summary = Some(line.trim().to_string());
-                    break;
-                }
+            let header = result.lines().next().unwrap_or("").trim();
+            let stats = result
+                .lines()
+                .take(5)
+                .find(|line| line.contains("Latest="))
+                .map(str::trim)
+                .unwrap_or("");
+            if !stats.is_empty() {
+                out.summary = Some(format!("{header} {stats}"));
+            } else if header.contains("error_rate") || header.contains("latency") {
+                out.summary = Some(header.to_string());
+            }
+        }
+        "list_services" | "service_dependencies" | "list_deploys" | "get_trace" => {
+            if let Some(first_line) = result.lines().next()
+                && !first_line.trim().is_empty()
+            {
+                let detail = result
+                    .lines()
+                    .skip(1)
+                    .find(|line| !line.trim().is_empty() && !line.trim().starts_with('-'))
+                    .map(str::trim)
+                    .unwrap_or("");
+                out.summary = Some(if detail.is_empty() {
+                    first_line.trim().to_string()
+                } else {
+                    format!("{} sample={detail}", first_line.trim())
+                });
             }
         }
         "get_argocd_app" => {
@@ -314,6 +407,8 @@ pub fn extract_facts_from_tool_result(
         _ => {}
     }
 
+    out.has_data = !out.empty_result && !blocked && out.summary.is_some();
+
     out
 }
 
@@ -322,6 +417,7 @@ pub struct ExtractedFacts {
     pub services: HashSet<String>,
     pub summary: Option<String>,
     pub empty_result: bool,
+    pub has_data: bool,
 }
 
 /// Clip a tool result to a budget specific to the tool type.
@@ -592,6 +688,17 @@ mod tests {
         let args = json!({});
         let facts = extract_facts_from_tool_result("query_traces", &args, "No spans found.");
         assert!(facts.empty_result);
+    }
+
+    #[test]
+    fn blocked_results_are_not_evidence() {
+        let facts = extract_facts_from_tool_result(
+            "search_logs",
+            &json!({"service": "checkout"}),
+            "Access denied: your account does not have permission to search logs.",
+        );
+        assert!(!facts.has_data);
+        assert!(facts.summary.is_none());
     }
 
     #[test]

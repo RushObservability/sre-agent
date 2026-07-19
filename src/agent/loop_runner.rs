@@ -101,7 +101,7 @@ fn decide_report_kind(
     }
 
     if memory.escalation_level < 2
-        && !memory.confirmed_facts.is_empty()
+        && memory.evidence.len() >= 2
         && !memory.suspect_services.is_empty()
         && memory.unique_signal_count() >= MIN_SIGNAL_TYPES
         && tool_steps >= min_depth
@@ -126,14 +126,58 @@ fn tool_signal_type(tool_name: &str) -> Option<&'static str> {
     }
 }
 
+/// Extract the model's explicit alternative-hypothesis conclusions into the
+/// durable ledger. This is intentionally conservative: only content under a
+/// heading/label that mentions ruled-out or refuted alternatives is recorded.
+fn capture_report_state(memory: &mut WorkingMemory, content: &str) {
+    let mut in_ruled_out = false;
+    for raw_line in content.lines() {
+        let line = raw_line.trim();
+        let lower = line.to_ascii_lowercase();
+        if lower.contains("ruled out")
+            || lower.contains("refuted alternative")
+            || lower.contains("alternatives rejected")
+        {
+            in_ruled_out = true;
+            if let Some((_, value)) = line.split_once(':') {
+                let value = value.trim().trim_start_matches(['-', '*']).trim();
+                if !value.is_empty() && !is_empty_hypothesis(value) {
+                    memory.add_ruled_out(value.to_string());
+                    memory.add_failed_hypothesis(value.to_string());
+                }
+            }
+            continue;
+        }
+        if in_ruled_out && line.starts_with('#') {
+            in_ruled_out = false;
+            continue;
+        }
+        if in_ruled_out {
+            let value = line.trim_start_matches(['-', '*', ' ']).trim();
+            if !value.is_empty() && !is_empty_hypothesis(value) {
+                memory.add_ruled_out(value.to_string());
+                memory.add_failed_hypothesis(value.to_string());
+            }
+        }
+    }
+}
+
+fn is_empty_hypothesis(value: &str) -> bool {
+    matches!(
+        value.to_ascii_lowercase().as_str(),
+        "none" | "none yet" | "nothing" | "n/a" | "unknown"
+    )
+}
+
 /// Root-cause gate: examine the investigation state and return a descriptive
 /// gap message if the agent shouldn't be allowed to conclude yet, or `None`
 /// if the conclusion is sufficiently grounded.
 ///
-/// The gate checks three criteria:
+/// The gate checks four criteria:
 /// 1. Minimum investigation depth (at least MIN_INVESTIGATION_DEPTH real tool steps).
 /// 2. Multi-signal coverage (at least MIN_SIGNAL_TYPES distinct signal types).
-/// 3. Minimum confirmed evidence (at least 2 confirmed facts in working memory).
+/// 3. Minimum confirmed evidence (at least 2 concrete result-backed records).
+/// 4. At least one explicitly ruled-out alternative hypothesis.
 fn root_cause_gate(memory: &WorkingMemory, tool_steps: u32, min_depth: u32) -> Option<String> {
     let mut gaps: Vec<String> = Vec::new();
 
@@ -169,12 +213,20 @@ fn root_cause_gate(memory: &WorkingMemory, tool_steps: u32, min_depth: u32) -> O
         ));
     }
 
-    if memory.confirmed_facts.len() < 2 {
+    if memory.evidence.len() < 2 {
         gaps.push(format!(
-            "Fewer than 2 confirmed facts in working memory (have {}). \
-             Run targeted queries to build concrete evidence before concluding.",
-            memory.confirmed_facts.len()
+            "Fewer than 2 concrete evidence records in working memory (have {}). \
+             Run targeted queries that return timestamps, values, IDs, or specific messages before concluding.",
+            memory.evidence.len()
         ));
+    }
+
+    if memory.ruled_out.is_empty() && memory.failed_hypotheses.is_empty() {
+        gaps.push(
+            "No competing hypothesis has been explicitly ruled out. Test one plausible \
+             alternative and record what evidence refuted it before concluding."
+                .to_string(),
+        );
     }
 
     if gaps.is_empty() {
@@ -613,6 +665,10 @@ async fn run_inner(
                 continue;
             }
 
+            // Preserve the model's explicit alternative-hypothesis work in
+            // durable memory before the gate evaluates the report.
+            capture_report_state(&mut memory, &content);
+
             // Root-cause gate: bounce premature conclusions back until the
             // agent has gathered sufficient multi-signal evidence, or until
             // the gate has rejected MAX_GATE_REJECTIONS times (at which point
@@ -721,8 +777,9 @@ async fn run_inner(
         // Execute the round's tool calls (usually just one per round).
         //
         // Pass 1 — synchronous bookkeeping in call order. Repeat-call
-        // detection must see earlier calls from the SAME round, so
-        // record_call/record_signal happen here, before anything executes.
+        // detection must see earlier calls from the SAME round. Signal
+        // coverage is deliberately recorded later, after a result proves
+        // that the query returned usable data.
         enum Planned {
             /// Repeat call — precomputed structured error, never executed.
             PrecomputedError(String),
@@ -749,9 +806,6 @@ async fn run_inner(
                 ))
             } else {
                 memory.record_call(sig);
-                if let Some(sig_type) = tool_signal_type(&tc.name) {
-                    memory.record_signal(sig_type);
-                }
                 Planned::Execute
             };
             planned.push((args, plan));
@@ -806,7 +860,18 @@ async fn run_inner(
                     memory.add_suspect_service(svc);
                 }
                 if let Some(summary) = facts.summary {
-                    memory.add_fact(format!("{}: {}", tc.name, summary));
+                    memory.add_fact(format!("{}: {}", tc.name, summary.clone()));
+                    if facts.has_data {
+                        if let Some(sig_type) = tool_signal_type(&tc.name) {
+                            memory.record_signal(sig_type);
+                            let service = args
+                                .get("service")
+                                .or_else(|| args.get("service_name"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            memory.add_evidence(sig_type, &tc.name, service, summary);
+                        }
+                    }
                 }
                 if facts.empty_result {
                     memory.consecutive_empty_results += 1;
@@ -1226,13 +1291,26 @@ mod tests {
 
     // ── root_cause_gate ──────────────────────────────────────────────────
 
-    /// Memory satisfying every gate criterion: ≥2 signals, ≥2 facts.
+    /// Memory satisfying every gate criterion: ≥2 signals, ≥2 concrete records.
     fn satisfied_memory() -> WorkingMemory {
         let mut mem = WorkingMemory::new("investigate".to_string());
         mem.record_signal("logs");
         mem.record_signal("traces");
         mem.add_fact("search_logs: 5 errors in api".to_string());
         mem.add_fact("query_traces: p99 spike at 10:30".to_string());
+        mem.add_evidence(
+            "logs",
+            "search_logs",
+            "api",
+            "Found 5 error entries at 10:30".to_string(),
+        );
+        mem.add_evidence(
+            "traces",
+            "query_traces",
+            "api",
+            "Found 12 error spans at 10:30".to_string(),
+        );
+        mem.add_ruled_out("No matching deploy in the incident window".to_string());
         mem
     }
 
@@ -1272,10 +1350,13 @@ mod tests {
         mem.record_signal("metrics");
         mem.add_fact("only one fact".to_string());
         let msg = root_cause_gate(&mem, 5, 4).expect("gate must reject <2 facts");
-        assert!(msg.contains("Fewer than 2 confirmed facts"), "{msg}");
         assert!(
-            msg.contains("(have 1)"),
-            "reports current fact count: {msg}"
+            msg.contains("Fewer than 2 concrete evidence records"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("(have 0)"),
+            "reports current evidence count: {msg}"
         );
     }
 
@@ -1296,7 +1377,10 @@ mod tests {
         let msg = root_cause_gate(&mem, 0, 4).expect("fresh memory must be rejected");
         assert!(msg.contains("Only 0 investigation step(s)"), "{msg}");
         assert!(msg.contains("Only 0 signal type(s)"), "{msg}");
-        assert!(msg.contains("Fewer than 2 confirmed facts"), "{msg}");
+        assert!(
+            msg.contains("Fewer than 2 concrete evidence records"),
+            "{msg}"
+        );
     }
 
     // ── decide_report_kind ───────────────────────────────────────────────
@@ -1332,6 +1416,30 @@ mod tests {
         mem.add_suspect_service("api".to_string());
         let kind = decide_report_kind(&mem, "## Root Cause", 3, 4);
         assert_eq!(kind, ReportKind::Preliminary);
+    }
+
+    #[test]
+    fn facts_without_evidence_cannot_be_final() {
+        let mut mem = WorkingMemory::new("investigate".to_string());
+        mem.record_signal("logs");
+        mem.record_signal("traces");
+        mem.add_fact("generic count".to_string());
+        mem.add_suspect_service("api".to_string());
+        assert_eq!(
+            decide_report_kind(&mem, "## Root Cause", 10, 4),
+            ReportKind::Preliminary
+        );
+    }
+
+    #[test]
+    fn report_state_captures_ruled_out_alternatives() {
+        let mut mem = WorkingMemory::new("investigate".to_string());
+        capture_report_state(
+            &mut mem,
+            "## Reflection\nWhat I ruled out:\n- No deploy preceded the onset\n- The upstream gateway was healthy\n\n## Root Cause",
+        );
+        assert_eq!(mem.ruled_out.len(), 2);
+        assert_eq!(mem.failed_hypotheses.len(), 2);
     }
 
     // ── LoopBudget ───────────────────────────────────────────────────────

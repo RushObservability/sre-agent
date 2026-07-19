@@ -25,6 +25,10 @@ impl Tool for ListDeploys {
                 "hours": {
                     "type": "integer",
                     "description": "Look back this many hours (default 6)"
+                },
+                "around": {
+                    "type": "string",
+                    "description": "ISO 8601 incident timestamp. When set, list deploys in the preceding 'hours' window around that event instead of relative to now."
                 }
             }
         })
@@ -33,9 +37,22 @@ impl Tool for ListDeploys {
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String> {
         let service = args.get("service").and_then(|v| v.as_str()).unwrap_or("");
         let hours = args.get("hours").and_then(|v| v.as_u64()).unwrap_or(6);
+        let around = args.get("around").and_then(|v| v.as_str()).unwrap_or("");
 
-        let cutoff = chrono::Utc::now() - chrono::Duration::hours(hours as i64);
+        let end = if around.is_empty() {
+            chrono::Utc::now()
+        } else {
+            chrono::DateTime::parse_from_rfc3339(around)
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .unwrap_or_else(|_| chrono::Utc::now())
+        };
+        let cutoff = end - chrono::Duration::hours(hours.min(24 * 30) as i64);
         let from_str = cutoff.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let until_str = if around.is_empty() {
+            None
+        } else {
+            Some(end.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+        };
 
         let svc_filter = if service.is_empty() {
             None
@@ -46,7 +63,7 @@ impl Tool for ListDeploys {
         let deploys = ctx
             .state
             .config_db
-            .list_deploy_markers(svc_filter.as_deref(), Some(&from_str), None)
+            .list_deploy_markers(svc_filter.as_deref(), Some(&from_str), until_str.as_deref())
             .await
             .map_err(|e| anyhow::anyhow!("failed to list deploys: {e}"))?;
 
@@ -59,7 +76,11 @@ impl Tool for ListDeploys {
             return Ok(format!("No deploys for {scope} in last {hours}h."));
         }
 
-        let mut out = format!("Deploys in last {hours}h:\n\n");
+        let mut out = if around.is_empty() {
+            format!("Deploys in last {hours}h:\n\n")
+        } else {
+            format!("Deploys in the {hours}h before {around}:\n\n")
+        };
         for d in &deploys {
             out.push_str(&format!(
                 "  [{ts}] {svc} → {ver}",

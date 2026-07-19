@@ -7,6 +7,7 @@ pub mod agent;
 pub mod config_db;
 pub mod http;
 pub mod models;
+pub mod repository;
 pub mod state;
 
 pub use state::AppState;

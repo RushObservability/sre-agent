@@ -88,14 +88,14 @@ async fn investigate_with_empty_fields_returns_400() {
 /// its first frames must carry the setup-oriented "LLM not configured" error
 /// instead of starting a doomed investigation.
 ///
-/// Env vars are process-global; this test only READS LLM_API_KEY and skips
+/// Env vars are process-global; this test only READS OPENAI_API_KEY and skips
 /// itself when one is set (e.g. a dev machine), to avoid mutating env state
 /// and racing other tests.
 #[tokio::test]
 async fn investigate_without_llm_env_streams_not_configured_error() {
-    if std::env::var("LLM_API_KEY").is_ok() {
+    if std::env::var("OPENAI_API_KEY").is_ok() {
         eprintln!(
-            "LLM_API_KEY is set in this environment — skipping the \
+            "OPENAI_API_KEY is set in this environment — skipping the \
              LLM-not-configured assertion to avoid flaking"
         );
         return;

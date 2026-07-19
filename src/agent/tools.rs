@@ -24,9 +24,20 @@ pub struct ToolContext {
 
 impl ToolContext {
     /// Returns true if the caller has access to the given signal type.
-    /// The "all" scope grants access to everything.
+    /// The "all" scope grants access to telemetry and namespaced
+    /// infrastructure tools. Source code and cluster-wide Kubernetes reads are
+    /// intentionally separate: they always require an explicit scope so adding
+    /// a new tool cannot widen existing callers.
     pub fn has_scope(&self, signal: &str) -> bool {
-        self.scopes.iter().any(|s| s == "all" || s == signal)
+        scope_allows(&self.scopes, signal)
+    }
+}
+
+fn scope_allows(scopes: &[String], signal: &str) -> bool {
+    if matches!(signal, "code" | "kube_cluster") {
+        scopes.iter().any(|scope| scope == signal)
+    } else {
+        scopes.iter().any(|scope| scope == "all" || scope == signal)
     }
 }
 
@@ -154,6 +165,25 @@ mod tests {
         let r = ToolRegistry::new();
         assert!(r.get("anything").is_none());
         assert!(r.definitions().is_empty());
+    }
+
+    #[test]
+    fn code_requires_an_explicit_scope() {
+        assert!(!scope_allows(&["all".to_string()], "code"));
+        assert!(scope_allows(
+            &["all".to_string(), "code".to_string()],
+            "code"
+        ));
+        assert!(scope_allows(&["all".to_string()], "logs"));
+    }
+
+    #[test]
+    fn cluster_kubernetes_reads_require_an_explicit_scope() {
+        assert!(!scope_allows(&["all".to_string()], "kube_cluster"));
+        assert!(scope_allows(
+            &["all".to_string(), "kube_cluster".to_string()],
+            "kube_cluster"
+        ));
     }
 
     #[test]

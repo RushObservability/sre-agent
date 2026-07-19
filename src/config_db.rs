@@ -17,6 +17,7 @@ use clickhouse::Client;
 
 use crate::models::anomaly::{AnomalyEvent, AnomalyRule, DeployMarker};
 use crate::models::custom_skills::CustomSkill;
+use crate::models::service_link::ServiceLink;
 
 pub struct ConfigDb {
     pub client: Client,
@@ -116,6 +117,45 @@ struct InvestigationTurnRow {
 }
 
 impl ConfigDb {
+    /// Resolve a repository link inside the caller's tenant. Repository links
+    /// live in query-api's tenant-safe v2 table; the agent is read-only here.
+    pub async fn get_service_link(
+        &self,
+        tenant_id: &str,
+        service_name: &str,
+    ) -> anyhow::Result<Option<ServiceLink>> {
+        #[derive(clickhouse::Row, serde::Deserialize)]
+        struct Row {
+            tenant_id: String,
+            service_name: String,
+            github_repo: String,
+            github_installation_id: u64,
+            github_repository_id: u64,
+            default_branch: String,
+            root_path: String,
+        }
+
+        let result = self.client
+            .query("SELECT tenant_id, service_name, github_repo, github_installation_id, github_repository_id, default_branch, root_path FROM config_service_links_v2 FINAL WHERE tenant_id = ? AND service_name = ? AND is_deleted = 0 LIMIT 1")
+            .bind(tenant_id)
+            .bind(service_name)
+            .fetch_one::<Row>()
+            .await;
+        match result {
+            Ok(row) => Ok(Some(ServiceLink {
+                tenant_id: row.tenant_id,
+                service_name: row.service_name,
+                github_repo: row.github_repo,
+                github_installation_id: row.github_installation_id,
+                github_repository_id: row.github_repository_id,
+                default_branch: row.default_branch,
+                root_path: row.root_path,
+            })),
+            Err(clickhouse::error::Error::RowNotFound) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// Build the ClickHouse client and ensure the two agent-owned tables exist.
     ///
     /// The 5 shared tables (deploy_markers, anomaly_rules, anomaly_events,

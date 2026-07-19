@@ -21,6 +21,34 @@ Investigations follow a five-phase playbook — orient, hypothesize, gather evid
 
 It reads telemetry straight from ClickHouse, fetches user-authored skills from [query-api](https://github.com/RushObservability/query-api) over HTTP (one source of truth, no shared volume), and reaches Kubernetes and ArgoCD through the in-cluster ServiceAccount.
 
+## Read-only GitHub source access
+
+The agent can inspect code linked to an observed service without webhooks and
+without a general-purpose shell. Create a GitHub App with only the repository
+permission **Contents: Read-only**, install it on selected repositories, and
+mount its PEM private key into the agent. Each repository link can carry its
+operator-approved GitHub installation and stable repository IDs. The policy is
+keyed by Rush tenant, so API callers cannot claim another tenant's installation.
+
+Required environment variables:
+
+```text
+GITHUB_APP_ID=<numeric app id>
+GITHUB_APP_PRIVATE_KEY_PATH=/var/run/rush-github/private-key.pem
+SRE_AGENT_GITHUB_REPOSITORY_POLICY={"acme":[{"repository":"acme/api","installationId":654321,"repositoryId":123456789}]}
+REPOSITORY_CACHE_DIR=/var/run/rush-repositories
+```
+
+`GITHUB_API_URL` is optional for GitHub Enterprise Server. There is deliberately
+no global installation fallback. The query API and agent both require an exact
+tenant/repository/installation/repository-ID policy match before access,
+including cached access. The agent mints a short-lived installation token
+scoped by stable repository ID and `contents: read`, downloads a bounded
+tar snapshot, rejects links/special files/path traversal, and exposes only
+`list_repository_files`, `search_repository`, and `read_repository_file`.
+Repository code is never executed. Successful source reads are sent to
+query-api's tamper-evident audit log without tokens or source contents.
+
 ## Tools
 
 | Tool | Purpose |
@@ -31,18 +59,18 @@ It reads telemetry straight from ClickHouse, fetches user-authored skills from [
 | `list_services` / `service_dependencies` | health snapshot; call graph |
 | `list_deploys` / `get_anomaly_context` | recent deploys; anomaly rules and events |
 | `get_argocd_app` | Application health, sync, history |
-| `kube_describe` / `kube_events` | describe any resource; namespace events |
+| `kube_describe` / `kube_events` | describe resources in the caller's mapped namespaces; namespace events |
 | `load_skill` | load an investigation playbook |
 
 ## Running it
 
-Needs ClickHouse, a running query-api, and an LLM key:
+Needs ClickHouse, a running query-api, and an OpenAI API key:
 
 ```bash
 export CLICKHOUSE_URL=http://localhost:8123
 export QUERY_API_URL=http://localhost:8080   # where it fetches custom skills
-export LLM_API_KEY=sk-...
-export LLM_MODEL=gpt-4o
+export OPENAI_API_KEY=sk-...
+export OPENAI_BASE_URL=https://api.openai.com   # optional
 make run
 
 make docker        # build image
@@ -52,9 +80,28 @@ make docker-push
 | Variable | Default | |
 |---|---|---|
 | `SRE_AGENT_PORT` | `8081` | listen port |
-| `LLM_BASE_URL` | `https://api.openai.com` | any OpenAI-compatible endpoint |
-| `LLM_API_KEY` / `LLM_MODEL` | required / `gpt-4o` | |
+| `OPENAI_BASE_URL` | `https://api.openai.com` | any OpenAI-compatible endpoint |
+| `OPENAI_API_KEY` | required | provider credential |
+| `sre_agent_model` | `gpt-4o` | set in SRE Agent settings; not read from the environment |
 | `ARGOCD_NAMESPACE` | `argocd` | where ArgoCD Application CRDs live |
+
+### Kubernetes access boundaries
+
+Kubernetes inspection is deny-by-default. Set `SRE_AGENT_KUBE_TENANT_NAMESPACES`
+to a JSON object that maps Rush tenant IDs to the namespaces they may inspect:
+
+```text
+SRE_AGENT_KUBE_TENANT_NAMESPACES={"acme":["acme-prod"],"*":["shared-observability"]}
+```
+
+The optional `*` entry is a shared-namespace allowlist; it does not grant
+access to arbitrary namespaces. Cluster-scoped resources such as nodes and
+namespace enumeration are denied unless both `SRE_AGENT_KUBE_ALLOW_CLUSTER_SCOPED=true`
+and the authenticated caller has the explicit `kube_cluster` scope (the Rush
+admin role is the only role that receives it). The Helm chart creates a
+dedicated service account and namespace RoleBindings from
+`sreAgent.kube.tenantNamespaces`; it does not grant the agent Secrets, pod-log,
+node, or namespace permissions.
 
 ## API
 

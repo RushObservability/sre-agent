@@ -305,6 +305,8 @@ pub struct LlmConfig {
     pub reasoning_effort: Option<String>,
 }
 
+pub const DEFAULT_MODEL: &str = "gpt-4o";
+
 /// Heuristic: does this model support the `reasoning_effort` parameter (OpenAI gpt-5 / o-series)?
 pub fn is_reasoning_model(model: &str) -> bool {
     let m = model.trim().to_ascii_lowercase();
@@ -312,32 +314,29 @@ pub fn is_reasoning_model(model: &str) -> bool {
 }
 
 impl LlmConfig {
-    /// Construct from environment variables:
-    /// - API key: `OPENAI_API_KEY` → `OPENAI_KEY` → `LLM_API_KEY` (first set wins; required)
-    /// - LLM_BASE_URL (default: https://api.openai.com)
-    /// - LLM_MODEL (default: gpt-4o) — overridable at runtime by the `sre_agent_model` setting
+    /// Construct the provider connection from environment variables. The model is
+    /// intentionally not read from the environment; app settings choose it.
+    /// - `OPENAI_API_KEY` (required)
+    /// - `OPENAI_BASE_URL` (default: https://api.openai.com)
     pub fn from_env() -> Result<Self> {
-        let api_key = Self::api_key_from_env().ok_or_else(|| {
-            anyhow::anyhow!("no LLM API key set (OPENAI_API_KEY / OPENAI_KEY / LLM_API_KEY)")
-        })?;
+        let api_key = std::env::var("OPENAI_API_KEY")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("OPENAI_API_KEY is not set"))?;
         Ok(Self {
-            base_url: std::env::var("LLM_BASE_URL")
+            base_url: std::env::var("OPENAI_BASE_URL")
                 .unwrap_or_else(|_| "https://api.openai.com".to_string()),
             api_key,
-            model: std::env::var("LLM_MODEL").unwrap_or_else(|_| "gpt-4o".to_string()),
-            reasoning_effort: std::env::var("LLM_REASONING_EFFORT")
-                .ok()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty()),
+            model: DEFAULT_MODEL.to_string(),
+            reasoning_effort: None,
         })
     }
 
-    /// Resolve the API key from the accepted env vars, in priority order. OpenAI-branded
-    /// names are preferred; `LLM_API_KEY` is kept for backward compatibility.
+    /// Resolve the configured OpenAI API key.
     pub fn api_key_from_env() -> Option<String> {
-        ["OPENAI_API_KEY", "OPENAI_KEY", "LLM_API_KEY"]
-            .into_iter()
-            .find_map(|k| std::env::var(k).ok().filter(|v| !v.trim().is_empty()))
+        std::env::var("OPENAI_API_KEY")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
     }
 }
 

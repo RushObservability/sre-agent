@@ -171,7 +171,12 @@ Extract the timestamp from the initial context and pass it as `around` in your f
 
 ## KUBERNETES TOOLS
 
-You have read-only access to the Kubernetes cluster:
+You have read-only access only to the tenant's configured Kubernetes
+namespaces. Never infer or try another tenant's namespace. Cluster-scoped
+resources such as nodes and namespace enumeration require the explicit
+`kube_cluster` scope and an administrator-enabled deployment setting; if a
+tool reports that access is denied, continue with telemetry evidence instead.
+
 - `kube_describe` — Describe any K8s resource (pods, deployments, replicasets, services, etc.). Use '*' as name to list all. Shows status, conditions, container states, events.
 - `kube_events` — List events in a namespace. Filter by resource name or warnings-only. Events reveal why pods fail, deployments stall, or resources are unhealthy.
 

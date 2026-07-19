@@ -504,15 +504,15 @@ async fn investigate(
     };
 
     // Fail fast with a setup-oriented message when no LLM is configured —
-    // otherwise the user sees a bare "LLM_API_KEY not set" mid-stream. The
+    // otherwise the user sees a bare provider-key error mid-stream. The
     // "LLM not configured:" prefix is a stable marker the UI styles as a
     // setup card. Only env var NAMES are mentioned, never values.
     if agent::loop_runner::LlmConfig::from_env().is_err() {
         let _ = tx
             .send(AgentEvent::Error {
                 message: "LLM not configured: the SRE agent needs an LLM to run investigations. \
-                          Set the OPENAI_API_KEY (or OPENAI_KEY / LLM_API_KEY) environment variable \
-                          on the sre-agent service (optionally LLM_BASE_URL for non-OpenAI providers; \
+                          Set OPENAI_API_KEY on the sre-agent service (optionally OPENAI_BASE_URL for \
+                          an OpenAI-compatible provider; \
                           the model is selectable in Settings → SRE Agent) and restart it. \
                           Telemetry browsing in the rest of the app is unaffected."
                     .to_string(),
@@ -539,7 +539,7 @@ async fn investigate(
     let restored_mem = restored_memory;
 
     // Resolve the LLM config under the admin model/thinking policy. The API key
-    // always comes from the environment (OPENAI_API_KEY / OPENAI_KEY / LLM_API_KEY);
+    // always comes from OPENAI_API_KEY and OPENAI_BASE_URL;
     // only the model + thinking level are governed here. Two-tier governance:
     //   - ADMIN defines the allowed models + per-model thinking levels
     //     (`sre_agent_allowed_models` JSON) and a default model (`sre_agent_model`).
@@ -550,7 +550,7 @@ async fn investigate(
     let mut llm = agent::loop_runner::LlmConfig::from_env().expect("LLM config checked above");
 
     // Parse the allowed-models policy. Empty/missing/bad → no policy (preserve
-    // pre-governance behavior: honor the `sre_agent_model` default setting / env).
+    // pre-governance behavior: honor the `sre_agent_model` default setting).
     let allowed = state
         .config_db
         .get_setting("sre_agent_allowed_models")
@@ -567,7 +567,7 @@ async fn investigate(
         })
         .unwrap_or_default();
 
-    // Default model setting (admin's chosen default; may be empty → env default).
+    // Default model setting (admin's chosen default; may be empty → code default).
     let default_model = state
         .config_db
         .get_setting("sre_agent_model")
@@ -579,7 +579,7 @@ async fn investigate(
 
     if allowed.is_empty() {
         // No policy configured: keep today's behavior — the `sre_agent_model`
-        // default setting overrides the env model when set; no thinking control.
+        // default setting overrides the code default when set; no thinking control.
         if !default_model.is_empty() {
             llm.model = default_model.clone();
         }

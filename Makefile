@@ -2,6 +2,13 @@ BINARY  := sre-agent
 VERSION := $(shell grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
 IMAGE   := ghcr.io/rushobservability/sre-agent
 
+# Local development wiring. These values are used only by `make dev` and
+# `make watch`; `make run` sources the production-style `.env` file instead.
+DEV_SRE_AGENT_PORT           := 8081
+DEV_CLICKHOUSE_URL           := http://localhost:8123
+DEV_QUERY_API_URL            := http://localhost:8080
+DEV_SRE_AGENT_INTERNAL_TOKEN := dev-local-agent-token
+
 .PHONY: build release run check test test-integration fmt lint clean docker docker-push help
 
 ## Development
@@ -12,11 +19,27 @@ build:                ## Build debug binary
 release:              ## Build optimised release binary
 	cargo build --release
 
-run:                  ## Run the agent locally on :8081
-	RUST_LOG=sre_agent=debug,tower_http=debug cargo run
+dev:                  ## Run the agent with local development wiring
+	SRE_AGENT_PORT=$(DEV_SRE_AGENT_PORT) \
+	CLICKHOUSE_URL=$(DEV_CLICKHOUSE_URL) \
+	QUERY_API_URL=$(DEV_QUERY_API_URL) \
+	SRE_AGENT_INTERNAL_TOKEN=$(DEV_SRE_AGENT_INTERNAL_TOKEN) \
+	RUST_LOG=sre_agent=debug,tower_http=debug \
+	cargo run --bin $(BINARY)
 
-watch:                ## Watch & restart on code changes
-	RUST_LOG=sre_agent=debug,tower_http=debug cargo watch -x run
+run:                  ## Run the agent with variables sourced from .env
+	@set -e; \
+	test -f .env || { echo "ERROR: sre-agent/.env is required for make run" >&2; exit 1; }; \
+	set -a; . ./.env; set +a; \
+	RUST_LOG="$${RUST_LOG:-sre_agent=info,tower_http=info}" cargo run --bin $(BINARY)
+
+watch:                ## Watch the agent with local development wiring
+	SRE_AGENT_PORT=$(DEV_SRE_AGENT_PORT) \
+	CLICKHOUSE_URL=$(DEV_CLICKHOUSE_URL) \
+	QUERY_API_URL=$(DEV_QUERY_API_URL) \
+	SRE_AGENT_INTERNAL_TOKEN=$(DEV_SRE_AGENT_INTERNAL_TOKEN) \
+	RUST_LOG=sre_agent=debug,tower_http=debug \
+	cargo watch -x "run --bin $(BINARY)"
 
 ## Quality
 

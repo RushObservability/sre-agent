@@ -6,7 +6,7 @@ over labeled incident cases and scores **root-cause localization** plus a
 and is built as the `sre_evals` binary.
 
 > This is a manual evaluation tool. It needs a **live ClickHouse** (populated
-> with telemetry) and an **`LLM_API_KEY`** — it is deliberately *not* wired into
+> with telemetry) and an **`OPENAI_API_KEY`** — it is deliberately *not* wired into
 > CI. Building it (`cargo build`) requires neither.
 
 ---
@@ -42,9 +42,8 @@ tool calls.
 
 ```bash
 # from the sre-agent crate root
-export LLM_API_KEY=sk-...          # required (agent + judge)
-export LLM_BASE_URL=https://...    # optional, default https://api.openai.com
-export LLM_MODEL=gpt-4o            # optional
+export OPENAI_API_KEY=sk-...       # required (agent + judge)
+export OPENAI_BASE_URL=https://... # optional, default https://api.openai.com
 export CLICKHOUSE_URL=http://localhost:8123
 export CLICKHOUSE_DATABASE=observability
 # export CLICKHOUSE_USER / CLICKHOUSE_PASSWORD / QUERY_API_URL as for the server

@@ -4,6 +4,68 @@ use kube::api::DynamicObject;
 use kube::discovery::ApiResource;
 use kube::{Api, Client, api::ListParams};
 use serde_json::{Value, json};
+use std::collections::{HashMap, HashSet};
+
+const TENANT_NAMESPACES_ENV: &str = "SRE_AGENT_KUBE_TENANT_NAMESPACES";
+const CLUSTER_SCOPE_ENV: &str = "SRE_AGENT_KUBE_ALLOW_CLUSTER_SCOPED";
+
+/// Parse the tenant-to-namespace allowlist. The value is a JSON object such
+/// as `{ "tenant-a": ["payments"], "*": ["shared-observability"] }`.
+/// Invalid or missing policy is deliberately treated as deny-all.
+fn parse_namespace_policy(raw: Option<&str>) -> Option<HashMap<String, HashSet<String>>> {
+    let raw = raw?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let parsed: HashMap<String, Vec<String>> = serde_json::from_str(raw).ok()?;
+    let policy = parsed
+        .into_iter()
+        .map(|(tenant, namespaces)| {
+            (
+                tenant,
+                namespaces
+                    .into_iter()
+                    .map(|namespace| namespace.trim().to_string())
+                    .filter(|namespace| !namespace.is_empty())
+                    .collect(),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    Some(policy)
+}
+
+fn namespace_allowed_for(raw: Option<&str>, tenant_id: &str, namespace: &str) -> bool {
+    let Some(policy) = parse_namespace_policy(raw) else {
+        return false;
+    };
+    policy
+        .get(tenant_id)
+        .or_else(|| policy.get("*"))
+        .is_some_and(|namespaces| namespaces.contains(namespace))
+}
+
+fn namespace_allowed(ctx: &ToolContext, namespace: &str) -> bool {
+    namespace_allowed_for(
+        std::env::var(TENANT_NAMESPACES_ENV).ok().as_deref(),
+        &ctx.tenant_id,
+        namespace,
+    )
+}
+
+fn cluster_scope_allowed(ctx: &ToolContext) -> bool {
+    let enabled = std::env::var(CLUSTER_SCOPE_ENV)
+        .ok()
+        .is_some_and(|value| value.eq_ignore_ascii_case("true"));
+    cluster_scope_allowed_for(&ctx.scopes, enabled)
+}
+
+fn cluster_scope_allowed_for(scopes: &[String], enabled: bool) -> bool {
+    enabled && scopes.iter().any(|scope| scope == "kube_cluster")
+}
+
+fn namespace_denied(namespace: &str) -> String {
+    format!("Access to Kubernetes namespace '{namespace}' is not allowed for this tenant.")
+}
 
 /// Process-wide Kubernetes client, built once on first use. The kubeconfig /
 /// in-cluster service account doesn't change at runtime, so rebuilding the
@@ -53,7 +115,7 @@ impl Tool for KubeDescribe {
         })
     }
 
-    async fn execute(&self, args: Value, _ctx: &ToolContext) -> Result<String> {
+    async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String> {
         let kind = args
             .get("kind")
             .and_then(|v| v.as_str())
@@ -65,11 +127,6 @@ impl Tool for KubeDescribe {
         if name.is_empty() {
             return Ok("'name' is required. Use '*' to list all resources.".to_string());
         }
-
-        let client = match shared_kube_client().await {
-            Ok(c) => c,
-            Err(e) => return Ok(format!("Cannot connect to Kubernetes: {e}")),
-        };
 
         let (api_group, api_version, plural) = match kind.as_str() {
             "pod" | "pods" => ("", "v1", "pods"),
@@ -114,6 +171,29 @@ impl Tool for KubeDescribe {
             kind.as_str(),
             "node" | "nodes" | "namespace" | "ns" | "namespaces"
         );
+
+        if is_cluster_scoped {
+            if !cluster_scope_allowed(ctx) {
+                return Ok(
+                    "Cluster-scoped Kubernetes reads are restricted to administrators and must be explicitly enabled."
+                        .to_string(),
+                );
+            }
+        } else {
+            if namespace.is_empty() {
+                return Ok(format!("'namespace' is required for {kind} resources."));
+            }
+            if !namespace_allowed(ctx, namespace) {
+                return Ok(namespace_denied(namespace));
+            }
+        }
+
+        // Resolve the client only after the tenant and scope checks. Denied
+        // requests must not even attempt a Kubernetes connection.
+        let client = match shared_kube_client().await {
+            Ok(c) => c,
+            Err(e) => return Ok(format!("Cannot connect to Kubernetes: {e}")),
+        };
 
         // List mode
         if name == "*" {
@@ -302,7 +382,7 @@ impl Tool for KubeEvents {
         })
     }
 
-    async fn execute(&self, args: Value, _ctx: &ToolContext) -> Result<String> {
+    async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String> {
         let namespace = args.get("namespace").and_then(|v| v.as_str()).unwrap_or("");
         let resource_name = args
             .get("resource_name")
@@ -315,6 +395,9 @@ impl Tool for KubeEvents {
 
         if namespace.is_empty() {
             return Ok("'namespace' is required.".to_string());
+        }
+        if !namespace_allowed(ctx, namespace) {
+            return Ok(namespace_denied(namespace));
         }
 
         let client = match shared_kube_client().await {
@@ -404,6 +487,46 @@ impl Tool for KubeEvents {
         }
 
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::{cluster_scope_allowed_for, namespace_allowed_for, parse_namespace_policy};
+
+    #[test]
+    fn tenant_namespace_policy_is_exact_and_supports_shared_namespaces() {
+        let raw = r#"{"tenant-a":["payments"],"*":["shared-observability"]}"#;
+        assert!(namespace_allowed_for(Some(raw), "tenant-a", "payments"));
+        assert!(!namespace_allowed_for(Some(raw), "tenant-a", "other"));
+        assert!(namespace_allowed_for(
+            Some(raw),
+            "tenant-b",
+            "shared-observability"
+        ));
+    }
+
+    #[test]
+    fn malformed_or_missing_policy_denies() {
+        assert!(parse_namespace_policy(None).is_none());
+        assert!(!namespace_allowed_for(
+            Some("not-json"),
+            "tenant-a",
+            "payments"
+        ));
+    }
+
+    #[test]
+    fn cluster_scope_requires_the_admin_switch_and_scope() {
+        assert!(!cluster_scope_allowed_for(&["all".to_string()], true));
+        assert!(!cluster_scope_allowed_for(
+            &["kube_cluster".to_string()],
+            false
+        ));
+        assert!(cluster_scope_allowed_for(
+            &["all".to_string(), "kube_cluster".to_string()],
+            true
+        ));
     }
 }
 

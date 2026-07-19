@@ -11,7 +11,7 @@
 //!
 //! REQUIREMENTS to actually RUN (not needed to build):
 //!   - a live ClickHouse populated with telemetry (CLICKHOUSE_URL/USER/PASSWORD/DATABASE)
-//!   - LLM_API_KEY (+ optional LLM_BASE_URL / LLM_MODEL) for both the agent and the judge
+//!   - OPENAI_API_KEY (+ optional OPENAI_BASE_URL) for both the agent and the judge
 //!
 //! Usage:
 //!   sre_evals run [--cases evals/cases.yaml] [--limit N] [--out evals/out]
@@ -153,7 +153,7 @@ fn print_usage() {
          \x20 sre_evals convert-rcaeval <labels-file.csv|json>\n\
          \x20 sre_evals convert-openrca <labels-file.json>\n\n\
          Defaults: --cases evals/cases.yaml  --out evals/out\n\
-         RUN requires a live ClickHouse and LLM_API_KEY in the environment."
+         RUN requires a live ClickHouse and OPENAI_API_KEY in the environment."
     );
 }
 
@@ -250,7 +250,7 @@ async fn run_command(args: &[String]) -> Result<()> {
 
     // ── Construct shared state once (same env-driven wiring as main.rs) ──
     let state = build_app_state().await.context("building AppState")?;
-    let llm = LlmConfig::from_env().context("building LlmConfig (LLM_API_KEY required)")?;
+    let llm = LlmConfig::from_env().context("building LlmConfig (OPENAI_API_KEY required)")?;
 
     let run_id = std::env::var("SRE_EVALS_RUN_ID")
         .ok()

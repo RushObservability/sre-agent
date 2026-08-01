@@ -1,4 +1,5 @@
 pub mod built_in;
+pub mod contracts;
 pub mod loop_runner;
 pub mod memory;
 pub mod prompt;

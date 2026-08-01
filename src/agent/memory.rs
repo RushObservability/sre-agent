@@ -1,5 +1,16 @@
+use crate::agent::contracts::{
+    EvidencePolarity, InvestigationWindow, ResultQuality, ResultStatus, ToolResultEnvelope,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+
+pub const CURRENT_MEMORY_SCHEMA_VERSION: u32 = 3;
+const LEGACY_MEMORY_SCHEMA_VERSION: u32 = 1;
+const DEFAULT_PROMPT_MEMORY_LIMIT: usize = 12_000;
+
+fn legacy_memory_schema_version() -> u32 {
+    LEGACY_MEMORY_SCHEMA_VERSION
+}
 
 /// Working memory — distilled facts that survive aggressive transcript compaction.
 /// Based on Raschka's two-layer memory pattern: transcript is for prompt reconstruction,
@@ -7,44 +18,147 @@ use std::collections::HashSet;
 ///
 /// Serializable to JSON so it can be persisted across investigation turns in the
 /// `investigation_sessions.working_memory` column.
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkingMemory {
+    /// Version of this persisted object, not the database row version.
+    /// Missing values are treated as the pre-versioning schema and migrated
+    /// explicitly by `from_json`.
+    #[serde(default = "legacy_memory_schema_version")]
+    pub schema_version: u32,
+    #[serde(default)]
     pub task: String,
+    #[serde(default)]
     pub suspect_services: Vec<String>, // LRU, max 8
-    pub confirmed_facts: Vec<String>,  // max 10
-    pub ruled_out: Vec<String>,        // max 10
+    #[serde(default)]
+    pub confirmed_facts: Vec<String>, // max 10
+    #[serde(default)]
+    pub ruled_out: Vec<String>, // max 10
     #[serde(skip)]
     pub recent_tool_calls: Vec<CallSignature>, // transient: per-turn repeat detection
     #[serde(skip)]
     pub consecutive_empty_results: u32, // transient: per-turn dead-end detection
     /// Hypotheses we explored and ruled out (LRU, max 5). Used to discourage
     /// re-exploring dead ends across escalation rounds.
+    #[serde(default)]
     pub failed_hypotheses: Vec<String>,
     /// Dead-end escalation level.
     ///   0 = initial investigation
     ///   1 = nudged to try alternative tool categories
     ///   2 = nudged to check dependency graph / widen window
     ///   3+ = force preliminary report
+    #[serde(default)]
     pub escalation_level: u32,
     /// Signal types that have produced real data in this investigation (e.g.
     /// "logs", "traces", "metrics", "kubernetes", "deploys"). Persisted across
     /// turns so the root-cause gate can require cross-signal confirmation.
     /// LRU-capped at 10.
+    #[serde(default)]
     pub signals_consulted: Vec<String>,
     /// Concrete result-backed evidence records. These are intentionally
     /// compact so they can survive persisted-session compaction while still
     /// giving the root-cause gate something stronger than a tool-call count.
     #[serde(default)]
     pub evidence: Vec<EvidenceItem>,
+    /// Exact effective incident/baseline contract for the active turn.
+    #[serde(default)]
+    pub window: Option<InvestigationWindow>,
+    /// Structured hypotheses are persisted in PR1 even though the causal gate
+    /// remains a PR4 concern.
+    #[serde(default)]
+    pub hypotheses: Vec<Hypothesis>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+impl Default for WorkingMemory {
+    fn default() -> Self {
+        Self {
+            schema_version: CURRENT_MEMORY_SCHEMA_VERSION,
+            task: String::new(),
+            suspect_services: Vec::new(),
+            confirmed_facts: Vec::new(),
+            ruled_out: Vec::new(),
+            recent_tool_calls: Vec::new(),
+            consecutive_empty_results: 0,
+            failed_hypotheses: Vec::new(),
+            escalation_level: 0,
+            signals_consulted: Vec::new(),
+            evidence: Vec::new(),
+            window: None,
+            hypotheses: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct EvidenceItem {
     pub id: String,
+    /// Kept for compatibility with the current gate and prompt.
     pub signal: String,
     pub tool: String,
     pub service: String,
     pub summary: String,
+    #[serde(default)]
+    pub source_family: String,
+    #[serde(default)]
+    pub source_tables: Vec<String>,
+    #[serde(default)]
+    pub operation: String,
+    #[serde(default)]
+    pub query_fingerprint: String,
+    #[serde(default)]
+    pub window: Option<InvestigationWindow>,
+    #[serde(default)]
+    pub observation: String,
+    #[serde(default)]
+    pub incident_value: Option<serde_json::Value>,
+    #[serde(default)]
+    pub baseline_value: Option<serde_json::Value>,
+    #[serde(default)]
+    pub delta: Option<serde_json::Value>,
+    #[serde(default)]
+    pub polarity: EvidencePolarity,
+    #[serde(default)]
+    pub quality: ResultQuality,
+    #[serde(default)]
+    pub references: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct Hypothesis {
+    pub id: String,
+    #[serde(default)]
+    pub culprit_service: String,
+    #[serde(default)]
+    pub mechanism: String,
+    #[serde(default)]
+    pub symptom_service: String,
+    #[serde(default)]
+    pub propagation_path: Vec<String>,
+    #[serde(default)]
+    pub expected_if_true: Vec<String>,
+    #[serde(default)]
+    pub expected_if_false: Vec<String>,
+    #[serde(default)]
+    pub supporting_evidence_ids: Vec<String>,
+    #[serde(default)]
+    pub contradicting_evidence_ids: Vec<String>,
+    #[serde(default)]
+    pub discriminating_evidence_ids: Vec<String>,
+    #[serde(default = "default_hypothesis_status")]
+    pub status: String,
+    #[serde(default)]
+    pub confidence: f64,
+    #[serde(default = "default_confidence_band")]
+    pub confidence_band: String,
+    #[serde(default)]
+    pub next_best_test: String,
+}
+
+fn default_hypothesis_status() -> String {
+    "open".into()
+}
+
+fn default_confidence_band() -> String {
+    "low".into()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -59,6 +173,59 @@ impl WorkingMemory {
             task,
             ..Default::default()
         }
+    }
+
+    /// Deserialize and migrate a persisted memory object. The database row
+    /// itself remains tenant-scoped by ConfigDb; this method only handles the
+    /// JSON payload and never changes the owning session or tenant.
+    pub fn from_json(raw: &str) -> Result<Self, String> {
+        let mut memory: Self = serde_json::from_str(raw).map_err(|e| e.to_string())?;
+        memory.migrate().map_err(|e| e.to_string())?;
+        Ok(memory)
+    }
+
+    pub fn migrate(&mut self) -> Result<(), MemoryMigrationError> {
+        if self.schema_version > CURRENT_MEMORY_SCHEMA_VERSION {
+            return Err(MemoryMigrationError::UnsupportedVersion(
+                self.schema_version,
+            ));
+        }
+
+        // Version 1 was the existing free-form memory object. Preserve all
+        // fields, then backfill the structured provenance fields from its
+        // signal/tool pair. This is intentionally deterministic and does not
+        // infer evidence from args or no-data strings.
+        for (index, item) in self.evidence.iter_mut().enumerate() {
+            if item.id.is_empty() {
+                item.id = format!("E{}", index + 1);
+            }
+            if item.source_family.is_empty() {
+                item.source_family = item.signal.clone();
+            }
+            if item.source_tables.is_empty() {
+                item.source_tables = legacy_source_tables(&item.signal);
+            }
+            if item.observation.is_empty() {
+                item.observation = item.summary.clone();
+            }
+            if item.quality.reasons.is_empty() {
+                item.quality = ResultQuality::legacy();
+            }
+        }
+        for hypothesis in &mut self.hypotheses {
+            keep_recent(&mut hypothesis.supporting_evidence_ids, 20);
+            keep_recent(&mut hypothesis.contradicting_evidence_ids, 20);
+            keep_recent(&mut hypothesis.discriminating_evidence_ids, 20);
+            normalize_hypothesis(hypothesis);
+        }
+        keep_recent(&mut self.suspect_services, 8);
+        keep_recent(&mut self.confirmed_facts, 10);
+        keep_recent(&mut self.ruled_out, 10);
+        keep_recent(&mut self.failed_hypotheses, 5);
+        keep_recent(&mut self.signals_consulted, 10);
+        keep_recent(&mut self.evidence, 20);
+        self.schema_version = CURRENT_MEMORY_SCHEMA_VERSION;
+        Ok(())
     }
 
     /// LRU insert: remove existing, push to end, cap size.
@@ -117,16 +284,126 @@ impl WorkingMemory {
         }
         let summary = crate::agent::memory::truncate_at_char_boundary(&summary, 360).to_string();
         let item = EvidenceItem {
-            id: format!("E{}", self.evidence.len() + 1),
+            id: self.next_evidence_id(),
             signal: signal.to_string(),
             tool: tool.to_string(),
             service: service.to_string(),
             summary,
+            source_family: signal.to_string(),
+            source_tables: legacy_source_tables(signal),
+            operation: String::new(),
+            query_fingerprint: String::new(),
+            window: self.window.clone(),
+            observation: String::new(),
+            incident_value: None,
+            baseline_value: None,
+            delta: None,
+            polarity: EvidencePolarity::Neutral,
+            quality: ResultQuality::legacy(),
+            references: Vec::new(),
         };
         self.evidence.push(item);
         if self.evidence.len() > 20 {
             self.evidence.drain(..self.evidence.len() - 20);
         }
+    }
+
+    /// Add evidence only from a validated positive result envelope. `no_data`,
+    /// access-denied, and error results are intentionally excluded.
+    pub fn add_evidence_from_envelope(
+        &mut self,
+        tool: &str,
+        envelope: &ToolResultEnvelope,
+    ) -> bool {
+        if !envelope.is_positive_evidence() {
+            return false;
+        }
+        let source_family = serde_json::to_value(&envelope.source_family)
+            .ok()
+            .and_then(|v| v.as_str().map(ToOwned::to_owned))
+            .unwrap_or_else(|| "unknown".into());
+        let item = EvidenceItem {
+            id: self.next_evidence_id(),
+            signal: source_family.clone(),
+            tool: tool.to_string(),
+            service: envelope.service.clone(),
+            summary: truncate_at_char_boundary(&envelope.summary, 360).to_string(),
+            source_family,
+            source_tables: envelope.source_tables.clone(),
+            operation: envelope.operation.clone(),
+            query_fingerprint: envelope.query_fingerprint.clone(),
+            window: envelope.window.clone(),
+            observation: truncate_at_char_boundary(&envelope.summary, 360).to_string(),
+            incident_value: envelope.incident_value.clone(),
+            baseline_value: envelope.baseline_value.clone(),
+            delta: envelope.absolute_delta.clone(),
+            polarity: EvidencePolarity::Neutral,
+            quality: envelope.quality.clone(),
+            references: envelope.references.clone(),
+        };
+        self.evidence.push(item);
+        if self.evidence.len() > 20 {
+            self.evidence.drain(..self.evidence.len() - 20);
+        }
+        true
+    }
+
+    /// Persist a model-declared hypothesis update. The model may propose the
+    /// state, but IDs and evidence links are normalized and validated here so
+    /// the causal gate never trusts an unbounded or unknown reference.
+    pub fn upsert_hypothesis(&mut self, mut hypothesis: Hypothesis) {
+        normalize_hypothesis(&mut hypothesis);
+        if hypothesis.id.is_empty() {
+            return;
+        }
+        if let Some(existing) = self
+            .hypotheses
+            .iter_mut()
+            .find(|item| item.id == hypothesis.id)
+        {
+            *existing = hypothesis;
+        } else {
+            self.hypotheses.push(hypothesis);
+        }
+        if self.hypotheses.len() > 12 {
+            self.hypotheses.drain(..self.hypotheses.len() - 12);
+        }
+        self.apply_evidence_polarity();
+    }
+
+    /// Apply hypothesis links to the validated evidence ledger. A single
+    /// evidence item can support one hypothesis and contradict another; in
+    /// that ambiguous aggregate case the item-level polarity is neutral and
+    /// the per-hypothesis links remain authoritative.
+    pub fn apply_evidence_polarity(&mut self) {
+        let mut supporting = HashSet::new();
+        let mut contradicting = HashSet::new();
+        for hypothesis in &self.hypotheses {
+            supporting.extend(hypothesis.supporting_evidence_ids.iter().cloned());
+            contradicting.extend(hypothesis.contradicting_evidence_ids.iter().cloned());
+        }
+        for evidence in &mut self.evidence {
+            evidence.polarity = match (
+                supporting.contains(&evidence.id),
+                contradicting.contains(&evidence.id),
+            ) {
+                (true, false) => EvidencePolarity::Supports,
+                (false, true) => EvidencePolarity::Contradicts,
+                _ => EvidencePolarity::Neutral,
+            };
+        }
+    }
+
+    fn next_evidence_id(&self) -> String {
+        let next = self
+            .evidence
+            .iter()
+            .filter_map(|item| item.id.strip_prefix('E'))
+            .filter_map(|value| value.parse::<u32>().ok())
+            .max()
+            .unwrap_or(0)
+            + 1;
+        format!("E{next}")
     }
 
     /// Number of distinct signal types that have returned real data.
@@ -152,8 +429,22 @@ impl WorkingMemory {
         }
     }
 
-    /// Render working memory as a compact string for prompt injection.
+    /// Render working memory as a bounded string for prompt injection.
     pub fn to_prompt_block(&self) -> String {
+        self.to_prompt_block_with_limit(DEFAULT_PROMPT_MEMORY_LIMIT)
+    }
+
+    pub fn to_prompt_block_with_limit(&self, limit: usize) -> String {
+        let block = self.render_prompt_block();
+        if block.len() <= limit {
+            return block;
+        }
+        let suffix = "\n...[working memory truncated]";
+        let head = truncate_at_char_boundary(&block, limit.saturating_sub(suffix.len()));
+        format!("{head}{suffix}")
+    }
+
+    fn render_prompt_block(&self) -> String {
         let mut out = String::from("## Working Memory\n");
         if !self.task.is_empty() {
             out.push_str(&format!("**Task**: {}\n", self.task));
@@ -163,6 +454,37 @@ impl WorkingMemory {
                 "**Suspect services**: {}\n",
                 self.suspect_services.join(", ")
             ));
+        }
+        if !self.hypotheses.is_empty() {
+            out.push_str("**Active hypotheses:**\n");
+            for hypothesis in self
+                .hypotheses
+                .iter()
+                .filter(|h| h.status != "refuted")
+                .take(6)
+            {
+                let path = if hypothesis.propagation_path.is_empty() {
+                    String::new()
+                } else {
+                    format!(" path={}", hypothesis.propagation_path.join(" -> "))
+                };
+                out.push_str(&format!(
+                    "- [{}] {} / {} status={} confidence={} next_test={}{}\n",
+                    hypothesis.id,
+                    hypothesis.culprit_service,
+                    hypothesis.mechanism,
+                    hypothesis.status,
+                    hypothesis.confidence_band,
+                    hypothesis.next_best_test,
+                    path
+                ));
+                if !hypothesis.contradicting_evidence_ids.is_empty() {
+                    out.push_str(&format!(
+                        "  contradictions={}\n",
+                        hypothesis.contradicting_evidence_ids.join(", ")
+                    ));
+                }
+            }
         }
         if !self.confirmed_facts.is_empty() {
             out.push_str("**Confirmed facts**:\n");
@@ -226,6 +548,60 @@ impl WorkingMemory {
     }
 }
 
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum MemoryMigrationError {
+    #[error(
+        "unsupported working memory schema version {0}; newest supported version is {CURRENT_MEMORY_SCHEMA_VERSION}"
+    )]
+    UnsupportedVersion(u32),
+}
+
+fn legacy_source_tables(signal: &str) -> Vec<String> {
+    match signal {
+        "logs" => vec!["logs".into()],
+        "traces" | "metrics" => vec!["spans".into()],
+        "kubernetes" => vec!["kubernetes_api".into()],
+        "deploys" => vec!["config_deploys".into()],
+        "repository" => vec!["repository_api".into()],
+        _ => Vec::new(),
+    }
+}
+
+fn normalize_hypothesis(hypothesis: &mut Hypothesis) {
+    hypothesis.status = match hypothesis.status.to_ascii_lowercase().as_str() {
+        "supported" => "supported",
+        "refuted" => "refuted",
+        "inconclusive" => "inconclusive",
+        _ => "open",
+    }
+    .into();
+    hypothesis.confidence = hypothesis.confidence.clamp(0.0, 1.0);
+    hypothesis.confidence_band = match hypothesis.confidence_band.to_ascii_lowercase().as_str() {
+        "high" => "high",
+        "medium" | "med" => "medium",
+        _ => "low",
+    }
+    .into();
+    for values in [
+        &mut hypothesis.propagation_path,
+        &mut hypothesis.expected_if_true,
+        &mut hypothesis.expected_if_false,
+        &mut hypothesis.supporting_evidence_ids,
+        &mut hypothesis.contradicting_evidence_ids,
+        &mut hypothesis.discriminating_evidence_ids,
+    ] {
+        values.retain(|value| !value.trim().is_empty());
+        values.truncate(20);
+    }
+}
+
+fn keep_recent<T>(items: &mut Vec<T>, limit: usize) {
+    if items.len() > limit {
+        let keep_from = items.len() - limit;
+        items.drain(..keep_from);
+    }
+}
+
 /// Normalize args into a stable string for repeat detection.
 /// Collapses equivalent queries (sorted keys, whitespace removed).
 pub fn normalize_args(args: &serde_json::Value) -> String {
@@ -275,16 +651,26 @@ pub fn extract_facts_from_tool_result(
 ) -> ExtractedFacts {
     let mut out = ExtractedFacts::default();
 
-    // Service extraction from args
-    if let Some(svc) = args.get("service").and_then(|v| v.as_str())
-        && !svc.is_empty()
-    {
-        out.services.insert(svc.to_string());
-    }
-    if let Some(svc) = args.get("service_name").and_then(|v| v.as_str())
-        && !svc.is_empty()
-    {
-        out.services.insert(svc.to_string());
+    // PR2 causal tools return the PR1 envelope with a `data` member. Only
+    // positive structured results can create facts/evidence; arguments alone
+    // still never enter working memory.
+    if let Ok(envelope) = serde_json::from_str::<ToolResultEnvelope>(result) {
+        if envelope.is_positive_evidence() {
+            if !envelope.service.is_empty() {
+                out.services.insert(envelope.service.clone());
+            } else if let Some(service) = args
+                .get("service")
+                .or_else(|| args.get("service_name"))
+                .and_then(|value| value.as_str())
+                && !service.is_empty()
+            {
+                out.services.insert(service.to_string());
+            }
+        }
+        out.summary = (!envelope.summary.is_empty()).then_some(envelope.summary.clone());
+        out.empty_result = matches!(envelope.status, ResultStatus::NoData);
+        out.has_data = envelope.is_positive_evidence();
+        return out;
     }
 
     // Detect empty/no-data/blocked results. A successful HTTP response that
@@ -301,7 +687,24 @@ pub fn extract_facts_from_tool_result(
     {
         out.empty_result = true;
     }
-    let blocked = low.starts_with("access denied") || low.starts_with("tool error:");
+    let blocked = low.starts_with("access denied")
+        || low.starts_with("tool error:")
+        || low.starts_with("error:");
+
+    // Service arguments become suspects only after a result has produced
+    // usable data. Arguments alone are never evidence or suspect attribution.
+    if !blocked && !out.empty_result {
+        if let Some(svc) = args.get("service").and_then(|v| v.as_str())
+            && !svc.is_empty()
+        {
+            out.services.insert(svc.to_string());
+        }
+        if let Some(svc) = args.get("service_name").and_then(|v| v.as_str())
+            && !svc.is_empty()
+        {
+            out.services.insert(svc.to_string());
+        }
+    }
 
     // Tool-specific summarization
     match tool_name {
@@ -438,8 +841,16 @@ pub fn clip_tool_result(tool_name: &str, result: &str) -> String {
         "kube_describe" => 2500,
         "kube_events" => 2500,
         "load_skill" => 6000, // skills are intentional content
+        "compare_service_windows" | "rank_slow_dependencies" => 12_000,
         _ => 2000,
     };
+
+    if matches!(
+        tool_name,
+        "compare_service_windows" | "rank_slow_dependencies"
+    ) {
+        return clip_structured_tool_result(result, limit);
+    }
 
     if result.len() <= limit {
         return result.to_string();
@@ -450,6 +861,45 @@ pub fn clip_tool_result(tool_name: &str, result: &str) -> String {
         head,
         result.len() - head.len()
     )
+}
+
+/// Keep causal results valid JSON while bounding large endpoint/edge arrays.
+/// A byte slice would destroy the PR1 envelope and make provenance impossible
+/// to recover in the streaming layer.
+fn clip_structured_tool_result(result: &str, limit: usize) -> String {
+    if result.len() <= limit {
+        return result.to_string();
+    }
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(result) else {
+        return clip_tool_result("unknown", result);
+    };
+    if let Some(data) = value
+        .get_mut("data")
+        .and_then(|value| value.as_object_mut())
+    {
+        for key in ["services", "client_wait", "endpoints", "dependencies"] {
+            if let Some(items) = data.get_mut(key).and_then(|value| value.as_array_mut()) {
+                let cap = match key {
+                    "endpoints" => 20,
+                    "dependencies" => 20,
+                    _ => 20,
+                };
+                items.truncate(cap);
+            }
+        }
+        data.insert("truncated".into(), serde_json::Value::Bool(true));
+    }
+    let compact = serde_json::to_string(&value).unwrap_or_else(|_| result.to_string());
+    if compact.len() <= limit {
+        return compact;
+    }
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "data".into(),
+            serde_json::json!({"truncated": true, "reason": "prompt size budget"}),
+        );
+    }
+    serde_json::to_string(&value).unwrap_or_else(|_| result.to_string())
 }
 
 /// Truncate `s` to at most `max` bytes without splitting a multi-byte
@@ -702,6 +1152,35 @@ mod tests {
     }
 
     #[test]
+    fn tool_arguments_do_not_create_suspects_for_no_data() {
+        let facts = extract_facts_from_tool_result(
+            "query_traces",
+            &json!({"service": "checkout"}),
+            "No spans found.",
+        );
+        assert!(facts.services.is_empty());
+        assert!(!facts.has_data);
+    }
+
+    #[test]
+    fn structured_causal_results_are_clipped_without_breaking_json() {
+        let result = serde_json::json!({
+            "status":"ok",
+            "source_family":"traces",
+            "source_tables":["spans"],
+            "window": null,
+            "quality":{"band":"medium","reasons":[]},
+            "summary":"comparison",
+            "data":{"endpoints":(0..1000).map(|i| serde_json::json!({"endpoint": i})).collect::<Vec<_>>()}
+        })
+        .to_string();
+        let clipped = clip_tool_result("compare_service_windows", &result);
+        let parsed: serde_json::Value = serde_json::from_str(&clipped).unwrap();
+        assert_eq!(parsed["data"]["truncated"], true);
+        assert!(parsed["data"]["endpoints"].as_array().unwrap().len() <= 20);
+    }
+
+    #[test]
     fn extract_facts_metrics_summary() {
         let args = json!({"service": "api", "metric": "error_rate"});
         let result =
@@ -811,5 +1290,125 @@ mod tests {
             assert!(head.len() <= 1500);
             assert!(long.starts_with(head));
         }
+    }
+
+    // ── PR1 memory schema and provenance ──
+
+    #[test]
+    fn migrates_current_unversioned_memory_and_backfills_provenance() {
+        let raw = r#"{
+            "task":"investigate api",
+            "suspect_services":["api"],
+            "confirmed_facts":["trace latency increased"],
+            "ruled_out":[],
+            "failed_hypotheses":[],
+            "escalation_level":0,
+            "signals_consulted":["traces"],
+            "evidence":[{
+                "id":"E1",
+                "signal":"traces",
+                "tool":"query_traces",
+                "service":"api",
+                "summary":"p99 increased"
+            }]
+        }"#;
+        let memory = WorkingMemory::from_json(raw).unwrap();
+        assert_eq!(memory.schema_version, CURRENT_MEMORY_SCHEMA_VERSION);
+        assert_eq!(memory.task, "investigate api");
+        assert_eq!(memory.evidence[0].source_family, "traces");
+        assert_eq!(memory.evidence[0].source_tables, vec!["spans"]);
+        assert_eq!(memory.evidence[0].observation, "p99 increased");
+    }
+
+    #[test]
+    fn rejects_memory_from_a_newer_schema() {
+        let raw = r#"{"schema_version":99,"task":"future"}"#;
+        let err = WorkingMemory::from_json(raw).unwrap_err();
+        assert!(err.contains("unsupported working memory schema version 99"));
+    }
+
+    #[test]
+    fn serialized_memory_contains_schema_version() {
+        let memory = WorkingMemory::new("task".into());
+        let json = serde_json::to_value(&memory).unwrap();
+        assert_eq!(json["schema_version"], CURRENT_MEMORY_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn only_positive_envelopes_enter_evidence_ledger() {
+        let mut memory = WorkingMemory::new("task".into());
+        let no_data = ToolResultEnvelope::from_legacy(
+            "query_traces",
+            &serde_json::json!({"service":"api"}),
+            "No spans found.",
+            None,
+        );
+        assert!(!memory.add_evidence_from_envelope("query_traces", &no_data));
+        assert!(memory.evidence.is_empty());
+
+        let ok = ToolResultEnvelope::from_legacy(
+            "query_traces",
+            &serde_json::json!({"service":"api"}),
+            "Found 4 spans",
+            Some("Found 4 spans; Latency: 900ms"),
+        );
+        assert!(memory.add_evidence_from_envelope("query_traces", &ok));
+        assert_eq!(memory.evidence.len(), 1);
+        assert_eq!(memory.evidence[0].source_tables, vec!["spans"]);
+    }
+
+    #[test]
+    fn hypothesis_relationships_preserve_cross_hypothesis_conflict() {
+        let mut memory = WorkingMemory::new("task".into());
+        memory.add_evidence("logs", "search_logs", "api", "connection refused".into());
+        memory.upsert_hypothesis(Hypothesis {
+            id: "H1".into(),
+            culprit_service: "api".into(),
+            mechanism: "error regression".into(),
+            symptom_service: "api".into(),
+            supporting_evidence_ids: vec!["E1".into()],
+            ..Default::default()
+        });
+        memory.upsert_hypothesis(Hypothesis {
+            id: "H2".into(),
+            culprit_service: "db".into(),
+            mechanism: "database failure".into(),
+            symptom_service: "api".into(),
+            contradicting_evidence_ids: vec!["E1".into()],
+            ..Default::default()
+        });
+
+        assert_eq!(memory.hypotheses[0].supporting_evidence_ids, vec!["E1"]);
+        assert_eq!(memory.hypotheses[1].contradicting_evidence_ids, vec!["E1"]);
+        assert_eq!(memory.evidence[0].polarity, EvidencePolarity::Neutral);
+    }
+
+    #[test]
+    fn bounded_prompt_prioritizes_active_hypotheses() {
+        let mut memory = WorkingMemory::new("task".into());
+        memory.hypotheses.push(Hypothesis {
+            id: "H1".into(),
+            culprit_service: "media".into(),
+            mechanism: "cpu_throttling".into(),
+            symptom_service: "gateway".into(),
+            propagation_path: vec!["media".into(), "gateway".into()],
+            expected_if_true: vec!["throttling rises".into()],
+            expected_if_false: vec![],
+            supporting_evidence_ids: vec![],
+            contradicting_evidence_ids: vec!["E9".into()],
+            discriminating_evidence_ids: vec!["E10".into()],
+            status: "open".into(),
+            confidence: 0.4,
+            confidence_band: "low".into(),
+            next_best_test: "compare media resource metrics".into(),
+        });
+        for _ in 0..50 {
+            memory.add_fact("large fact ".repeat(50));
+        }
+        let block = memory.to_prompt_block_with_limit(500);
+        assert!(block.len() <= 500);
+        assert!(block.contains("Active hypotheses"));
+        assert!(block.contains("media"));
+        assert!(block.contains("contradictions=E9"));
     }
 }

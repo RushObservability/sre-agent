@@ -1,5 +1,7 @@
 use serde::Serialize;
 
+use crate::agent::contracts::ToolResultEnvelope;
+
 /// Whether an investigation report is a final root-cause analysis, a
 /// preliminary set of findings with open questions, or a clarifying
 /// question the agent is posing back to the user.
@@ -23,7 +25,11 @@ pub enum AgentEvent {
         args: serde_json::Value,
     },
     #[serde(rename = "tool_result")]
-    ToolResult { name: String, data: String },
+    ToolResult {
+        name: String,
+        data: String,
+        provenance: ToolResultEnvelope,
+    },
     #[serde(rename = "summary")]
     Summary {
         text: String,
@@ -93,6 +99,12 @@ mod tests {
         let out = as_string(AgentEvent::ToolResult {
             name: "search_logs".into(),
             data: "Found 10 logs".into(),
+            provenance: ToolResultEnvelope::from_legacy(
+                "search_logs",
+                &json!({}),
+                "Found 10 logs",
+                None,
+            ),
         });
         assert!(out.contains(r#""type":"tool_result""#));
         assert!(out.contains("Found 10 logs"));

@@ -1,3 +1,4 @@
+mod advanced_analysis;
 mod anomalies;
 mod argocd_tool;
 mod deploys;
@@ -7,6 +8,7 @@ mod logs;
 mod metrics;
 mod past_incidents;
 mod repository_tools;
+mod service_analysis;
 mod services;
 mod skills_tool;
 mod traces;
@@ -23,6 +25,12 @@ pub fn register_all(registry: &mut ToolRegistry) {
         Arc::new(metrics::QueryMetrics),
         Arc::new(services::ListServices),
         Arc::new(services::ServiceDependencies),
+        Arc::new(service_analysis::CompareServiceWindows),
+        Arc::new(service_analysis::RankSlowDependencies),
+        Arc::new(advanced_analysis::AnalyzeTraceCriticalPath),
+        Arc::new(advanced_analysis::GetResourceSaturation),
+        Arc::new(advanced_analysis::ListMetricCatalog),
+        Arc::new(advanced_analysis::DetectServiceSilence),
         Arc::new(deploys::ListDeploys),
         Arc::new(anomalies::GetAnomalyContext),
         Arc::new(past_incidents::SearchPastIncidents),

@@ -3,8 +3,8 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 
 use super::memory::{
-    CallSignature, WorkingMemory, clip_tool_result, extract_facts_from_tool_result, normalize_args,
-    truncate_at_char_boundary,
+    CallSignature, EvidenceItem, Hypothesis, WorkingMemory, clip_tool_result,
+    extract_facts_from_tool_result, normalize_args, truncate_at_char_boundary,
 };
 use super::stream::{AgentEvent, ReportKind};
 use super::tools::{ToolContext, ToolRegistry};
@@ -85,9 +85,9 @@ const MIN_SIGNAL_TYPES: usize = 2;
 const MAX_GATE_REJECTIONS: u32 = 3;
 
 /// Decide whether a given investigation state represents a final or
-/// preliminary report. A final report requires an unescalated run with
-/// confirmed facts, suspect services, and multi-signal evidence. Anything
-/// less rigorous is surfaced as preliminary so the user knows to follow up.
+/// preliminary report. The causal gate is intentionally deterministic: model
+/// prose can propose hypotheses and links, but it cannot bypass missing
+/// evidence, contradictions, propagation, or report citations.
 fn decide_report_kind(
     memory: &WorkingMemory,
     content: &str,
@@ -101,10 +101,7 @@ fn decide_report_kind(
     }
 
     if memory.escalation_level < 2
-        && memory.evidence.len() >= 2
-        && !memory.suspect_services.is_empty()
-        && memory.unique_signal_count() >= MIN_SIGNAL_TYPES
-        && tool_steps >= min_depth
+        && root_cause_gate(memory, content, tool_steps, min_depth).is_none()
     {
         ReportKind::Final
     } else {
@@ -116,8 +113,15 @@ fn decide_report_kind(
 fn tool_signal_type(tool_name: &str) -> Option<&'static str> {
     match tool_name {
         "search_logs" => Some("logs"),
-        "query_traces" | "get_trace" | "list_services" | "service_dependencies" => Some("traces"),
-        "query_metrics" => Some("metrics"),
+        "query_traces"
+        | "get_trace"
+        | "list_services"
+        | "service_dependencies"
+        | "compare_service_windows"
+        | "rank_slow_dependencies"
+        | "analyze_trace_critical_path"
+        | "detect_service_silence" => Some("traces"),
+        "query_metrics" | "get_resource_saturation" | "list_metric_catalog" => Some("metrics"),
         "kube_describe" | "kube_events" | "get_argocd_app" | "get_flux_resource" => {
             Some("kubernetes")
         }
@@ -130,6 +134,11 @@ fn tool_signal_type(tool_name: &str) -> Option<&'static str> {
 /// durable ledger. This is intentionally conservative: only content under a
 /// heading/label that mentions ruled-out or refuted alternatives is recorded.
 fn capture_report_state(memory: &mut WorkingMemory, content: &str) {
+    for line in content.lines() {
+        if let Some(hypothesis) = parse_hypothesis_line(line) {
+            memory.upsert_hypothesis(hypothesis);
+        }
+    }
     let mut in_ruled_out = false;
     for raw_line in content.lines() {
         let line = raw_line.trim();
@@ -162,6 +171,116 @@ fn capture_report_state(memory: &mut WorkingMemory, content: &str) {
     }
 }
 
+/// Parse the compact, machine-readable ledger line required by the prompt:
+/// `HYPOTHESIS H1 | culprit=media | mechanism=cpu throttling | ...`.
+/// A markdown-table fallback is accepted for compatibility with older model
+/// responses, but the key/value form is preferred because it is unambiguous.
+fn parse_hypothesis_line(line: &str) -> Option<Hypothesis> {
+    let trimmed = line.trim();
+    let fields: Vec<&str> = if let Some(rest) = trimmed.strip_prefix("HYPOTHESIS ") {
+        rest.split('|').map(str::trim).collect()
+    } else if trimmed.starts_with('|') && trimmed.ends_with('|') {
+        trimmed
+            .trim_matches('|')
+            .split('|')
+            .map(str::trim)
+            .collect()
+    } else {
+        return None;
+    };
+    let id = fields.first()?.trim();
+    if !id.starts_with('H') || !id[1..].chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    let mut hypothesis = Hypothesis {
+        id: id.to_string(),
+        culprit_service: String::new(),
+        mechanism: String::new(),
+        symptom_service: String::new(),
+        propagation_path: Vec::new(),
+        expected_if_true: Vec::new(),
+        expected_if_false: Vec::new(),
+        supporting_evidence_ids: Vec::new(),
+        contradicting_evidence_ids: Vec::new(),
+        discriminating_evidence_ids: Vec::new(),
+        status: "open".into(),
+        confidence: 0.0,
+        confidence_band: "low".into(),
+        next_best_test: String::new(),
+    };
+    let key_value_form = fields.iter().skip(1).any(|field| field.contains('='));
+    if key_value_form {
+        for field in fields.iter().skip(1) {
+            let Some((key, value)) = field.split_once('=') else {
+                continue;
+            };
+            let value = value.trim();
+            match key.trim().to_ascii_lowercase().as_str() {
+                "culprit" | "culprit_service" => hypothesis.culprit_service = value.into(),
+                "mechanism" => hypothesis.mechanism = value.into(),
+                "symptom" | "symptom_service" => hypothesis.symptom_service = value.into(),
+                "path" | "propagation_path" => {
+                    hypothesis.propagation_path = value
+                        .split("->")
+                        .map(|item| item.trim().to_string())
+                        .filter(|item| !item.is_empty())
+                        .collect()
+                }
+                "status" => hypothesis.status = value.into(),
+                "supports" | "supporting" => {
+                    hypothesis.supporting_evidence_ids = parse_evidence_ids(value)
+                }
+                "contradicts" | "contradicting" => {
+                    hypothesis.contradicting_evidence_ids = parse_evidence_ids(value)
+                }
+                "discriminates" | "discriminating" => {
+                    hypothesis.discriminating_evidence_ids = parse_evidence_ids(value)
+                }
+                "confidence" => {
+                    hypothesis.confidence_band = value.into();
+                    hypothesis.confidence = match value.to_ascii_lowercase().as_str() {
+                        "high" => 0.85,
+                        "medium" | "med" => 0.6,
+                        _ => 0.25,
+                    };
+                }
+                "confidence_score" => hypothesis.confidence = value.parse().unwrap_or(0.0),
+                "next_test" | "next_best_test" => hypothesis.next_best_test = value.into(),
+                _ => {}
+            }
+        }
+    } else if fields.len() >= 6 {
+        // Legacy table: ID | hypothesis | status | support IDs | contradiction IDs | confidence
+        let description = fields[1];
+        hypothesis.mechanism = description.into();
+        hypothesis.culprit_service = description
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .into();
+        hypothesis.status = fields[2].into();
+        hypothesis.supporting_evidence_ids = parse_evidence_ids(fields[3]);
+        hypothesis.contradicting_evidence_ids = parse_evidence_ids(fields[4]);
+        hypothesis.confidence_band = fields[5].into();
+        hypothesis.confidence = match fields[5].to_ascii_lowercase().as_str() {
+            "high" => 0.85,
+            "medium" | "med" => 0.6,
+            _ => 0.25,
+        };
+    }
+    Some(hypothesis)
+}
+
+fn parse_evidence_ids(value: &str) -> Vec<String> {
+    value
+        .replace(['[', ']', '(', ')'], "")
+        .split([',', ';', ' '])
+        .map(str::trim)
+        .filter(|item| item.starts_with('E') && item[1..].chars().all(|ch| ch.is_ascii_digit()))
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
 fn is_empty_hypothesis(value: &str) -> bool {
     matches!(
         value.to_ascii_lowercase().as_str(),
@@ -169,15 +288,15 @@ fn is_empty_hypothesis(value: &str) -> bool {
     )
 }
 
-/// Root-cause gate: examine the investigation state and return a descriptive
-/// gap message if the agent shouldn't be allowed to conclude yet, or `None`
-/// if the conclusion is sufficiently grounded.
-///
-/// The gate checks three criteria:
-/// 1. Minimum investigation depth (at least MIN_INVESTIGATION_DEPTH real tool steps).
-/// 2. Multi-signal coverage (at least MIN_SIGNAL_TYPES distinct signal types).
-/// 3. Minimum confirmed evidence (at least 2 concrete result-backed records).
-fn root_cause_gate(memory: &WorkingMemory, tool_steps: u32, min_depth: u32) -> Option<String> {
+/// Root-cause gate: examine the investigation state and return structured gap
+/// codes if the agent should remain preliminary. The requirements mirror the
+/// PRD's causal final-report contract.
+fn root_cause_gate(
+    memory: &WorkingMemory,
+    content: &str,
+    tool_steps: u32,
+    min_depth: u32,
+) -> Option<String> {
     let mut gaps: Vec<String> = Vec::new();
 
     if tool_steps < min_depth {
@@ -220,21 +339,220 @@ fn root_cause_gate(memory: &WorkingMemory, tool_steps: u32, min_depth: u32) -> O
         ));
     }
 
+    let supported = memory
+        .hypotheses
+        .iter()
+        .filter(|hypothesis| hypothesis.status == "supported")
+        .max_by(|left, right| left.confidence.total_cmp(&right.confidence));
+    let Some(leading) = supported else {
+        gaps.push(
+            "missing_supported_hypothesis: no supported leading hypothesis is recorded".into(),
+        );
+        return Some(format_gate_gaps(gaps));
+    };
+    if leading.culprit_service.is_empty() {
+        gaps.push(
+            "missing_culprit_service: the leading hypothesis names no culprit service".into(),
+        );
+    }
+    if leading.mechanism.is_empty() {
+        gaps.push(
+            "missing_mechanism_evidence: the leading hypothesis names no specific mechanism".into(),
+        );
+    }
+    if leading.symptom_service.is_empty() {
+        gaps.push("missing_symptom_service: the reported symptom service is not recorded".into());
+    }
+    if leading.propagation_path.len() < 2 && leading.culprit_service != leading.symptom_service {
+        gaps.push(
+            "no_propagation_path: the causal path does not connect culprit to symptom".into(),
+        );
+    }
+    let supporting = linked_evidence(memory, &leading.supporting_evidence_ids);
+    if supporting.is_empty() {
+        gaps.push(
+            "missing_mechanism_evidence: the leading hypothesis has no valid supporting evidence"
+                .into(),
+        );
+    }
+    if !supporting.iter().any(|item| has_material_change(item)) {
+        gaps.push("no_baseline_delta: supporting evidence contains no typed incident-versus-baseline change".into());
+    }
+    if !supporting.iter().any(|item| {
+        service_matches(&item.service, &leading.culprit_service) && has_material_change(item)
+    }) {
+        gaps.push("culprit_symptom_only: the culprit's own telemetry has not changed".into());
+    }
+    if !supporting
+        .iter()
+        .any(|item| mechanism_matches(&leading.mechanism, item))
+    {
+        gaps.push(
+            "missing_mechanism_evidence: no supporting result matches the proposed mechanism"
+                .into(),
+        );
+    }
+    if linked_evidence(memory, &leading.discriminating_evidence_ids).is_empty() {
+        gaps.push("strong_alternative_untested: no discriminating check is linked to the leading hypothesis".into());
+    }
+    if supporting.len() >= 2
+        && !supporting.iter().enumerate().any(|(index, item)| {
+            supporting
+                .iter()
+                .skip(index + 1)
+                .any(|other| evidence_is_independent(item, other))
+        })
+    {
+        gaps.push("same_source_corroboration: supporting evidence does not use independent source families/tables".into());
+    }
+    for evidence_id in &leading.contradicting_evidence_ids {
+        if let Some(item) = memory.evidence.iter().find(|item| &item.id == evidence_id)
+            && item.quality.band == crate::agent::contracts::QualityBand::High
+        {
+            gaps.push(format!("unresolved_contradiction:{evidence_id}"));
+        }
+    }
+    if !supporting
+        .iter()
+        .any(|item| item.window.is_some() && has_material_change(item))
+        || !content.to_ascii_lowercase().contains("onset")
+    {
+        gaps.push("onset_order_invalid: supporting evidence has no bounded incident window".into());
+    }
+    let cited = evidence_ids_in_text(content);
+    if !content_has_required_sections(content) {
+        gaps.push(
+            "report_contract_incomplete: final report is missing one or more required sections"
+                .into(),
+        );
+    }
+    if !leading
+        .supporting_evidence_ids
+        .iter()
+        .all(|id| cited.contains(id))
+    {
+        gaps.push(
+            "missing_evidence_citation: final report does not cite the leading evidence IDs".into(),
+        );
+    }
+
     if gaps.is_empty() {
         return None;
     }
+    Some(format_gate_gaps(gaps))
+}
 
-    Some(format!(
-        "Root cause not yet confirmed. The following evidence gaps remain:\n{}\n\n\
-         Continue the investigation to address these gaps. \
-         You MUST check additional signals before producing a final report. \
-         Do not repeat queries you've already made — try a different service, \
-         time window, or signal type.",
+fn format_gate_gaps(gaps: Vec<String>) -> String {
+    format!(
+        "Root cause not yet confirmed. The following causal evidence gaps remain:\n{}\n\nContinue the investigation; do not label this report Final until each gap is resolved.",
         gaps.iter()
-            .map(|g| format!("- {g}"))
+            .map(|gap| format!("- {gap}"))
             .collect::<Vec<_>>()
             .join("\n")
-    ))
+    )
+}
+
+fn linked_evidence<'a>(memory: &'a WorkingMemory, ids: &[String]) -> Vec<&'a EvidenceItem> {
+    ids.iter()
+        .filter_map(|id| memory.evidence.iter().find(|item| &item.id == id))
+        .collect()
+}
+
+fn service_matches(value: &str, service: &str) -> bool {
+    value.split(',').map(str::trim).any(|item| item == service) || value == service
+}
+
+fn evidence_is_independent(left: &EvidenceItem, right: &EvidenceItem) -> bool {
+    left.source_family != right.source_family
+        && left
+            .source_tables
+            .iter()
+            .all(|table| !right.source_tables.contains(table))
+}
+
+fn has_material_change(item: &EvidenceItem) -> bool {
+    item.delta.as_ref().is_some_and(value_has_material_number)
+        || item.summary.to_ascii_lowercase().contains("increas")
+        || item.summary.to_ascii_lowercase().contains("degrad")
+        || item.summary.to_ascii_lowercase().contains("silence")
+}
+
+fn value_has_material_number(value: &Value) -> bool {
+    match value {
+        Value::Number(number) => number.as_f64().is_some_and(|value| value.abs() > 0.000_001),
+        Value::Array(values) => values.iter().any(value_has_material_number),
+        Value::Object(values) => values.values().any(value_has_material_number),
+        _ => false,
+    }
+}
+
+fn mechanism_matches(mechanism: &str, evidence: &EvidenceItem) -> bool {
+    let mechanism = mechanism.to_ascii_lowercase();
+    let text = format!(
+        "{} {} {}",
+        evidence.tool, evidence.summary, evidence.observation
+    )
+    .to_ascii_lowercase();
+    let families: &[(&str, &[&str])] = &[
+        ("cpu", &["cpu", "throttl", "resource"]),
+        ("memory", &["memory", "oom", "working_set"]),
+        ("oom", &["oom", "memory"]),
+        ("restart", &["restart", "evict", "oom"]),
+        ("silent", &["silence", "detect_service_silence"]),
+        ("down", &["silence", "detect_service_silence"]),
+        (
+            "database",
+            &["dependency", "postgres", "mysql", "database", "db"],
+        ),
+        ("pool", &["pool", "connection", "database"]),
+        ("deploy", &["deploy", "revision"]),
+        ("config", &["config", "setting"]),
+        ("error", &["error", "status"]),
+    ];
+    families.iter().any(|(key, markers)| {
+        mechanism.contains(key) && markers.iter().any(|marker| text.contains(marker))
+    }) || text.contains(&mechanism)
+}
+
+fn evidence_ids_in_text(content: &str) -> std::collections::HashSet<String> {
+    let mut ids = std::collections::HashSet::new();
+    for token in content.split(|ch: char| !ch.is_ascii_alphanumeric()) {
+        if token.starts_with('E')
+            && token.len() > 1
+            && token[1..].chars().all(|ch| ch.is_ascii_digit())
+        {
+            ids.insert(token.to_string());
+        }
+    }
+    ids
+}
+
+fn content_has_required_sections(content: &str) -> bool {
+    let sections = [
+        "status",
+        "root cause",
+        "incident change",
+        "causal path",
+        "evidence",
+        "contradictions",
+        "impact",
+        "recommended actions",
+        "open questions",
+    ];
+    let positions: Option<Vec<usize>> = sections
+        .iter()
+        .map(|section| {
+            content.lines().position(|line| {
+                let heading = line
+                    .trim()
+                    .trim_start_matches('#')
+                    .trim()
+                    .to_ascii_lowercase();
+                heading.starts_with(section)
+            })
+        })
+        .collect();
+    positions.is_some_and(|positions| positions.windows(2).all(|pair| pair[0] < pair[1]))
 }
 
 /// Strip the `[QUESTION]` prefix from content if present, returning the
@@ -665,7 +983,7 @@ async fn run_inner(
             // the gate has rejected MAX_GATE_REJECTIONS times (at which point
             // we surface a Preliminary report rather than looping forever).
             if gate_rejection_count < MAX_GATE_REJECTIONS {
-                if let Some(gap_msg) = root_cause_gate(&memory, tool_steps, min_depth) {
+                if let Some(gap_msg) = root_cause_gate(&memory, &content, tool_steps, min_depth) {
                     gate_rejection_count += 1;
                     messages.push(serde_json::json!({
                         "role": "assistant",
@@ -845,8 +1163,15 @@ async fn run_inner(
 
             // Update working memory from this result (skipped for repeats,
             // matching the previous behavior).
+            let facts = extract_facts_from_tool_result(&tc.name, args, &result);
+            let provenance = crate::agent::contracts::ToolResultEnvelope::from_legacy(
+                &tc.name,
+                args,
+                &result,
+                facts.summary.as_deref(),
+            );
+
             if !matches!(plan, Planned::PrecomputedError(_)) {
-                let facts = extract_facts_from_tool_result(&tc.name, args, &result);
                 for svc in facts.services {
                     memory.add_suspect_service(svc);
                 }
@@ -855,12 +1180,7 @@ async fn run_inner(
                     if facts.has_data {
                         if let Some(sig_type) = tool_signal_type(&tc.name) {
                             memory.record_signal(sig_type);
-                            let service = args
-                                .get("service")
-                                .or_else(|| args.get("service_name"))
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("");
-                            memory.add_evidence(sig_type, &tc.name, service, summary);
+                            let _ = memory.add_evidence_from_envelope(&tc.name, &provenance);
                         }
                     }
                 }
@@ -875,6 +1195,7 @@ async fn run_inner(
                 .send(AgentEvent::ToolResult {
                     name: tc.name.clone(),
                     data: result.clone(),
+                    provenance,
                 })
                 .await;
 
@@ -1148,6 +1469,8 @@ async fn parse_streaming_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::contracts::{InvestigationWindow, WindowSelectionReason};
+    use chrono::{TimeZone, Utc};
     use serde_json::json;
 
     /// Build one investigation round: assistant tool-call message + tool result.
@@ -1301,14 +1624,53 @@ mod tests {
             "api",
             "Found 12 error spans at 10:30".to_string(),
         );
+        let window = InvestigationWindow::new(
+            Utc.with_ymd_and_hms(2026, 8, 1, 10, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 8, 1, 11, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 8, 1, 9, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 8, 1, 10, 0, 0).unwrap(),
+            WindowSelectionReason::UserProvidedRange,
+        )
+        .unwrap();
+        mem.evidence[0].window = Some(window.clone());
+        mem.evidence[0].source_tables = vec!["logs".into()];
+        mem.evidence[0].incident_value = Some(json!({"errors": 5}));
+        mem.evidence[0].baseline_value = Some(json!({"errors": 0}));
+        mem.evidence[0].delta = Some(json!({"errors_delta": 5}));
+        mem.evidence[1].window = Some(window);
+        mem.evidence[1].source_tables = vec!["spans".into()];
+        mem.evidence[1].incident_value = Some(json!({"p99_ms": 900}));
+        mem.evidence[1].baseline_value = Some(json!({"p99_ms": 100}));
+        mem.evidence[1].delta = Some(json!({"p99_delta_ms": 800}));
+        mem.upsert_hypothesis(Hypothesis {
+            id: "H1".into(),
+            culprit_service: "api".into(),
+            mechanism: "error regression".into(),
+            symptom_service: "api".into(),
+            propagation_path: vec!["api".into()],
+            expected_if_true: vec!["errors rise".into()],
+            expected_if_false: vec!["errors remain flat".into()],
+            supporting_evidence_ids: vec!["E1".into(), "E2".into()],
+            contradicting_evidence_ids: vec![],
+            discriminating_evidence_ids: vec!["E2".into()],
+            status: "supported".into(),
+            confidence: 0.8,
+            confidence_band: "high".into(),
+            next_best_test: "check the deploy timeline".into(),
+        });
         mem.add_ruled_out("No matching deploy in the incident window".to_string());
         mem
+    }
+
+    fn valid_report() -> &'static str {
+        "## Status\nFinal — high confidence\n\n## Root Cause\napi error regression began at 10:00 UTC [E1] [E2]\n\n## Incident Change\nerrors and p99 increased versus baseline; onset was 10:00 UTC [E1] [E2]\n\n## Causal Path\napi -> api [E2]\n\n## Evidence\n- [E1] logs show errors\n- [E2] traces show p99 delta\n\n## Contradictions and Alternatives\nNo material contradiction remains; E2 was the discriminating trace check.\n\n## Impact\napi requests failed\n\n## Recommended Actions\nrollback the change\n\n## Open Questions\nNone material."
     }
 
     #[test]
     fn gate_rejects_insufficient_depth_with_step_counts() {
         let mem = satisfied_memory();
-        let msg = root_cause_gate(&mem, 1, 4).expect("gate must reject depth 1 < 4");
+        let msg =
+            root_cause_gate(&mem, valid_report(), 1, 4).expect("gate must reject depth 1 < 4");
         assert!(
             msg.contains("Only 1 investigation step(s)"),
             "mentions current steps: {msg}"
@@ -1325,7 +1687,8 @@ mod tests {
         mem.record_signal("logs");
         mem.add_fact("fact one".to_string());
         mem.add_fact("fact two".to_string());
-        let msg = root_cause_gate(&mem, 5, 4).expect("gate must reject 1 signal type");
+        let msg =
+            root_cause_gate(&mem, valid_report(), 5, 4).expect("gate must reject 1 signal type");
         assert!(msg.contains("Only 1 signal type(s) checked"), "{msg}");
         // logs already consulted → the two suggested missing types are traces, metrics
         assert!(
@@ -1340,7 +1703,7 @@ mod tests {
         mem.record_signal("logs");
         mem.record_signal("metrics");
         mem.add_fact("only one fact".to_string());
-        let msg = root_cause_gate(&mem, 5, 4).expect("gate must reject <2 facts");
+        let msg = root_cause_gate(&mem, valid_report(), 5, 4).expect("gate must reject <2 facts");
         assert!(
             msg.contains("Fewer than 2 concrete evidence records"),
             "{msg}"
@@ -1355,17 +1718,18 @@ mod tests {
     fn gate_passes_when_all_criteria_satisfied() {
         let mem = satisfied_memory();
         assert_eq!(
-            root_cause_gate(&mem, 4, 4),
+            root_cause_gate(&mem, valid_report(), 4, 4),
             None,
             "depth == min_depth must pass"
         );
-        assert_eq!(root_cause_gate(&mem, 10, 4), None);
+        assert_eq!(root_cause_gate(&mem, valid_report(), 10, 4), None);
     }
 
     #[test]
     fn gate_lists_all_gaps_when_everything_is_missing() {
         let mem = WorkingMemory::new("investigate".to_string());
-        let msg = root_cause_gate(&mem, 0, 4).expect("fresh memory must be rejected");
+        let msg =
+            root_cause_gate(&mem, "## Root Cause", 0, 4).expect("fresh memory must be rejected");
         assert!(msg.contains("Only 0 investigation step(s)"), "{msg}");
         assert!(msg.contains("Only 0 signal type(s)"), "{msg}");
         assert!(
@@ -1389,7 +1753,7 @@ mod tests {
         let mut mem = satisfied_memory();
         mem.add_suspect_service("api".to_string());
         mem.escalation_level = 2;
-        let kind = decide_report_kind(&mem, "## Root Cause", 10, 4);
+        let kind = decide_report_kind(&mem, valid_report(), 10, 4);
         assert_eq!(kind, ReportKind::Preliminary);
     }
 
@@ -1397,7 +1761,7 @@ mod tests {
     fn happy_path_yields_final() {
         let mut mem = satisfied_memory();
         mem.add_suspect_service("api".to_string());
-        let kind = decide_report_kind(&mem, "## Root Cause", 5, 4);
+        let kind = decide_report_kind(&mem, valid_report(), 5, 4);
         assert_eq!(kind, ReportKind::Final);
     }
 
@@ -1405,7 +1769,7 @@ mod tests {
     fn insufficient_depth_yields_preliminary() {
         let mut mem = satisfied_memory();
         mem.add_suspect_service("api".to_string());
-        let kind = decide_report_kind(&mem, "## Root Cause", 3, 4);
+        let kind = decide_report_kind(&mem, valid_report(), 3, 4);
         assert_eq!(kind, ReportKind::Preliminary);
     }
 
@@ -1417,7 +1781,7 @@ mod tests {
         mem.add_fact("generic count".to_string());
         mem.add_suspect_service("api".to_string());
         assert_eq!(
-            decide_report_kind(&mem, "## Root Cause", 10, 4),
+            decide_report_kind(&mem, valid_report(), 10, 4),
             ReportKind::Preliminary
         );
     }
@@ -1431,6 +1795,38 @@ mod tests {
         );
         assert_eq!(mem.ruled_out.len(), 2);
         assert_eq!(mem.failed_hypotheses.len(), 2);
+    }
+
+    #[test]
+    fn report_state_parses_hypothesis_links_and_polarity() {
+        let mut mem = satisfied_memory();
+        capture_report_state(
+            &mut mem,
+            "HYPOTHESIS H2 | culprit=db | mechanism=database latency | symptom=api | path=db -> api | status=refuted | supports=E2 | contradicts=E1 | discriminates=E1 | confidence=low | next_test=check db pool",
+        );
+        let hypothesis = mem.hypotheses.iter().find(|item| item.id == "H2").unwrap();
+        assert_eq!(hypothesis.culprit_service, "db");
+        assert_eq!(hypothesis.status, "refuted");
+        assert_eq!(hypothesis.supporting_evidence_ids, vec!["E2"]);
+        assert_eq!(hypothesis.contradicting_evidence_ids, vec!["E1"]);
+        assert_eq!(
+            mem.evidence[0].polarity,
+            crate::agent::contracts::EvidencePolarity::Neutral
+        );
+        assert_eq!(
+            mem.evidence[1].polarity,
+            crate::agent::contracts::EvidencePolarity::Supports
+        );
+    }
+
+    #[test]
+    fn causal_gate_names_missing_report_contract_and_discriminating_check() {
+        let mut mem = satisfied_memory();
+        mem.hypotheses[0].discriminating_evidence_ids.clear();
+        let msg = root_cause_gate(&mem, "## Root Cause\napi error regression", 10, 4).unwrap();
+        assert!(msg.contains("strong_alternative_untested"), "{msg}");
+        assert!(msg.contains("report_contract_incomplete"), "{msg}");
+        assert!(msg.contains("missing_evidence_citation"), "{msg}");
     }
 
     // ── LoopBudget ───────────────────────────────────────────────────────

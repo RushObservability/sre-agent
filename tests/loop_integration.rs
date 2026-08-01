@@ -37,22 +37,57 @@ fn llm_for(server: &common::MockServer) -> LlmConfig {
     }
 }
 
-/// Tool results crafted so `extract_facts_from_tool_result` yields facts:
-/// search_logs needs a first line containing "Found"; query_metrics needs a
-/// line containing "Latest=" / "error_rate" / "latency". Args `service` is
-/// extracted as a suspect service.
+/// Structured tool results with explicit incident/baseline deltas. This keeps
+/// the integration test honest: the causal gate must see typed provenance,
+/// not infer a baseline change from prose alone.
 fn evidence_registry() -> ToolRegistry {
-    make_registry(vec![
-        (
-            "search_logs",
-            "Found 7 log entries.\n[api] ERROR: connection refused".to_string(),
-        ),
-        (
-            "query_metrics",
-            "api error_rate (last 30m, 12 points):\nLatest=0.42 Avg=0.10 Min=0.01 Max=0.55"
-                .to_string(),
-        ),
-    ])
+    let window = json!({
+        "incident_start": "2026-07-19T10:00:00Z",
+        "incident_end": "2026-07-19T11:00:00Z",
+        "baseline_start": "2026-07-19T09:00:00Z",
+        "baseline_end": "2026-07-19T10:00:00Z",
+        "selection_reason": "inferred_onset",
+        "timezone": "UTC"
+    });
+    let logs = json!({
+        "status": "ok",
+        "source_family": "logs",
+        "source_tables": ["logs"],
+        "window": window,
+        "service": "",
+        "operation": "error search",
+        "incident_value": 7,
+        "baseline_value": 1,
+        "absolute_delta": 6,
+        "relative_delta": 6.0,
+        "sample_count": 7,
+        "quality": {"band": "high", "reasons": []},
+        "references": ["logs:connection-refused"],
+        "query_fingerprint": "sha256:test-logs",
+        "summary": "connection refused errors increased during incident window",
+        "data": {"count": 7}
+    })
+    .to_string();
+    let metrics = json!({
+        "status": "ok",
+        "source_family": "otel_metrics",
+        "source_tables": ["otel_metrics"],
+        "window": window,
+        "service": "",
+        "operation": "error_rate",
+        "incident_value": 0.42,
+        "baseline_value": 0.10,
+        "absolute_delta": 0.32,
+        "relative_delta": 3.2,
+        "sample_count": 12,
+        "quality": {"band": "high", "reasons": []},
+        "references": ["metrics:api:error_rate"],
+        "query_fingerprint": "sha256:test-metrics",
+        "summary": "api error_rate increased from 0.10 baseline to 0.42 incident",
+        "data": {"latest": 0.42}
+    })
+    .to_string();
+    make_registry(vec![("search_logs", logs), ("query_metrics", metrics)])
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -89,11 +124,10 @@ async fn earns_final_report() {
             call_id: "call_4".to_string(),
         },
         Script::Final(
-            "## Root Cause\napi error_rate spiked after connection refusals.".to_string(),
+            "HYPOTHESIS H1 | culprit=api | mechanism=error regression | symptom=api | path=api | status=supported | supports=E1,E3 | contradicts= | discriminates=E3 | confidence=high | next_test=check deploy\n## Status\nFinal — high confidence\n## Root Cause\napi error_rate spiked after connection refusals at onset [E1] [E3]\n## Incident Change\nerror rate and latency increased versus baseline; onset was 10:00 UTC [E1] [E3]\n## Causal Path\napi -> api [E3]\n## Evidence\n- [E1] logs\n- [E3] metrics\n## Contradictions and Alternatives\nNo material contradiction remains; E3 was the discriminating check.\n## Impact\napi requests failed\n## Recommended Actions\ncheck deploy\n## Open Questions\nNone material.".to_string(),
         ),
         Script::Final(
-            "## Root Cause\napi error_rate spiked after connection refusals. Confidence: high."
-                .to_string(),
+            "HYPOTHESIS H1 | culprit=api | mechanism=error regression | symptom=api | path=api | status=supported | supports=E1,E3 | contradicts= | discriminates=E3 | confidence=high | next_test=check deploy\n## Status\nFinal — high confidence\n## Root Cause\napi error_rate spiked after connection refusals at onset [E1] [E3]\n## Incident Change\nerror rate and latency increased versus baseline; onset was 10:00 UTC [E1] [E3]\n## Causal Path\napi -> api [E3]\n## Evidence\n- [E1] logs\n- [E3] metrics\n## Contradictions and Alternatives\nNo material contradiction remains; E3 was the discriminating check.\n## Impact\napi requests failed\n## Recommended Actions\ncheck deploy\n## Open Questions\nNone material. Confidence: high".to_string(),
         ),
     ];
     let server = start_mock(scripts).await;
@@ -102,7 +136,7 @@ async fn earns_final_report() {
     let ctx = make_ctx().await;
     let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
 
-    let (text, kind, _mem, _, _, _) = run_with_config_and_budget(
+    let (text, kind, mem, _, _, _) = run_with_config_and_budget(
         initial_messages("Why is api erroring?"),
         &registry,
         &ctx,
@@ -116,7 +150,11 @@ async fn earns_final_report() {
     .unwrap();
     drop(tx);
 
-    assert_eq!(kind, ReportKind::Final, "gate criteria met → Final report");
+    assert_eq!(
+        kind,
+        ReportKind::Final,
+        "gate criteria met → Final report; memory={mem:?}; text={text}"
+    );
     assert!(
         text.contains("Confidence: high"),
         "accepted text is the post-review one: {text}"
@@ -325,10 +363,10 @@ async fn compaction_visible_on_wire() {
         })
         .collect();
     scripts.push(Script::Final(
-        "## Root Cause\nsvc0 cascading failure.".to_string(),
+        "HYPOTHESIS H1 | culprit=svc0 | mechanism=error regression | symptom=svc0 | path=svc0 | status=supported | supports=E1,E2 | contradicts= | discriminates=E2 | confidence=high | next_test=check deploy\n## Status\nFinal — high confidence\n## Root Cause\nsvc0 cascading failure at onset [E1] [E2]\n## Incident Change\nerror rate increased versus baseline; onset was 10:00 UTC [E1] [E2]\n## Causal Path\nsvc0 -> svc0 [E2]\n## Evidence\n- [E1] logs\n- [E2] metrics\n## Contradictions and Alternatives\nNo material contradiction remains; E2 was the discriminating check.\n## Impact\nsvc0 affected\n## Recommended Actions\ncheck deploy\n## Open Questions\nNone material.".to_string(),
     ));
     scripts.push(Script::Final(
-        "## Root Cause\nsvc0 cascading failure. Confidence: high.".to_string(),
+        "HYPOTHESIS H1 | culprit=svc0 | mechanism=error regression | symptom=svc0 | path=svc0 | status=supported | supports=E1,E2 | contradicts= | discriminates=E2 | confidence=high | next_test=check deploy\n## Status\nFinal — high confidence\n## Root Cause\nsvc0 cascading failure at onset [E1] [E2]\n## Incident Change\nerror rate increased versus baseline; onset was 10:00 UTC [E1] [E2]\n## Causal Path\nsvc0 -> svc0 [E2]\n## Evidence\n- [E1] logs\n- [E2] metrics\n## Contradictions and Alternatives\nNo material contradiction remains; E2 was the discriminating check.\n## Impact\nsvc0 affected\n## Recommended Actions\ncheck deploy\n## Open Questions\nNone material. Confidence: high".to_string(),
     ));
     let server = start_mock(scripts).await;
 
@@ -336,7 +374,7 @@ async fn compaction_visible_on_wire() {
     let ctx = make_ctx().await;
     let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
 
-    let (_text, kind, _mem, _, _, _) = run_with_config_and_budget(
+    let (_text, kind, mem, _, _, _) = run_with_config_and_budget(
         initial_messages("Investigate"),
         &registry,
         &ctx,
@@ -351,7 +389,7 @@ async fn compaction_visible_on_wire() {
     drop(tx);
     let _ = collect_events(&mut rx).await;
 
-    assert_eq!(kind, ReportKind::Final);
+    assert_eq!(kind, ReportKind::Final, "memory={mem:?}");
     assert_eq!(
         server.calls(),
         10,
@@ -393,7 +431,8 @@ async fn compaction_visible_on_wire() {
     );
     for (i, c) in tool_contents.iter().enumerate().skip(2) {
         assert!(
-            c.contains("Found 7 log entries") || c.contains("Latest=0.42"),
+            c.contains("connection refused errors increased")
+                || c.contains("error_rate increased from 0.10"),
             "recent round {i} must keep its full tool result, got: {c}"
         );
     }

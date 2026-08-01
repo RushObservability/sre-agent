@@ -260,7 +260,7 @@ async fn investigate(
 
         // Deserialize persisted working memory
         if session.working_memory != "{}" && !session.working_memory.is_empty() {
-            match serde_json::from_str::<WorkingMemory>(&session.working_memory) {
+            match WorkingMemory::from_json(&session.working_memory) {
                 Ok(mem) => restored_memory = Some(mem),
                 Err(e) => {
                     tracing::warn!(

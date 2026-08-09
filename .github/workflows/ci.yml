@@ -31,3 +31,10 @@ jobs:
         run: cargo build --verbose
       - name: Test
         run: cargo test --verbose
+      - name: PR6 deterministic replay release gate
+        run: |
+          SRE_EVALS_RUN_ID=pr6-ci cargo run --bin sre_evals -- replay \
+            --cases evals/replay_cases.yaml --out evals/out
+          cargo run --bin sre_evals -- release-gate \
+            --current evals/out/pr6-ci.json \
+            --baseline evals/baseline-pr6.json

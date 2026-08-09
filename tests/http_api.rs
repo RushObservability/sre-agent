@@ -25,6 +25,12 @@ fn test_router() -> axum::Router {
         query_api_url: None,
         internal_auth_token: INTERNAL_TOKEN.to_string(),
         caches: Arc::new(Default::default()),
+        metrics: Arc::new(sre_agent::metrics::AgentMetrics::new()),
+        admission: Arc::new(sre_agent::state::InvestigationAdmission::new(
+            4,
+            16,
+            Arc::new(sre_agent::metrics::AgentMetrics::new()),
+        )),
     };
     router(state)
 }
@@ -41,6 +47,54 @@ async fn healthz_returns_200_ok() {
     let body = resp.into_body().collect().await.unwrap().to_bytes();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json, serde_json::json!({"status": "ok"}));
+}
+
+#[tokio::test]
+async fn readyz_reports_unavailable_dependency_without_leaking_secrets() {
+    let app = test_router();
+    let resp = app
+        .oneshot(Request::get("/readyz").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["status"], "not_ready");
+    assert_eq!(json["checks"]["clickhouse"], false);
+    assert!(
+        !body
+            .windows(INTERNAL_TOKEN.len())
+            .any(|window| window == INTERNAL_TOKEN.as_bytes())
+    );
+}
+
+#[tokio::test]
+async fn metrics_preserves_internal_token_protection() {
+    let app = test_router();
+    let unauthorized = app
+        .clone()
+        .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    let authorized = app
+        .oneshot(
+            Request::get("/metrics")
+                .header("x-rush-internal-token", INTERNAL_TOKEN)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(authorized.status(), StatusCode::OK);
+    assert_eq!(
+        authorized.headers().get(header::CONTENT_TYPE).unwrap(),
+        "text/plain; version=0.0.4; charset=utf-8"
+    );
+    let body = authorized.into_body().collect().await.unwrap().to_bytes();
+    assert!(body.starts_with(b"# HELP sre_agent_investigations_in_flight"));
 }
 
 #[tokio::test]

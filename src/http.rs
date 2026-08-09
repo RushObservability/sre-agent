@@ -10,7 +10,7 @@ use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode, header},
     middleware::Next,
-    response::Response,
+    response::{IntoResponse, Response},
     routing::{delete, get, post},
 };
 use serde::Deserialize;
@@ -19,11 +19,14 @@ use tokio::sync::mpsc;
 use tower_http::trace::TraceLayer;
 
 use crate::agent;
+use crate::agent::contracts::InvestigationWindow;
 use crate::agent::memory::WorkingMemory;
 use crate::agent::skill_store::SkillStore;
 use crate::agent::stream::AgentEvent;
 use crate::agent::templates;
 use crate::agent::tools::{ToolContext, ToolRegistry};
+use crate::cancellation::CancellationToken;
+use crate::metrics::AgentMetrics;
 use crate::state::AppState;
 
 /// Build the production router: all API routes plus the CORS and trace
@@ -44,6 +47,7 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/investigation-templates",
             get(list_investigation_templates),
         )
+        .route("/metrics", get(metrics))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             require_internal_token,
@@ -52,6 +56,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .merge(protected)
         .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -124,36 +129,115 @@ struct InvestigateRequest {
     /// by the policy; otherwise ignored.
     #[serde(default)]
     reasoning_effort: String,
+    /// Optional explicit incident/baseline scope for this turn. A changed
+    /// window partitions old causal evidence instead of reusing it as proof.
+    #[serde(default)]
+    window: Option<InvestigationWindow>,
+    /// Continue an unresolved dead-end intentionally; otherwise escalation is
+    /// reset for a normal follow-up turn.
+    #[serde(default)]
+    continue_dead_end: bool,
 }
 
 async fn healthz() -> Json<serde_json::Value> {
     Json(serde_json::json!({"status": "ok"}))
 }
 
+async fn readyz(State(state): State<AppState>) -> Response {
+    #[derive(clickhouse::Row, serde::Deserialize)]
+    struct Probe {
+        _n: u8,
+    }
+
+    let clickhouse_started = std::time::Instant::now();
+    let clickhouse_ready = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        state.ch.query("SELECT 1 AS _n").fetch_one::<Probe>(),
+    )
+    .await
+    .is_ok_and(|result| result.is_ok());
+    state
+        .metrics
+        .clickhouse_probe_finished(clickhouse_started.elapsed(), clickhouse_ready);
+    let llm_ready = agent::loop_runner::LlmConfig::from_env().is_ok();
+    let ready = clickhouse_ready && llm_ready;
+    state.metrics.set_ready(ready);
+    let status = if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        status,
+        Json(serde_json::json!({
+            "status": if ready { "ready" } else { "not_ready" },
+            "checks": {
+                "clickhouse": clickhouse_ready,
+                "llm": llm_ready,
+            }
+        })),
+    )
+        .into_response()
+}
+
+async fn metrics(State(state): State<AppState>) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )
+        .body(Body::from(state.metrics.render()))
+        .expect("metrics response builder accepts static headers")
+}
+
 /// Convert agent events into an SSE body and emit a comment heartbeat while
 /// the agent is waiting on a tool or provider response. Without heartbeats,
 /// an otherwise healthy investigation can be dropped by an idle proxy before
 /// the next evidence event arrives.
-fn sse_body(rx: mpsc::Receiver<AgentEvent>) -> Body {
+struct SseCancellationGuard {
+    cancellation: CancellationToken,
+    metrics: Arc<AgentMetrics>,
+}
+
+impl Drop for SseCancellationGuard {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+        self.metrics.sse_closed();
+    }
+}
+
+fn sse_body(
+    rx: mpsc::Receiver<AgentEvent>,
+    cancellation: CancellationToken,
+    metrics: Arc<AgentMetrics>,
+) -> Body {
+    metrics.sse_opened();
+    let guard = SseCancellationGuard {
+        cancellation,
+        metrics,
+    };
     let heartbeat = tokio::time::interval_at(
         tokio::time::Instant::now() + std::time::Duration::from_secs(15),
         std::time::Duration::from_secs(15),
     );
-    let stream =
-        futures_util::stream::unfold((rx, heartbeat), |(mut rx, mut heartbeat)| async move {
+    let stream = futures_util::stream::unfold(
+        (rx, heartbeat, guard),
+        |(mut rx, mut heartbeat, guard)| async move {
             tokio::select! {
                 event = rx.recv() => event.map(|event| {
                     (
                         Ok::<_, std::convert::Infallible>(Bytes::from(event.to_sse_bytes())),
-                        (rx, heartbeat),
+                        (rx, heartbeat, guard),
                     )
                 }),
                 _ = heartbeat.tick() => Some((
                     Ok::<_, std::convert::Infallible>(Bytes::from_static(b": keep-alive\n\n")),
-                    (rx, heartbeat),
+                    (rx, heartbeat, guard),
                 )),
             }
-        });
+        },
+    );
     Body::from_stream(stream)
 }
 
@@ -176,6 +260,16 @@ async fn investigate(
         ));
     }
 
+    // Admit the full investigation before doing session/setup work. This keeps
+    // expensive LLM and tool work bounded under burst traffic while retaining
+    // the tenant from the request in ToolContext unchanged.
+    let permit = state
+        .admission
+        .acquire()
+        .await
+        .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error.to_string()))?;
+    let investigation_started = std::time::Instant::now();
+
     // Build the unified skill store, cached for 60s — skill edits show up on
     // the next investigation within a minute, without paying an HTTP fetch to
     // query-api (or a config_db scan) on every single request.
@@ -191,7 +285,12 @@ async fn investigate(
         Some(store) => store,
         None => {
             let store = Arc::new(
-                SkillStore::load_unified(&state.config_db, state.query_api_url.as_deref()).await,
+                SkillStore::load_unified_with_metrics(
+                    &state.config_db,
+                    state.query_api_url.as_deref(),
+                    Some(state.metrics.as_ref()),
+                )
+                .await,
             );
             *state.caches.skills.write().await = Some((std::time::Instant::now(), store.clone()));
             store
@@ -299,6 +398,27 @@ async fn investigate(
     } else {
         "Continue the investigation.".to_string()
     };
+
+    if let Some(memory) = restored_memory.as_mut() {
+        let transition = memory.prepare_follow_up(
+            user_content.clone(),
+            req.window.clone(),
+            req.continue_dead_end,
+        );
+        tracing::info!(
+            session_id,
+            scope_changed = transition.scope_changed,
+            window_changed = transition.window_changed,
+            historical_evidence = transition.historical_evidence,
+            retired_hypotheses = transition.retired_hypotheses,
+            reason = %transition.reason,
+            "prepared investigation follow-up state"
+        );
+    } else if let Some(window) = req.window.clone() {
+        let mut memory = WorkingMemory::new(user_content.clone());
+        memory.window = Some(window);
+        restored_memory = Some(memory);
+    }
 
     // Save user turn to DB (session mode only).
     if session_mode {
@@ -534,6 +654,9 @@ async fn investigate(
     // "LLM not configured:" prefix is a stable marker the UI styles as a
     // setup card. Only env var NAMES are mentioned, never values.
     if agent::loop_runner::LlmConfig::from_env().is_err() {
+        state
+            .metrics
+            .investigation_failed(investigation_started.elapsed());
         let _ = tx
             .send(AgentEvent::Error {
                 message: "LLM not configured: the SRE agent needs an LLM to run investigations. \
@@ -550,7 +673,11 @@ async fn investigate(
             .header(header::CONTENT_TYPE, "text/event-stream")
             .header(header::CACHE_CONTROL, "no-cache")
             .header(header::CONNECTION, "keep-alive")
-            .body(sse_body(rx))
+            .body(sse_body(
+                rx,
+                CancellationToken::new(),
+                state.metrics.clone(),
+            ))
             .unwrap());
     }
 
@@ -559,6 +686,9 @@ async fn investigate(
     let session_id_for_task = session_id.clone();
     let session_mode_for_task = session_mode;
     let restored_mem = restored_memory;
+    let cancellation = CancellationToken::new();
+    let task_cancellation = cancellation.clone();
+    let task_metrics = state.metrics.clone();
 
     // Resolve the LLM config under the admin model/thinking policy. The API key
     // always comes from OPENAI_API_KEY and OPENAI_BASE_URL;
@@ -660,7 +790,8 @@ async fn investigate(
     }
 
     tokio::spawn(async move {
-        let result = agent::loop_runner::run_with_config_and_budget(
+        let _permit = permit;
+        let result = agent::loop_runner::run_with_config_and_budget_cancelable(
             messages,
             &registry,
             &tool_ctx,
@@ -669,8 +800,11 @@ async fn investigate(
             restored_mem,
             &session_id_for_task,
             budget,
+            task_cancellation.clone(),
         )
         .await;
+        let was_cancelled = task_cancellation.is_cancelled();
+        let succeeded = result.is_ok();
 
         match result {
             Ok((
@@ -735,10 +869,17 @@ async fn investigate(
                     .await;
             }
         }
+        if was_cancelled {
+            task_metrics.investigation_cancelled(investigation_started.elapsed());
+        } else if succeeded {
+            task_metrics.investigation_completed(investigation_started.elapsed());
+        } else {
+            task_metrics.investigation_failed(investigation_started.elapsed());
+        }
     });
 
     // Convert the receiver into an SSE byte stream
-    let body = sse_body(rx);
+    let body = sse_body(rx, cancellation, state.metrics.clone());
 
     Ok(Response::builder()
         .status(200)

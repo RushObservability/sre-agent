@@ -10,6 +10,7 @@ use serde::Deserialize;
 
 use crate::agent::skills::all_skills as all_built_in_skills;
 use crate::config_db::ConfigDb;
+use crate::metrics::AgentMetrics;
 use crate::models::custom_skills::CustomSkill;
 
 #[derive(Debug, Deserialize)]
@@ -79,14 +80,29 @@ impl SkillStore {
     /// `query_api_url` should be the base URL, e.g. `http://rush-o11y-query-api:8080`.
     /// When `None`, this is equivalent to [`SkillStore::load`].
     pub async fn load_unified(config_db: &Arc<ConfigDb>, query_api_url: Option<&str>) -> Self {
+        Self::load_unified_with_metrics(config_db, query_api_url, None).await
+    }
+
+    pub async fn load_unified_with_metrics(
+        config_db: &Arc<ConfigDb>,
+        query_api_url: Option<&str>,
+        metrics: Option<&AgentMetrics>,
+    ) -> Self {
         let mut store = Self::with_built_ins();
 
         // Prefer HTTP fetch if a query-api URL is configured. This is the path
         // the cluster uses: query-api owns the custom_skills table, sre-agent
         // reads it over HTTP so the two services don't have to share a volume.
         if let Some(url) = query_api_url {
+            let started = std::time::Instant::now();
+            if let Some(metrics) = metrics {
+                metrics.query_api_started();
+            }
             match fetch_custom_skills_http(url).await {
                 Ok(custom) => {
+                    if let Some(metrics) = metrics {
+                        metrics.query_api_finished(started.elapsed(), true);
+                    }
                     tracing::info!(
                         "loaded {} custom skill(s) from query-api at {url}",
                         custom.len()
@@ -95,6 +111,9 @@ impl SkillStore {
                     return store;
                 }
                 Err(e) => {
+                    if let Some(metrics) = metrics {
+                        metrics.query_api_finished(started.elapsed(), false);
+                    }
                     tracing::warn!(
                         "HTTP custom-skill fetch from {url} failed ({e}); falling back to local db"
                     );

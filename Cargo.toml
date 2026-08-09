@@ -21,6 +21,7 @@ tower-http = { version = "0.6", features = ["cors", "trace"] }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
+libc = "0.2"
 tokio-stream = "0.1"
 futures-util = "0.3"
 

@@ -1,5 +1,7 @@
 use anyhow::Result;
 use serde_json::Value;
+use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 use super::memory::{
@@ -8,9 +10,10 @@ use super::memory::{
 };
 use super::stream::{AgentEvent, ReportKind};
 use super::tools::{ToolContext, ToolRegistry};
+use crate::cancellation::CancellationToken;
 
-/// Default maximum real tool-executing rounds. The model should never hear
-/// about this number — it exists purely as a backstop against runaway loops.
+/// Default maximum real tool calls. The model should never hear about this
+/// number — it exists purely as a backstop against runaway loops.
 /// Operators can override per deployment via the `sre_agent_max_tool_steps`
 /// setting (see `LoopBudget`).
 const DEFAULT_MAX_TOOL_STEPS: u32 = 40;
@@ -26,7 +29,10 @@ const DEFAULT_MAX_ATTEMPTS: u32 = 55;
 /// paths are untrusted strings, so construction clamps to sane bounds.
 #[derive(Debug, Clone, Copy)]
 pub struct LoopBudget {
-    /// Max real tool-executing rounds before a summary is forced.
+    /// Max model-dispatched tool calls before a summary is forced. Concurrent
+    /// calls in one response each consume one unit.
+    pub max_tool_calls: u32,
+    /// Max tool-bearing LLM rounds before a summary is forced.
     pub max_tool_steps: u32,
     /// Max total LLM calls (tool rounds + retries + critique + summary).
     pub max_llm_calls: u32,
@@ -35,6 +41,7 @@ pub struct LoopBudget {
 impl Default for LoopBudget {
     fn default() -> Self {
         Self {
+            max_tool_calls: DEFAULT_MAX_TOOL_STEPS,
             max_tool_steps: DEFAULT_MAX_TOOL_STEPS,
             max_llm_calls: DEFAULT_MAX_ATTEMPTS,
         }
@@ -54,6 +61,7 @@ impl LoopBudget {
             .unwrap_or(DEFAULT_MAX_ATTEMPTS)
             .clamp(steps.saturating_add(2), 300);
         Self {
+            max_tool_calls: steps,
             max_tool_steps: steps,
             max_llm_calls: calls,
         }
@@ -83,6 +91,120 @@ const MIN_SIGNAL_TYPES: usize = 2;
 /// per session. After this many rejections the gate steps aside to avoid an
 /// infinite loop, and the report is surfaced as Preliminary.
 const MAX_GATE_REJECTIONS: u32 = 3;
+
+/// Keep two actual tool-call slots available for a refutation check and final
+/// verification after the exploratory portion of a run.
+const RESERVED_VERIFICATION_CALLS: u32 = 2;
+
+#[derive(Debug, Default)]
+struct ToolTelemetry {
+    dispatched_calls: u32,
+    useful_results: u32,
+    empty_results: u32,
+    result_bytes: u64,
+    context_tokens: u64,
+    duration_ms: u64,
+    per_tool: BTreeMap<String, ToolTelemetryEntry>,
+}
+
+#[derive(Debug, Default)]
+struct ToolTelemetryEntry {
+    calls: u32,
+    useful_results: u32,
+    result_bytes: u64,
+    context_tokens: u64,
+    duration_ms: u64,
+}
+
+impl ToolTelemetry {
+    fn record(
+        &mut self,
+        tool: &str,
+        duration: Duration,
+        result_bytes: usize,
+        context_tokens: u64,
+        useful: bool,
+        empty: bool,
+    ) {
+        let duration_ms = duration.as_millis() as u64;
+        self.dispatched_calls += 1;
+        self.result_bytes += result_bytes as u64;
+        self.context_tokens += context_tokens;
+        self.duration_ms += duration_ms;
+        if useful {
+            self.useful_results += 1;
+        }
+        if empty {
+            self.empty_results += 1;
+        }
+        let entry = self.per_tool.entry(tool.to_string()).or_default();
+        entry.calls += 1;
+        entry.result_bytes += result_bytes as u64;
+        entry.context_tokens += context_tokens;
+        entry.duration_ms += duration_ms;
+        if useful {
+            entry.useful_results += 1;
+        }
+    }
+
+    fn log_stop(&self, session_id: &str, reason: &str, tool_steps: u32, attempts: u32) {
+        tracing::info!(
+            session_id,
+            stop_reason = reason,
+            tool_steps,
+            tool_calls = self.dispatched_calls,
+            llm_calls = attempts,
+            useful_results = self.useful_results,
+            empty_results = self.empty_results,
+            result_bytes = self.result_bytes,
+            context_tokens = self.context_tokens,
+            duration_ms = self.duration_ms,
+            per_tool = ?self.per_tool,
+            "investigation stop telemetry"
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn disconnected_report(
+    memory: WorkingMemory,
+    model: &str,
+    session_id: &str,
+    telemetry: &ToolTelemetry,
+    tool_steps: u32,
+    attempts: u32,
+    total_prompt: u64,
+    total_completion: u64,
+    metrics: &crate::metrics::AgentMetrics,
+    cancellation: &CancellationToken,
+) -> (String, ReportKind, WorkingMemory, u64, u64, String) {
+    cancellation.cancel();
+    metrics.client_disconnected();
+    metrics.investigation_work(telemetry.dispatched_calls, attempts);
+    if let Some(latency) = cancellation.elapsed_since_cancelled() {
+        metrics.observe_cancellation_latency(latency);
+    }
+    tracing::info!(
+        session_id,
+        tool_steps,
+        attempts,
+        "client disconnected — aborting investigation early"
+    );
+    telemetry.log_stop(session_id, "client_disconnected", tool_steps, attempts);
+    let text = format!(
+        "## Preliminary Investigation Report\n\n**Status**: Client disconnected before \
+         the investigation completed\n\n{}",
+        memory.to_prompt_block()
+    );
+    (
+        text,
+        ReportKind::Preliminary,
+        memory,
+        total_prompt,
+        total_completion,
+        model.to_string(),
+    )
+}
 
 /// Decide whether a given investigation state represents a final or
 /// preliminary report. The causal gate is intentionally deterministic: model
@@ -207,6 +329,8 @@ fn parse_hypothesis_line(line: &str) -> Option<Hypothesis> {
         confidence: 0.0,
         confidence_band: "low".into(),
         next_best_test: String::new(),
+        historical: false,
+        carry_reason: String::new(),
     };
     let key_value_form = fields.iter().skip(1).any(|field| field.contains('='));
     if key_value_form {
@@ -331,18 +455,19 @@ fn root_cause_gate(
         ));
     }
 
-    if memory.evidence.len() < 2 {
+    let active_evidence_count = memory.active_evidence_count();
+    if active_evidence_count < 2 {
         gaps.push(format!(
             "Fewer than 2 concrete evidence records in working memory (have {}). \
              Run targeted queries that return timestamps, values, IDs, or specific messages before concluding.",
-            memory.evidence.len()
+            active_evidence_count
         ));
     }
 
     let supported = memory
         .hypotheses
         .iter()
-        .filter(|hypothesis| hypothesis.status == "supported")
+        .filter(|hypothesis| hypothesis.status == "supported" && !hypothesis.historical)
         .max_by(|left, right| left.confidence.total_cmp(&right.confidence));
     let Some(leading) = supported else {
         gaps.push(
@@ -454,7 +579,12 @@ fn format_gate_gaps(gaps: Vec<String>) -> String {
 
 fn linked_evidence<'a>(memory: &'a WorkingMemory, ids: &[String]) -> Vec<&'a EvidenceItem> {
     ids.iter()
-        .filter_map(|id| memory.evidence.iter().find(|item| &item.id == id))
+        .filter_map(|id| {
+            memory
+                .evidence
+                .iter()
+                .find(|item| &item.id == id && !item.historical)
+        })
         .collect()
 }
 
@@ -730,6 +860,7 @@ pub async fn run_with_config(
         None,
         "",
         LoopBudget::default(),
+        CancellationToken::new(),
     )
     .await?;
     Ok(())
@@ -758,6 +889,7 @@ pub async fn run_with_session(
         restored_memory,
         session_id,
         budget,
+        CancellationToken::new(),
     )
     .await
 }
@@ -776,6 +908,35 @@ pub async fn run_with_config_and_budget(
     session_id: &str,
     budget: LoopBudget,
 ) -> Result<(String, ReportKind, WorkingMemory, u64, u64, String)> {
+    run_with_config_and_budget_cancelable(
+        messages,
+        registry,
+        ctx,
+        tx,
+        llm,
+        restored_memory,
+        session_id,
+        budget,
+        CancellationToken::new(),
+    )
+    .await
+}
+
+/// Session-aware loop entry point with cancellation propagated to the LLM
+/// stream and concurrent tool calls. The HTTP layer cancels this token when
+/// the SSE response body is dropped by the client.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_with_config_and_budget_cancelable(
+    messages: Vec<Value>,
+    registry: &ToolRegistry,
+    ctx: &ToolContext,
+    tx: &mpsc::Sender<AgentEvent>,
+    llm: LlmConfig,
+    restored_memory: Option<WorkingMemory>,
+    session_id: &str,
+    budget: LoopBudget,
+    cancellation: CancellationToken,
+) -> Result<(String, ReportKind, WorkingMemory, u64, u64, String)> {
     run_inner(
         messages,
         registry,
@@ -785,6 +946,7 @@ pub async fn run_with_config_and_budget(
         restored_memory,
         session_id,
         budget,
+        cancellation,
     )
     .await
 }
@@ -804,6 +966,7 @@ async fn run_inner(
     restored_memory: Option<WorkingMemory>,
     session_id: &str,
     budget: LoopBudget,
+    cancellation: CancellationToken,
 ) -> Result<(String, ReportKind, WorkingMemory, u64, u64, String)> {
     let base_url = llm.base_url;
     let api_key = llm.api_key;
@@ -852,38 +1015,37 @@ async fn run_inner(
     let mut total_completion = 0u64;
 
     let mut tool_steps = 0u32;
+    let mut tool_calls_dispatched = 0u32;
     let mut attempts = 0u32;
     let mut force_summary = false;
+    let mut reserve_mode = false;
     let mut gate_rejection_count = 0u32;
+    let mut telemetry = ToolTelemetry::default();
     let min_depth = budget.min_depth();
     // One self-critique cycle per run: when a conclusion passes the gate for
     // the first time, the agent is asked to challenge it (and may run more
     // tools) before the report is accepted.
     let mut self_review_done = false;
 
-    while tool_steps < budget.max_tool_steps && attempts < budget.max_llm_calls {
+    while tool_steps < budget.max_tool_steps
+        && tool_calls_dispatched < budget.max_tool_calls
+        && attempts < budget.max_llm_calls
+    {
         // Client disconnected (SSE receiver dropped) — every send would be
         // discarded and each further round only burns LLM tokens. Stop now
         // and hand back the memory gathered so far so the caller persists it.
-        if tx.is_closed() {
-            tracing::info!(
+        if cancellation.is_cancelled() || tx.is_closed() {
+            return Ok(disconnected_report(
+                memory,
+                &model,
                 session_id,
+                &telemetry,
                 tool_steps,
                 attempts,
-                "client disconnected — aborting investigation early"
-            );
-            let text = format!(
-                "## Preliminary Investigation Report\n\n**Status**: Client disconnected before \
-                 the investigation completed\n\n{}",
-                memory.to_prompt_block()
-            );
-            return Ok((
-                text,
-                ReportKind::Preliminary,
-                memory,
                 total_prompt,
                 total_completion,
-                model,
+                &ctx.state.metrics,
+                &cancellation,
             ));
         }
 
@@ -909,9 +1071,21 @@ async fn run_inner(
             }));
         }
 
-        // Final round or dead-end: force summary by withholding tools
-        let force_final = tool_steps + 1 >= budget.max_tool_steps || force_summary;
+        // Final round, dead-end, or the exploration phase reaching its
+        // reserved verification capacity: force a report-shaped response.
+        let reserve_threshold = budget
+            .max_tool_calls
+            .saturating_sub(RESERVED_VERIFICATION_CALLS);
+        if !self_review_done && !force_summary && tool_calls_dispatched >= reserve_threshold {
+            reserve_mode = true;
+        }
+        let force_final = tool_steps + 1 >= budget.max_tool_steps
+            || tool_calls_dispatched >= budget.max_tool_calls
+            || force_summary
+            || reserve_mode;
 
+        let llm_started = Instant::now();
+        ctx.state.metrics.llm_started();
         let resp = {
             let body = ChatRequest {
                 model: &model,
@@ -927,13 +1101,29 @@ async fn run_inner(
                 },
                 reasoning_effort: reasoning_effort.as_deref(),
             };
-            client
-                .post(&url)
-                .header("Authorization", format!("Bearer {api_key}"))
-                .header("Content-Type", "application/json")
-                .json(&body)
-                .send()
-                .await
+            tokio::select! {
+                _ = cancellation.cancelled() => {
+                    ctx.state.metrics.llm_finished(llm_started.elapsed(), true);
+                    return Ok(disconnected_report(
+                        memory,
+                        &model,
+                        session_id,
+                        &telemetry,
+                        tool_steps,
+                        attempts,
+                        total_prompt,
+                        total_completion,
+                        &ctx.state.metrics,
+                        &cancellation,
+                    ));
+                }
+                result = client
+                    .post(&url)
+                    .header("Authorization", format!("Bearer {api_key}"))
+                    .header("Content-Type", "application/json")
+                    .json(&body)
+                    .send() => result
+            }
         };
 
         // Remove the transient memory message BEFORE any error propagation or
@@ -941,9 +1131,31 @@ async fn run_inner(
         if injected_memory {
             messages.pop();
         }
-        let resp = resp?;
+        let resp = match resp {
+            Ok(response) => response,
+            Err(error) => {
+                ctx.state.metrics.llm_finished(llm_started.elapsed(), true);
+                if cancellation.is_cancelled() || tx.is_closed() {
+                    return Ok(disconnected_report(
+                        memory,
+                        &model,
+                        session_id,
+                        &telemetry,
+                        tool_steps,
+                        attempts,
+                        total_prompt,
+                        total_completion,
+                        &ctx.state.metrics,
+                        &cancellation,
+                    ));
+                }
+                return Err(error.into());
+            }
+        };
 
+        ctx.state.metrics.llm_status(resp.status().as_u16());
         if !resp.status().is_success() {
+            ctx.state.metrics.llm_finished(llm_started.elapsed(), true);
             let status = resp.status();
             let err_body = resp.text().await.unwrap_or_default();
             let msg = format!(
@@ -958,9 +1170,35 @@ async fn run_inner(
             return Err(anyhow::anyhow!(msg));
         }
 
-        let (content, tool_calls, usage) = parse_streaming_response(resp, tx).await?;
+        let parsed = parse_streaming_response(resp, tx, cancellation.clone()).await;
+        let (content, mut tool_calls, usage) = match parsed {
+            Ok(value) => {
+                ctx.state.metrics.llm_finished(llm_started.elapsed(), false);
+                value
+            }
+            Err(_error) if cancellation.is_cancelled() || tx.is_closed() => {
+                ctx.state.metrics.llm_finished(llm_started.elapsed(), true);
+                return Ok(disconnected_report(
+                    memory,
+                    &model,
+                    session_id,
+                    &telemetry,
+                    tool_steps,
+                    attempts,
+                    total_prompt,
+                    total_completion,
+                    &ctx.state.metrics,
+                    &cancellation,
+                ));
+            }
+            Err(error) => {
+                ctx.state.metrics.llm_finished(llm_started.elapsed(), true);
+                return Err(error);
+            }
+        };
         total_prompt += usage.0;
         total_completion += usage.1;
+        ctx.state.metrics.llm_usage(usage.0, usage.1);
 
         // --- Classify response ---
         if tool_calls.is_empty() {
@@ -1006,11 +1244,13 @@ async fn run_inner(
             let is_question = content.trim_start().starts_with("[QUESTION]");
             if !self_review_done
                 && !is_question
-                && !force_final
+                && (!force_final || reserve_mode)
                 && memory.escalation_level < 2
                 && attempts + 2 <= budget.max_llm_calls
             {
                 self_review_done = true;
+                reserve_mode = false;
+                force_summary = false;
                 messages.push(serde_json::json!({
                     "role": "assistant",
                     "content": content.clone(),
@@ -1033,7 +1273,24 @@ async fn run_inner(
 
             // Final answer (or question)
             let kind = decide_report_kind(&memory, &content, tool_steps, min_depth);
+            let kind_name = match &kind {
+                ReportKind::Final => "final",
+                ReportKind::Preliminary => "preliminary",
+                ReportKind::Question => "question",
+            };
+            let stop_reason = match kind {
+                ReportKind::Final => "causal_gate_passed",
+                ReportKind::Question => "clarifying_question",
+                ReportKind::Preliminary => "preliminary_report",
+            };
+            telemetry.log_stop(session_id, stop_reason, tool_steps, attempts);
             let display_text = strip_question_prefix(&content);
+            ctx.state.metrics.investigation_reported(
+                kind_name,
+                telemetry.dispatched_calls,
+                attempts,
+                display_text.len(),
+            );
             let _ = tx
                 .send(AgentEvent::Summary {
                     text: display_text.clone(),
@@ -1043,6 +1300,7 @@ async fn run_inner(
             let _ = tx
                 .send(AgentEvent::Done {
                     rounds: tool_steps + 1,
+                    tool_calls: telemetry.dispatched_calls,
                     prompt_tokens: total_prompt,
                     completion_tokens: total_completion,
                     session_id: session_id.to_string(),
@@ -1059,7 +1317,37 @@ async fn run_inner(
             ));
         }
 
-        // Record assistant message with tool calls
+        // Enforce the actual tool-call budget before dispatching. A single
+        // model response may contain several concurrent calls, so a batch
+        // cannot bypass the cap merely by being concurrent.
+        let reserved = if self_review_done {
+            0
+        } else {
+            RESERVED_VERIFICATION_CALLS
+        };
+        let remaining = budget
+            .max_tool_calls
+            .saturating_sub(tool_calls_dispatched.saturating_add(reserved));
+        if remaining == 0 {
+            reserve_mode = true;
+            messages.push(serde_json::json!({
+                "role": "system",
+                "content": "The exploratory tool budget is exhausted. Use the reserved capacity only for a targeted refutation or final verification, then produce the required report.",
+            }));
+            continue;
+        }
+        if tool_calls.len() > remaining as usize {
+            tracing::debug!(
+                session_id,
+                requested = tool_calls.len(),
+                allowed = remaining,
+                "truncating concurrent tool batch to remaining budget"
+            );
+            tool_calls.truncate(remaining as usize);
+        }
+        tool_calls_dispatched += tool_calls.len() as u32;
+
+        // Record assistant message with the budget-approved tool calls
         let tc_value: Vec<Value> = tool_calls
             .iter()
             .map(|tc| {
@@ -1133,30 +1421,69 @@ async fn run_inner(
         // Pass 2 — run the real calls concurrently: round wall time becomes
         // max(tool latencies) instead of their sum. Each future yields
         // (did_real_work, result_text).
-        let outcomes: Vec<(bool, String)> =
-            futures_util::future::join_all(tool_calls.iter().zip(&planned).map(
-                |(tc, (args, plan))| async move {
-                    match plan {
-                        Planned::PrecomputedError(msg) => (false, msg.clone()),
-                        Planned::Execute => {
+        struct ToolOutcome {
+            real_work: bool,
+            result: String,
+            duration: Duration,
+            error: bool,
+        }
+        let metrics = ctx.state.metrics.clone();
+        let tool_futures = tool_calls.iter().zip(&planned).map(|(tc, (args, plan))| {
+            let metrics = metrics.clone();
+            async move {
+                let started = Instant::now();
+                match plan {
+                    Planned::PrecomputedError(msg) => ToolOutcome {
+                        real_work: false,
+                        result: msg.clone(),
+                        duration: started.elapsed(),
+                        error: false,
+                    },
+                    Planned::Execute => {
+                        let tool_guard = metrics.tool_call();
+                        let (real_work, result, error) =
                             match registry.execute(&tc.name, args.clone(), ctx).await {
-                                Ok(data) => (true, clip_tool_result(&tc.name, &data)),
-                                Err(e) => (false, format!("Tool error: {e}")),
-                            }
+                                Ok(data) => (true, clip_tool_result(&tc.name, &data), false),
+                                Err(e) => (false, format!("Tool error: {e}"), true),
+                            };
+                        let duration = started.elapsed();
+                        tool_guard.finish(error);
+                        ToolOutcome {
+                            real_work,
+                            result,
+                            duration,
+                            error,
                         }
                     }
-                },
-            ))
-            .await;
+                }
+            }
+        });
+        let outcomes: Vec<ToolOutcome> = tokio::select! {
+            _ = cancellation.cancelled() => {
+                return Ok(disconnected_report(
+                    memory,
+                    &model,
+                    session_id,
+                    &telemetry,
+                    tool_steps,
+                    attempts,
+                    total_prompt,
+                    total_completion,
+                    &ctx.state.metrics,
+                    &cancellation,
+                ));
+            }
+            outcomes = futures_util::future::join_all(tool_futures) => outcomes,
+        };
 
         // Pass 3 — apply results in original call order, with the same
         // per-call sequence as the old sequential loop: memory fact
         // extraction → empty-result accounting → ToolResult event →
         // transcript push.
         let mut any_real_work = false;
-        for ((tc, (args, plan)), (real_work, result)) in
-            tool_calls.iter().zip(&planned).zip(outcomes)
-        {
+        for ((tc, (args, plan)), outcome) in tool_calls.iter().zip(&planned).zip(outcomes) {
+            let real_work = outcome.real_work;
+            let result = outcome.result;
             if real_work {
                 any_real_work = true;
             }
@@ -1164,6 +1491,31 @@ async fn run_inner(
             // Update working memory from this result (skipped for repeats,
             // matching the previous behavior).
             let facts = extract_facts_from_tool_result(&tc.name, args, &result);
+            let useful_result = facts.has_data;
+            let empty_result = facts.empty_result;
+            let context_tokens = (result.len() as u64 + 3) / 4;
+            telemetry.record(
+                &tc.name,
+                outcome.duration,
+                result.len(),
+                context_tokens,
+                useful_result,
+                empty_result,
+            );
+            if empty_result {
+                ctx.state.metrics.tool_result_empty();
+            }
+            tracing::debug!(
+                session_id,
+                tool = %tc.name,
+                duration_ms = outcome.duration.as_millis() as u64,
+                result_bytes = result.len(),
+                context_tokens,
+                useful = useful_result,
+                empty = empty_result,
+                error = outcome.error,
+                "tool result telemetry"
+            );
             let provenance = crate::agent::contracts::ToolResultEnvelope::from_legacy(
                 &tc.name,
                 args,
@@ -1268,6 +1620,7 @@ async fn run_inner(
         } else {
             "Exhausted internal investigation budget"
         };
+    telemetry.log_stop(session_id, "budget_exhausted", tool_steps, attempts);
 
     let text = format!(
         "## Preliminary Investigation Report\n\n**Status**: {}\n\n{}\n\n\
@@ -1284,9 +1637,16 @@ async fn run_inner(
             kind: ReportKind::Preliminary,
         })
         .await;
+    ctx.state.metrics.investigation_reported(
+        "preliminary",
+        telemetry.dispatched_calls,
+        attempts,
+        text.len(),
+    );
     let _ = tx
         .send(AgentEvent::Done {
             rounds: tool_steps,
+            tool_calls: telemetry.dispatched_calls,
             prompt_tokens: total_prompt,
             completion_tokens: total_completion,
             session_id: session_id.to_string(),
@@ -1413,6 +1773,7 @@ async fn process_sse_line(
 async fn parse_streaming_response(
     resp: reqwest::Response,
     tx: &mpsc::Sender<AgentEvent>,
+    cancellation: CancellationToken,
 ) -> Result<(String, Vec<ToolCallAccum>, (u64, u64))> {
     use futures_util::StreamExt;
 
@@ -1426,7 +1787,12 @@ async fn parse_streaming_response(
     let mut stream = resp.bytes_stream();
     let mut done = false;
 
-    'recv: while let Some(chunk) = stream.next().await {
+    'recv: while let Some(chunk) = tokio::select! {
+        _ = cancellation.cancelled() => {
+            return Err(anyhow::anyhow!("client disconnected"));
+        }
+        chunk = stream.next() => chunk
+    } {
         let chunk = chunk?;
         buf.extend_from_slice(&chunk);
 
@@ -1657,6 +2023,8 @@ mod tests {
             confidence: 0.8,
             confidence_band: "high".into(),
             next_best_test: "check the deploy timeline".into(),
+            historical: false,
+            carry_reason: String::new(),
         });
         mem.add_ruled_out("No matching deploy in the incident window".to_string());
         mem
@@ -1834,6 +2202,7 @@ mod tests {
     #[test]
     fn budget_defaults_when_no_overrides() {
         let b = LoopBudget::from_overrides(None, None);
+        assert_eq!(b.max_tool_calls, 40);
         assert_eq!(b.max_tool_steps, 40);
         assert_eq!(b.max_llm_calls, 55);
     }
@@ -1841,6 +2210,7 @@ mod tests {
     #[test]
     fn budget_low_steps_clamp_to_four_and_calls_floor_at_steps_plus_two() {
         let b = LoopBudget::from_overrides(Some(1), Some(1));
+        assert_eq!(b.max_tool_calls, 4);
         assert_eq!(b.max_tool_steps, 4, "steps clamp up to 4");
         assert_eq!(b.max_llm_calls, 6, "calls floored at steps + 2");
 
@@ -1853,6 +2223,7 @@ mod tests {
     #[test]
     fn budget_caps_at_200_and_300() {
         let b = LoopBudget::from_overrides(Some(9999), Some(9999));
+        assert_eq!(b.max_tool_calls, 200);
         assert_eq!(b.max_tool_steps, 200);
         assert_eq!(b.max_llm_calls, 300);
     }
@@ -1865,6 +2236,7 @@ mod tests {
         assert_eq!(LoopBudget::from_overrides(Some(1), None).min_depth(), 3);
         // Pathological direct construction still bottoms out at 1.
         let b = LoopBudget {
+            max_tool_calls: 1,
             max_tool_steps: 1,
             max_llm_calls: 3,
         };

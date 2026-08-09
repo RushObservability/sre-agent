@@ -342,6 +342,12 @@ pub async fn make_ctx() -> ToolContext {
             query_api_url: None,
             internal_auth_token: "test-not-an-http-server".to_string(),
             caches: Arc::new(Default::default()),
+            metrics: Arc::new(sre_agent::metrics::AgentMetrics::new()),
+            admission: Arc::new(sre_agent::state::InvestigationAdmission::new(
+                4,
+                16,
+                Arc::new(sre_agent::metrics::AgentMetrics::new()),
+            )),
         },
         skill_store,
         tenant_id: "default".to_string(),

@@ -5,6 +5,8 @@ use tracing_subscriber::EnvFilter;
 
 use sre_agent::AppState;
 use sre_agent::config_db::ConfigDb;
+use sre_agent::metrics::AgentMetrics;
+use sre_agent::state::InvestigationAdmission;
 use sre_agent::state::probe_row_policy_support;
 
 #[tokio::main]
@@ -60,12 +62,17 @@ async fn main() -> anyhow::Result<()> {
             "SRE_AGENT_INTERNAL_TOKEN must be set; refusing to expose the SRE agent without internal authentication"
         ))?;
 
+    let metrics = Arc::new(AgentMetrics::new());
+    sre_agent::process_metrics::sample(&metrics);
+    sre_agent::process_metrics::spawn(metrics.clone());
     let state = AppState {
         ch,
         config_db,
         query_api_url,
         internal_auth_token,
         caches: Arc::new(Default::default()),
+        admission: Arc::new(InvestigationAdmission::from_env(metrics.clone())),
+        metrics,
     };
 
     let port: u16 = std::env::var("SRE_AGENT_PORT")

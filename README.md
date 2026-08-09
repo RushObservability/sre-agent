@@ -80,6 +80,9 @@ make docker-push
 | Variable | Default | |
 |---|---|---|
 | `SRE_AGENT_PORT` | `8081` | listen port |
+| `SRE_AGENT_MAX_CONCURRENT_INVESTIGATIONS` | `4` | maximum investigations executing at once |
+| `SRE_AGENT_MAX_QUEUED_INVESTIGATIONS` | `16` | maximum investigations waiting for a slot |
+| `SRE_AGENT_RUNTIME_METRICS_INTERVAL_SECS` | `15` | process/runtime metric sampling interval |
 | `OPENAI_BASE_URL` | `https://api.openai.com` | any OpenAI-compatible endpoint |
 | `OPENAI_API_KEY` | required | provider credential |
 | `sre_agent_model` | `gpt-4o` | set in SRE Agent settings; not read from the environment |
@@ -111,7 +114,15 @@ node, or namespace permissions.
 { "event_id": "", "question": "why is checkout slow?", "additional_context": "" }
 ```
 
-Events: `thinking_delta` (incremental reasoning), `tool_call`, `tool_result`, `summary` (the report), `error`, and `done` (token usage + round count). `GET /healthz` for liveness.
+Events: `thinking_delta` (incremental reasoning), `tool_call`, `tool_result`, `summary` (the report), `error`, and `done` (token usage + round count).
+
+`GET /healthz` is a cheap liveness check. `GET /readyz` verifies ClickHouse and
+LLM configuration and returns `503` until both are available. `GET /metrics`
+exports low-cardinality Prometheus metrics for investigation admission,
+investigation outcomes, report-kind outcomes, investigation work and report
+sizes, process/runtime health, SSE streams, LLM calls and token usage,
+query-api/ClickHouse dependencies, and tool calls; it uses the
+same `x-rush-internal-token` header as the API.
 
 ## Part of Rush
 

@@ -153,6 +153,12 @@ mod tests {
                 query_api_url: None,
                 internal_auth_token: "test-not-an-http-server".to_string(),
                 caches: Arc::new(Default::default()),
+                metrics: Arc::new(crate::metrics::AgentMetrics::new()),
+                admission: Arc::new(crate::state::InvestigationAdmission::new(
+                    4,
+                    16,
+                    Arc::new(crate::metrics::AgentMetrics::new()),
+                )),
             },
             skill_store,
             tenant_id: "default".to_string(),

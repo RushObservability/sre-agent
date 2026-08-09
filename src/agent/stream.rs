@@ -43,6 +43,7 @@ pub enum AgentEvent {
     #[serde(rename = "done")]
     Done {
         rounds: u32,
+        tool_calls: u32,
         prompt_tokens: u64,
         completion_tokens: u64,
         session_id: String,
@@ -114,6 +115,7 @@ mod tests {
     fn done_includes_counts() {
         let out = as_string(AgentEvent::Done {
             rounds: 5,
+            tool_calls: 5,
             prompt_tokens: 1000,
             completion_tokens: 500,
             session_id: "sess_abc".into(),

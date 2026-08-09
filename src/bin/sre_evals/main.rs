@@ -25,6 +25,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -41,6 +42,10 @@ use sre_agent::agent::tools::{ToolContext, ToolRegistry};
 use sre_agent::config_db::ConfigDb;
 
 mod rca_convert;
+mod replay;
+use replay::{
+    ReplayArtifact, ReplayExpectation, ReplayFixture, ReplayToolCall, ReplayedToolResult,
+};
 
 /// The demo-stack service vocabulary. Used as the fallback token set when
 /// extracting candidate root-cause services from the agent's final report.
@@ -68,6 +73,14 @@ pub struct EvalCase {
     #[serde(default)]
     pub window: Option<CaseWindow>,
     pub ground_truth: GroundTruth,
+    /// Deterministic PR6 evaluation contract. Live cases may omit this and
+    /// use the legacy ground-truth fields only.
+    #[serde(default)]
+    pub expectation: ReplayExpectation,
+    /// Replayed tool results and a captured report for offline regression
+    /// testing. This is intentionally separate from live ClickHouse cases.
+    #[serde(default)]
+    pub replay: Option<ReplayFixture>,
     /// "curated" | "seeded" | "benchmark"
     #[serde(default)]
     pub source: Option<String>,
@@ -124,6 +137,10 @@ pub struct CaseResult {
     pub tool_calls: u32,
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
+    #[serde(default)]
+    pub wall_time_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<ReplayArtifact>,
     /// Set when the run itself errored (no report produced).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -138,6 +155,14 @@ pub struct RunReport {
     pub ac3_rate: f64,
     pub reason_accuracy: f64,
     pub avg_tool_calls: f64,
+    #[serde(default)]
+    pub total_prompt_tokens: u64,
+    #[serde(default)]
+    pub total_completion_tokens: u64,
+    #[serde(default)]
+    pub median_tool_calls: f64,
+    #[serde(default)]
+    pub wall_time_ms: u64,
     pub cases: Vec<CaseResult>,
 }
 
@@ -168,6 +193,9 @@ async fn main() -> Result<()> {
 
     match subcommand {
         "run" => run_command(&args[1..]).await,
+        "replay" => replay_command(&args[1..]),
+        "compare" => compare_command(&args[1..]),
+        "release-gate" => release_gate_command(&args[1..]),
         "convert-rcaeval" => {
             let path = args
                 .get(1)
@@ -196,6 +224,89 @@ async fn main() -> Result<()> {
     }
 }
 
+fn replay_command(args: &[String]) -> Result<()> {
+    let flags = parse_flags(args);
+    let cases_path = flags
+        .get("cases")
+        .cloned()
+        .unwrap_or_else(|| "evals/replay_cases.yaml".to_string());
+    let out_dir = flags
+        .get("out")
+        .cloned()
+        .unwrap_or_else(|| "evals/out".to_string());
+    let raw = std::fs::read_to_string(&cases_path)
+        .with_context(|| format!("reading replay cases file {cases_path}"))?;
+    let parsed: CasesFile = serde_yaml::from_str(&raw)
+        .with_context(|| format!("parsing replay cases file {cases_path}"))?;
+    if parsed.cases.is_empty() {
+        anyhow::bail!("no replay cases found in {cases_path}");
+    }
+    let run_id = std::env::var("SRE_EVALS_RUN_ID")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string());
+    let scorer = Scorer::new(LlmConfig {
+        base_url: "http://replay.invalid".into(),
+        api_key: "replay".into(),
+        model: "deterministic-replay".into(),
+        reasoning_effort: None,
+    });
+    let report = replay::evaluate(&run_id, &parsed.cases, &scorer)?;
+    std::fs::create_dir_all(&out_dir).with_context(|| format!("creating output dir {out_dir}"))?;
+    let path = PathBuf::from(&out_dir).join(format!("{run_id}.json"));
+    std::fs::write(&path, serde_json::to_string_pretty(&report)?)
+        .with_context(|| format!("writing {}", path.display()))?;
+    let artifact_dir = PathBuf::from(&out_dir).join("artifacts").join(&run_id);
+    std::fs::create_dir_all(&artifact_dir)?;
+    for artifact in &report.artifacts {
+        let artifact_path = artifact_dir.join(format!("{}.json", artifact.case_id));
+        std::fs::write(artifact_path, serde_json::to_string_pretty(artifact)?)?;
+    }
+    let markdown = replay::render_markdown(&report);
+    let md_path = PathBuf::from(&out_dir).join(format!("{run_id}.md"));
+    std::fs::write(&md_path, &markdown)?;
+    println!("{markdown}");
+    eprintln!("Wrote {} and {}", path.display(), md_path.display());
+    Ok(())
+}
+
+fn load_report(path: &str) -> Result<replay::ReplayRun> {
+    let raw = std::fs::read_to_string(path).with_context(|| format!("reading report {path}"))?;
+    serde_json::from_str(&raw).with_context(|| format!("parsing report {path}"))
+}
+
+fn compare_command(args: &[String]) -> Result<()> {
+    let flags = parse_flags(args);
+    let current = flags.get("current").context("compare requires --current")?;
+    let baseline = flags
+        .get("baseline")
+        .context("compare requires --baseline")?;
+    let current = load_report(current)?;
+    let baseline = load_report(baseline)?;
+    println!("{}", replay::render_comparison(&current, &baseline));
+    Ok(())
+}
+
+fn release_gate_command(args: &[String]) -> Result<()> {
+    let flags = parse_flags(args);
+    let current_path = flags
+        .get("current")
+        .cloned()
+        .unwrap_or_else(|| "evals/out/latest.json".to_string());
+    let baseline_path = flags
+        .get("baseline")
+        .cloned()
+        .unwrap_or_else(|| "evals/baseline-pr6.json".to_string());
+    let current = load_report(&current_path)?;
+    let baseline = load_report(&baseline_path)?;
+    let gate = replay::release_gate(&current, Some(&baseline));
+    println!("{}", gate.render());
+    if !gate.passed {
+        anyhow::bail!("PR6 release gate failed");
+    }
+    Ok(())
+}
+
 /// Minimal hand-rolled `--flag value` parser (no clap dependency).
 fn parse_flags(args: &[String]) -> HashMap<String, String> {
     let mut out = HashMap::new();
@@ -216,6 +327,20 @@ fn parse_flags(args: &[String]) -> HashMap<String, String> {
         }
     }
     out
+}
+
+fn median_tool_calls(results: &[CaseResult]) -> f64 {
+    if results.is_empty() {
+        return 0.0;
+    }
+    let mut values: Vec<u32> = results.iter().map(|r| r.tool_calls).collect();
+    values.sort_unstable();
+    let mid = values.len() / 2;
+    if values.len() % 2 == 0 {
+        (values[mid - 1] as f64 + values[mid] as f64) / 2.0
+    } else {
+        values[mid] as f64
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -286,6 +411,8 @@ async fn run_command(args: &[String]) -> Result<()> {
             tool_calls: 0,
             prompt_tokens: 0,
             completion_tokens: 0,
+            wall_time_ms: 0,
+            artifact: None,
             error: Some(format!("{e:#}")),
         }));
     }
@@ -317,6 +444,10 @@ async fn run_command(args: &[String]) -> Result<()> {
         ac3_rate,
         reason_accuracy,
         avg_tool_calls,
+        total_prompt_tokens: results.iter().map(|r| r.prompt_tokens).sum(),
+        total_completion_tokens: results.iter().map(|r| r.completion_tokens).sum(),
+        median_tool_calls: median_tool_calls(&results),
+        wall_time_ms: results.iter().map(|r| r.wall_time_ms).sum(),
         cases: results,
     };
 
@@ -326,6 +457,14 @@ async fn run_command(args: &[String]) -> Result<()> {
     let md_path = PathBuf::from(&out_dir).join(format!("{run_id}.md"));
     std::fs::write(&json_path, serde_json::to_string_pretty(&report)?)
         .with_context(|| format!("writing {}", json_path.display()))?;
+    let artifact_dir = PathBuf::from(&out_dir).join("artifacts").join(&run_id);
+    std::fs::create_dir_all(&artifact_dir)?;
+    for case in &report.cases {
+        if let Some(artifact) = &case.artifact {
+            let artifact_path = artifact_dir.join(format!("{}.json", artifact.case_id));
+            std::fs::write(artifact_path, serde_json::to_string_pretty(artifact)?)?;
+        }
+    }
     let markdown = render_markdown(&report);
     std::fs::write(&md_path, &markdown)
         .with_context(|| format!("writing {}", md_path.display()))?;
@@ -370,6 +509,12 @@ async fn build_app_state() -> Result<AppState> {
         query_api_url,
         internal_auth_token: "evals-not-an-http-server".to_string(),
         caches: Arc::new(Default::default()),
+        metrics: Arc::new(sre_agent::metrics::AgentMetrics::new()),
+        admission: Arc::new(sre_agent::state::InvestigationAdmission::new(
+            4,
+            16,
+            Arc::new(sre_agent::metrics::AgentMetrics::new()),
+        )),
     })
 }
 
@@ -392,6 +537,7 @@ async fn run_one_case(
     scorer: &Scorer,
     case: &EvalCase,
 ) -> Result<CaseResult> {
+    let started = Instant::now();
     let scopes = vec!["all".to_string()];
 
     // Skill store + system prompt, built the same way the HTTP handler does.
@@ -438,13 +584,11 @@ async fn run_one_case(
     // loop never blocks on a full channel during a long run.
     let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
     let collector = tokio::spawn(async move {
-        let mut tool_calls = 0u32;
+        let mut events = Vec::new();
         while let Some(ev) = rx.recv().await {
-            if let AgentEvent::ToolCall { .. } = ev {
-                tool_calls += 1;
-            }
+            events.push(ev);
         }
-        tool_calls
+        events
     });
 
     let session_id = format!("eval-{}", case.id);
@@ -471,7 +615,11 @@ async fn run_one_case(
 
     // Drop our sender so the collector task can finish counting.
     drop(tx);
-    let stream_tool_calls = collector.await.unwrap_or(0);
+    let events = collector.await.unwrap_or_default();
+    let stream_tool_calls = events
+        .iter()
+        .filter(|event| matches!(event, AgentEvent::ToolCall { .. }))
+        .count() as u32;
 
     let (report_text, report_kind, _mem, prompt_tokens, completion_tokens, _model) =
         outcome.context("agent loop returned an error")?;
@@ -488,6 +636,49 @@ async fn run_one_case(
         Err(e) => (None, Some(format!("judge error: {e}"))),
     };
 
+    let tool_calls = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::ToolCall { name, args } => Some(ReplayToolCall {
+                name: name.clone(),
+                args: args.clone(),
+            }),
+            _ => None,
+        })
+        .collect();
+    let replayed_tool_results = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::ToolResult {
+                name,
+                data,
+                provenance,
+            } => Some(ReplayedToolResult {
+                name: name.clone(),
+                args: Value::Null,
+                data: data.clone(),
+                tenant_id: "default".into(),
+                provenance: provenance.clone(),
+            }),
+            _ => None,
+        })
+        .collect();
+    let artifact = ReplayArtifact {
+        schema_version: replay::REPLAY_SCHEMA_VERSION,
+        case_id: case.id.clone(),
+        tenant_id: "default".into(),
+        question: case.input.text.clone(),
+        context: case.description.clone().unwrap_or_default(),
+        expected: case.expectation.clone(),
+        report: report_text.clone(),
+        report_kind: format!("{report_kind:?}").to_lowercase(),
+        tool_calls,
+        prompt_tokens,
+        completion_tokens,
+        wall_time_ms: started.elapsed().as_millis() as u64,
+        replayed_tool_results,
+    };
+
     Ok(CaseResult {
         id: case.id.clone(),
         source: case.source.clone(),
@@ -501,6 +692,8 @@ async fn run_one_case(
         tool_calls: stream_tool_calls,
         prompt_tokens,
         completion_tokens,
+        wall_time_ms: started.elapsed().as_millis() as u64,
+        artifact: Some(artifact),
         error: None,
     })
 }
@@ -857,6 +1050,13 @@ fn render_markdown(report: &RunReport) -> String {
         "- Avg tool calls: {:.1}\n\n",
         report.avg_tool_calls
     ));
+    s.push_str(&format!(
+        "- Median tool calls: {:.1}\n- Prompt tokens: {}\n- Completion tokens: {}\n- Wall time: {} ms\n\n",
+        report.median_tool_calls,
+        report.total_prompt_tokens,
+        report.total_completion_tokens,
+        report.wall_time_ms
+    ));
 
     s.push_str("## Per-case\n\n");
     s.push_str("| Case | Source | AC@1 | AC@3 | Reason | Kind | Tools | Top candidate |\n");
@@ -963,6 +1163,8 @@ mod tests {
                 reason: "r".into(),
                 related: related.iter().map(|s| s.to_string()).collect(),
             },
+            expectation: ReplayExpectation::default(),
+            replay: None,
             source: Some("seeded".into()),
         }
     }

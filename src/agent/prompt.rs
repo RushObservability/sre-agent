@@ -117,6 +117,12 @@ Test hypotheses systematically. For each tool call:
 4. Interpret the result — confirm, refute, or refine — and **update the ledger row** (status, evidence, confidence)
 
 Investigation heuristics:
+- Choose the next check by expected information gain: which single result
+  would most change the ranking of the top two hypotheses? Prefer a composite
+  causal tool when it answers the same question as several low-level queries.
+- Do not spend calls on confirmatory repetition after the causal gate is met;
+  reserve remaining capacity for one refutation check and one final
+  verification.
 - **Exact comparison first:** for a slowdown or anomaly, establish one UTC incident window and an immediately preceding equal-duration baseline. Use `compare_service_windows` with all four explicit bounds, then `rank_slow_dependencies` to rank changed caller-to-callee edges. Do not substitute a recent snapshot or omit the baseline.
 - **Trace causality:** when a concrete trace ID is available, use `analyze_trace_critical_path` with the same exact windows to separate application self-time from child/database wait and inspect malformed parentage.
 - **Infrastructure corroboration:** use `get_resource_saturation` for a named service, `list_metric_catalog` before guessing metric names, and `detect_service_silence` when a downstream service may have disappeared. Treat missing instrumentation as uncertainty, not healthy evidence.
@@ -206,6 +212,13 @@ tool reports that access is denied, continue with telemetry evidence instead.
 
 - `kube_describe` — Describe any K8s resource (pods, deployments, replicasets, services, etc.). Use '*' as name to list all. Shows status, conditions, container states, events.
 - `kube_events` — List events in a namespace. Filter by resource name or warnings-only. Events reveal why pods fail, deployments stall, or resources are unhealthy.
+
+## DEPLOYED REVISION AND REPOSITORY EVIDENCE
+Repository tools resolve the latest deployment metadata for the linked service.
+Use the reported commit SHA as the source revision when it is available. If the
+result says `unverified_revision`, the repository snapshot is only default-branch
+context and cannot by itself support a high-confidence deploy mechanism; correlate
+it with deploy, GitOps, or CI evidence first.
 
 {gitops_section}
 

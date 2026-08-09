@@ -12,6 +12,14 @@ const MAX_READ_LINES: usize = 400;
 const MAX_TOOL_OUTPUT: usize = 32 * 1024;
 const MAX_SEARCH_FILE_BYTES: u64 = 1024 * 1024;
 
+#[derive(Debug, Clone)]
+struct RevisionInfo {
+    git_ref: String,
+    commit_sha: String,
+    image_ref: String,
+    verified: bool,
+}
+
 pub struct ListRepositoryFiles;
 pub struct SearchRepository;
 pub struct ReadRepositoryFile;
@@ -31,7 +39,10 @@ fn required_string<'a>(args: &'a Value, name: &str) -> Result<&'a str> {
         .with_context(|| format!("{name} is required"))
 }
 
-async fn linked_snapshot(ctx: &ToolContext, service_name: &str) -> Result<(ServiceLink, PathBuf)> {
+async fn linked_snapshot(
+    ctx: &ToolContext,
+    service_name: &str,
+) -> Result<(ServiceLink, PathBuf, RevisionInfo)> {
     let link = ctx
         .state
         .config_db
@@ -40,12 +51,49 @@ async fn linked_snapshot(ctx: &ToolContext, service_name: &str) -> Result<(Servi
         .with_context(|| {
             format!("no repository is linked to service {service_name:?} in this tenant")
         })?;
+    // Deployment markers are the current source of deployed revision metadata.
+    // A commit SHA is safe to use as the repository ref; an image tag/digest is
+    // retained as context but is not blindly passed to GitHub because tags may
+    // not be repository refs. Missing commit metadata is explicitly marked
+    // unverified rather than presented as the healthy deployed revision.
+    let deployment = match ctx
+        .state
+        .config_db
+        .list_deploy_markers(Some(service_name), None, None)
+        .await
+    {
+        Ok(mut markers) => markers.pop(),
+        Err(error) => {
+            tracing::warn!(%error, service = service_name, "deployed revision metadata unavailable");
+            None
+        }
+    };
+    let revision = if let Some(deployment) = deployment {
+        let commit_sha = deployment.commit_sha.trim().to_string();
+        RevisionInfo {
+            git_ref: if commit_sha.is_empty() {
+                link.default_branch.clone()
+            } else {
+                commit_sha.clone()
+            },
+            commit_sha,
+            image_ref: deployment.version.trim().to_string(),
+            verified: !deployment.commit_sha.trim().is_empty(),
+        }
+    } else {
+        RevisionInfo {
+            git_ref: link.default_branch.clone(),
+            commit_sha: String::new(),
+            image_ref: String::new(),
+            verified: false,
+        }
+    };
     let snapshot = ensure_snapshot(
         &ctx.tenant_id,
         &link.github_repo,
         link.github_installation_id,
         link.github_repository_id,
-        &link.default_branch,
+        &revision.git_ref,
     )
     .await?;
     let root = if link.root_path.trim().is_empty() {
@@ -56,7 +104,29 @@ async fn linked_snapshot(ctx: &ToolContext, service_name: &str) -> Result<(Servi
     if !root.is_dir() {
         bail!("configured repository root_path does not exist in the downloaded snapshot")
     }
-    Ok((link, root))
+    Ok((link, root, revision))
+}
+
+fn repository_header(link: &ServiceLink, revision: &RevisionInfo) -> String {
+    let status = if revision.verified {
+        "verified_revision"
+    } else {
+        "unverified_revision"
+    };
+    let commit = if revision.commit_sha.is_empty() {
+        "unknown".to_string()
+    } else {
+        revision.commit_sha.clone()
+    };
+    let image = if revision.image_ref.is_empty() {
+        "unknown".to_string()
+    } else {
+        revision.image_ref.clone()
+    };
+    format!(
+        "Repository: {} @ {}\nDeployed revision: {} (image/tag: {})\nRevision status: {}",
+        link.github_repo, revision.git_ref, commit, image, status
+    )
 }
 
 fn relative_display(root: &Path, path: &Path) -> String {
@@ -134,7 +204,7 @@ impl ListRepositoryFiles {
             .and_then(Value::as_u64)
             .unwrap_or(4)
             .clamp(1, 12) as usize;
-        let (link, root) = linked_snapshot(ctx, service).await?;
+        let (link, root, revision) = linked_snapshot(ctx, service).await?;
         let start = resolve_under(&root, requested_path)?;
         if !start.is_dir() {
             bail!("requested path is not a directory")
@@ -163,9 +233,8 @@ impl ListRepositoryFiles {
         .await??;
         audit_access(ctx, &link, "list", requested_path);
         Ok(format!(
-            "Repository: {} @ {}\nFiles{}:\n{}",
-            link.github_repo,
-            link.default_branch,
+            "{}\nFiles{}:\n{}",
+            repository_header(&link, &revision),
             if paths.len() == MAX_LISTED_FILES {
                 " (truncated)"
             } else {
@@ -219,7 +288,7 @@ impl SearchRepository {
             .and_then(Value::as_u64)
             .unwrap_or(50) as usize;
         let limit = requested_limit.clamp(1, MAX_SEARCH_RESULTS);
-        let (link, root) = linked_snapshot(ctx, service).await?;
+        let (link, root, revision) = linked_snapshot(ctx, service).await?;
         let start = resolve_under(&root, requested_path)?;
         if !start.is_dir() {
             bail!("requested path is not a directory")
@@ -262,9 +331,8 @@ impl SearchRepository {
         .await??;
         audit_access(ctx, &link, "search", requested_path);
         Ok(format!(
-            "Repository: {} @ {}\nLiteral matches for {:?}{}:\n{}",
-            link.github_repo,
-            link.default_branch,
+            "{}\nLiteral matches for {:?}{}:\n{}",
+            repository_header(&link, &revision),
             query,
             if results.len() >= limit {
                 " (truncated)"
@@ -323,7 +391,7 @@ impl ReadRepositoryFile {
         let end_line = requested_end
             .max(start_line)
             .min(start_line + MAX_READ_LINES - 1);
-        let (link, root) = linked_snapshot(ctx, service).await?;
+        let (link, root, revision) = linked_snapshot(ctx, service).await?;
         let path = resolve_under(&root, requested_path)?;
         let output = tokio::task::spawn_blocking(move || -> Result<String> {
             let text = read_text_file(&path, MAX_SEARCH_FILE_BYTES)?;
@@ -345,8 +413,12 @@ impl ReadRepositoryFile {
         .await??;
         audit_access(ctx, &link, "read", requested_path);
         Ok(format!(
-            "Repository: {} @ {}\nFile: {} (lines {}-{})\n{}",
-            link.github_repo, link.default_branch, requested_path, start_line, end_line, output
+            "{}\nFile: {} (lines {}-{})\n{}",
+            repository_header(&link, &revision),
+            requested_path,
+            start_line,
+            end_line,
+            output
         ))
     }
 }
@@ -374,5 +446,54 @@ impl Tool for ReadRepositoryFile {
     }
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String> {
         self.run(args, ctx).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn link() -> ServiceLink {
+        ServiceLink {
+            tenant_id: "tenant-a".into(),
+            service_name: "api".into(),
+            github_repo: "acme/api".into(),
+            github_installation_id: 1,
+            github_repository_id: 2,
+            default_branch: "main".into(),
+            root_path: String::new(),
+        }
+    }
+
+    #[test]
+    fn repository_header_marks_unverified_revision_explicitly() {
+        let header = repository_header(
+            &link(),
+            &RevisionInfo {
+                git_ref: "main".into(),
+                commit_sha: String::new(),
+                image_ref: "api:latest".into(),
+                verified: false,
+            },
+        );
+        assert!(header.contains("unverified_revision"));
+        assert!(header.contains("api:latest"));
+        assert!(header.contains("main"));
+    }
+
+    #[test]
+    fn repository_header_reports_verified_commit_revision() {
+        let header = repository_header(
+            &link(),
+            &RevisionInfo {
+                git_ref: "abc123".into(),
+                commit_sha: "abc123".into(),
+                image_ref: "api@sha256:deadbeef".into(),
+                verified: true,
+            },
+        );
+        assert!(header.contains("verified_revision"));
+        assert!(header.contains("abc123"));
+        assert!(header.contains("api@sha256:deadbeef"));
     }
 }

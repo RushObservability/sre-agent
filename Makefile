@@ -9,7 +9,7 @@ DEV_CLICKHOUSE_URL           := http://localhost:8123
 DEV_QUERY_API_URL            := http://localhost:8080
 DEV_SRE_AGENT_INTERNAL_TOKEN := dev-local-agent-token
 
-.PHONY: build release run check test test-integration fmt lint clean docker docker-push help
+.PHONY: build release run check test test-integration eval-replay eval-release-gate fmt lint clean docker docker-push help
 
 ## Development
 
@@ -48,6 +48,13 @@ check:                ## Type-check without building
 
 test:                 ## Run tests
 	cargo test
+
+eval-replay:          ## Run the deterministic PR6 RCA replay suite
+	cargo run --bin sre_evals -- replay --cases evals/replay_cases.yaml --out evals/out
+
+eval-release-gate:    ## Compare a PR6 replay run with the checked-in baseline (CURRENT=...)
+	@test -n "$(CURRENT)" || { echo "Usage: make eval-release-gate CURRENT=evals/out/<run>.json" >&2; exit 1; }
+	cargo run --bin sre_evals -- release-gate --current "$(CURRENT)" --baseline evals/baseline-pr6.json
 
 # Runs the FULL suite including the #[ignore]d DB-gated tests.
 #

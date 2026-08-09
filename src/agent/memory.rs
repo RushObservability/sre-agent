@@ -4,7 +4,7 @@ use crate::agent::contracts::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
-pub const CURRENT_MEMORY_SCHEMA_VERSION: u32 = 3;
+pub const CURRENT_MEMORY_SCHEMA_VERSION: u32 = 4;
 const LEGACY_MEMORY_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_PROMPT_MEMORY_LIMIT: usize = 12_000;
 
@@ -120,6 +120,13 @@ pub struct EvidenceItem {
     pub quality: ResultQuality,
     #[serde(default)]
     pub references: Vec<String>,
+    /// Evidence retained from a previous follow-up scope. Historical items
+    /// remain available for context but are excluded from the active causal
+    /// gate until a new tool result validates them again.
+    #[serde(default)]
+    pub historical: bool,
+    #[serde(default)]
+    pub carry_reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -151,6 +158,12 @@ pub struct Hypothesis {
     pub confidence_band: String,
     #[serde(default)]
     pub next_best_test: String,
+    /// Hypotheses from an earlier follow-up scope are retained for auditability
+    /// but cannot become the active leading hypothesis without new evidence.
+    #[serde(default)]
+    pub historical: bool,
+    #[serde(default)]
+    pub carry_reason: String,
 }
 
 fn default_hypothesis_status() -> String {
@@ -228,6 +241,87 @@ impl WorkingMemory {
         Ok(())
     }
 
+    /// Prepare persisted working memory for a follow-up turn. Transient loop
+    /// state is always reset. Causal state is retained only when the new
+    /// question overlaps the prior scope and the caller did not select a new
+    /// incident window; otherwise old evidence/hypotheses are marked
+    /// historical and excluded from the active final-report gate.
+    pub fn prepare_follow_up(
+        &mut self,
+        task: String,
+        requested_window: Option<InvestigationWindow>,
+        continue_dead_end: bool,
+    ) -> FollowUpTransition {
+        let window_changed = requested_window
+            .as_ref()
+            .is_some_and(|window| self.window.as_ref() != Some(window));
+        let scope_changed = !task_scope_overlaps(&self.task, &task, &self.hypotheses);
+        let retire_active_scope = window_changed || scope_changed;
+        let reason = if window_changed {
+            "retired: incident window changed"
+        } else if scope_changed {
+            "retired: follow-up question changed investigation scope"
+        } else {
+            "carried forward: overlapping question and incident window"
+        };
+
+        let mut historical_evidence = 0;
+        for item in &mut self.evidence {
+            if retire_active_scope && !item.historical {
+                item.historical = true;
+                historical_evidence += 1;
+            }
+            if !item.historical || retire_active_scope {
+                item.carry_reason = reason.to_string();
+            }
+        }
+        let mut retired_hypotheses = 0;
+        for hypothesis in &mut self.hypotheses {
+            if retire_active_scope && !hypothesis.historical {
+                hypothesis.historical = true;
+                hypothesis.status = "inconclusive".into();
+                retired_hypotheses += 1;
+            }
+            if !hypothesis.historical || retire_active_scope {
+                hypothesis.carry_reason = reason.to_string();
+            }
+        }
+
+        if retire_active_scope {
+            self.suspect_services.clear();
+            self.confirmed_facts.clear();
+            self.ruled_out.clear();
+            self.failed_hypotheses.clear();
+            self.signals_consulted.clear();
+        }
+        self.task = task;
+        if requested_window.is_some() {
+            self.window = requested_window;
+        }
+        self.recent_tool_calls.clear();
+        self.consecutive_empty_results = 0;
+        if !continue_dead_end {
+            self.escalation_level = 0;
+        }
+        self.apply_evidence_polarity();
+
+        FollowUpTransition {
+            scope_changed: retire_active_scope,
+            window_changed,
+            historical_evidence,
+            retired_hypotheses,
+            reason: reason.to_string(),
+        }
+    }
+
+    pub fn active_evidence_count(&self) -> usize {
+        self.evidence.iter().filter(|item| !item.historical).count()
+    }
+
+    pub fn active_signal_count(&self) -> usize {
+        self.signals_consulted.len()
+    }
+
     /// LRU insert: remove existing, push to end, cap size.
     fn remember<T: PartialEq + Clone>(bucket: &mut Vec<T>, item: T, limit: usize) {
         bucket.retain(|x| *x != item);
@@ -301,6 +395,8 @@ impl WorkingMemory {
             polarity: EvidencePolarity::Neutral,
             quality: ResultQuality::legacy(),
             references: Vec::new(),
+            historical: false,
+            carry_reason: String::new(),
         };
         self.evidence.push(item);
         if self.evidence.len() > 20 {
@@ -322,6 +418,14 @@ impl WorkingMemory {
             .ok()
             .and_then(|v| v.as_str().map(ToOwned::to_owned))
             .unwrap_or_else(|| "unknown".into());
+        let historical = match (&self.window, &envelope.window) {
+            (Some(active), Some(result_window)) if active != result_window => true,
+            (None, Some(result_window)) => {
+                self.window = Some(result_window.clone());
+                false
+            }
+            _ => false,
+        };
         let item = EvidenceItem {
             id: self.next_evidence_id(),
             signal: source_family.clone(),
@@ -340,6 +444,12 @@ impl WorkingMemory {
             polarity: EvidencePolarity::Neutral,
             quality: envelope.quality.clone(),
             references: envelope.references.clone(),
+            historical,
+            carry_reason: if historical {
+                "historical: tool result used a different incident window".into()
+            } else {
+                String::new()
+            },
         };
         self.evidence.push(item);
         if self.evidence.len() > 20 {
@@ -449,6 +559,15 @@ impl WorkingMemory {
         if !self.task.is_empty() {
             out.push_str(&format!("**Task**: {}\n", self.task));
         }
+        if let Some(window) = &self.window {
+            out.push_str(&format!(
+                "**Active incident window**: {} to {}; baseline {} to {}\n",
+                window.incident_start.to_rfc3339(),
+                window.incident_end.to_rfc3339(),
+                window.baseline_start.to_rfc3339(),
+                window.baseline_end.to_rfc3339()
+            ));
+        }
         if !self.suspect_services.is_empty() {
             out.push_str(&format!(
                 "**Suspect services**: {}\n",
@@ -460,7 +579,7 @@ impl WorkingMemory {
             for hypothesis in self
                 .hypotheses
                 .iter()
-                .filter(|h| h.status != "refuted")
+                .filter(|h| h.status != "refuted" && !h.historical)
                 .take(6)
             {
                 let path = if hypothesis.propagation_path.is_empty() {
@@ -478,6 +597,9 @@ impl WorkingMemory {
                     hypothesis.next_best_test,
                     path
                 ));
+                if !hypothesis.carry_reason.is_empty() {
+                    out.push_str(&format!("  lifecycle: {}\n", hypothesis.carry_reason));
+                }
                 if !hypothesis.contradicting_evidence_ids.is_empty() {
                     out.push_str(&format!(
                         "  contradictions={}\n",
@@ -527,6 +649,9 @@ impl WorkingMemory {
                     "- [{}] {} via {}{}: {}\n",
                     item.id, item.signal, item.tool, service, item.summary
                 ));
+                if !item.carry_reason.is_empty() {
+                    out.push_str(&format!("  lifecycle: {}\n", item.carry_reason));
+                }
             }
         }
         if self.escalation_level > 0 {
@@ -593,6 +718,72 @@ fn normalize_hypothesis(hypothesis: &mut Hypothesis) {
         values.retain(|value| !value.trim().is_empty());
         values.truncate(20);
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FollowUpTransition {
+    pub scope_changed: bool,
+    pub window_changed: bool,
+    pub historical_evidence: usize,
+    pub retired_hypotheses: usize,
+    pub reason: String,
+}
+
+fn task_scope_overlaps(old_task: &str, new_task: &str, hypotheses: &[Hypothesis]) -> bool {
+    if old_task.trim().is_empty() || new_task.trim().is_empty() {
+        return true;
+    }
+    let old = scope_tokens(old_task);
+    let new = scope_tokens(new_task);
+    if old.iter().any(|token| new.contains(token)) {
+        return true;
+    }
+    let new_lower = new_task.to_ascii_lowercase();
+    hypotheses.iter().any(|hypothesis| {
+        !hypothesis.historical
+            && (!hypothesis.culprit_service.is_empty()
+                && new_lower.contains(&hypothesis.culprit_service.to_ascii_lowercase())
+                || !hypothesis.symptom_service.is_empty()
+                    && new_lower.contains(&hypothesis.symptom_service.to_ascii_lowercase()))
+    })
+}
+
+fn scope_tokens(value: &str) -> HashSet<String> {
+    const STOP_WORDS: &[&str] = &[
+        "about",
+        "after",
+        "agent",
+        "an",
+        "and",
+        "are",
+        "can",
+        "check",
+        "continue",
+        "did",
+        "for",
+        "from",
+        "how",
+        "investigate",
+        "is",
+        "it",
+        "me",
+        "of",
+        "on",
+        "or",
+        "please",
+        "show",
+        "the",
+        "this",
+        "to",
+        "what",
+        "why",
+        "with",
+    ];
+    value
+        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_' && ch != '-')
+        .map(str::to_ascii_lowercase)
+        .filter(|token| token.len() >= 3 && !STOP_WORDS.contains(&token.as_str()))
+        .collect()
 }
 
 fn keep_recent<T>(items: &mut Vec<T>, limit: usize) {
@@ -1384,6 +1575,57 @@ mod tests {
     }
 
     #[test]
+    fn follow_up_partitions_changed_scope_and_resets_transient_state() {
+        use crate::agent::contracts::WindowSelectionReason;
+        use chrono::{TimeZone, Utc};
+
+        let first_window = InvestigationWindow::new(
+            Utc.with_ymd_and_hms(2026, 8, 1, 10, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 8, 1, 11, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 8, 1, 9, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 8, 1, 10, 0, 0).unwrap(),
+            WindowSelectionReason::UserProvidedRange,
+        )
+        .unwrap();
+        let second_window = InvestigationWindow::new(
+            Utc.with_ymd_and_hms(2026, 8, 1, 12, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 8, 1, 13, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 8, 1, 11, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 8, 1, 12, 0, 0).unwrap(),
+            WindowSelectionReason::UserProvidedRange,
+        )
+        .unwrap();
+
+        let mut memory = WorkingMemory::new("Why is api erroring?".into());
+        memory.window = Some(first_window);
+        memory.add_evidence("logs", "search_logs", "api", "errors increased".into());
+        memory.add_suspect_service("api".into());
+        memory.add_fact("api errors increased".into());
+        memory.record_signal("logs");
+        memory.escalation_level = 2;
+        memory.record_call(CallSignature {
+            tool: "search_logs".into(),
+            args_normalized: "{service:api}".into(),
+        });
+
+        let transition =
+            memory.prepare_follow_up("Why is checkout slow?".into(), Some(second_window), false);
+
+        assert!(transition.scope_changed);
+        assert!(transition.window_changed);
+        assert_eq!(transition.historical_evidence, 1);
+        assert!(memory.evidence[0].historical);
+        assert_eq!(memory.active_evidence_count(), 0);
+        assert!(memory.suspect_services.is_empty());
+        assert!(memory.confirmed_facts.is_empty());
+        assert!(memory.signals_consulted.is_empty());
+        assert!(memory.recent_tool_calls.is_empty());
+        assert_eq!(memory.consecutive_empty_results, 0);
+        assert_eq!(memory.escalation_level, 0);
+        assert!(transition.reason.contains("window changed"));
+    }
+
+    #[test]
     fn bounded_prompt_prioritizes_active_hypotheses() {
         let mut memory = WorkingMemory::new("task".into());
         memory.hypotheses.push(Hypothesis {
@@ -1401,6 +1643,8 @@ mod tests {
             confidence: 0.4,
             confidence_band: "low".into(),
             next_best_test: "compare media resource metrics".into(),
+            historical: false,
+            carry_reason: String::new(),
         });
         for _ in 0..50 {
             memory.add_fact("large fact ".repeat(50));

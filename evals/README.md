@@ -56,6 +56,47 @@ Flags: `--cases <file>` (default `evals/cases.yaml`), `--limit <N>`,
 `--out <dir>` (default `evals/out`). The run id defaults to a UTC timestamp;
 override with `SRE_EVALS_RUN_ID`.
 
+## PR6 deterministic replay and release gate
+
+`evals/replay_cases.yaml` is a deterministic, offline suite of 20 labeled
+cases covering service silence/down, CPU and memory pressure, database and
+dependency latency, traffic surge/skew, deploy/configuration regressions,
+queue/disk/network saturation, missing logs, partial traces, contradictory
+signals, ambiguous onset, and model/tool failures. Each case stores its
+question, expected culprit/mechanism/path, evidence classes, corroboration
+minimum, expected report kind, and replayed tool results with tenant and
+provenance metadata.
+
+Run it without ClickHouse, credentials, or an LLM:
+
+```bash
+SRE_EVALS_RUN_ID=pr6-local cargo run --bin sre_evals -- replay \
+  --cases evals/replay_cases.yaml --out evals/out
+```
+
+This writes an aggregate JSON/Markdown report and one complete replay artifact
+per case under `evals/out/artifacts/<run-id>/`. Artifacts contain the original
+question, expected contract, captured report, tool arguments/results,
+structured provenance, and prompt/completion/wall-time measurements.
+
+Compare a run to the checked-in baseline:
+
+```bash
+cargo run --bin sre_evals -- compare \
+  --current evals/out/pr6-local.json \
+  --baseline evals/baseline-pr6.json
+cargo run --bin sre_evals -- release-gate \
+  --current evals/out/pr6-local.json \
+  --baseline evals/baseline-pr6.json
+```
+
+The release gate currently requires at least 20 cases, AC@1 ≥ 90%, mechanism
+accuracy ≥ 85%, false-final rate ≤ 2%, median actual tool calls ≤ 12, and zero
+tenant-scope or provenance failures. It also rejects material regressions
+against the supplied baseline. The suite reports AC@1/AC@3, mechanism and
+causal-chain completeness, confidence Brier score, preliminary usefulness,
+actual calls, tokens, wall time, false-final rate, and scope/provenance errors.
+
 ---
 
 ## Case schema

@@ -25,7 +25,9 @@ use common::{
 use serde_json::json;
 use tokio::sync::mpsc;
 
-use sre_agent::agent::loop_runner::{LlmConfig, run_with_config};
+use sre_agent::agent::loop_runner::{
+    LlmConfig, LoopBudget, run_with_config, run_with_config_and_budget,
+};
 use sre_agent::agent::stream::{AgentEvent, ReportKind};
 
 /// Marker text of the root-cause gate's gap system message.
@@ -327,5 +329,75 @@ async fn empty_response_triggers_retry_without_burning_tool_budget() {
     assert_eq!(
         count_messages_containing(last, "system", CRITIQUE_MARKER),
         1
+    );
+}
+
+#[tokio::test]
+async fn concurrent_tool_batch_cannot_bypass_actual_call_budget() {
+    let scripts = vec![
+        Script::ToolCalls(vec![
+            (
+                "search_logs".to_string(),
+                json!({"service": "api"}),
+                "call_1".to_string(),
+            ),
+            (
+                "query_metrics".to_string(),
+                json!({"service": "api"}),
+                "call_2".to_string(),
+            ),
+        ]),
+        Script::Final("## Root Cause\nBudget test report.".to_string()),
+        Script::Final("## Root Cause\nBudget test report.".to_string()),
+        Script::Final("## Root Cause\nBudget test report.".to_string()),
+        Script::Final("## Root Cause\nBudget test report.".to_string()),
+    ];
+    let server = start_mock(scripts).await;
+    let registry = make_registry(vec![
+        ("search_logs", "Found 1 log entry.".to_string()),
+        ("query_metrics", "Latest=1".to_string()),
+    ]);
+    let ctx = make_ctx().await;
+    let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
+    let llm = LlmConfig {
+        base_url: server.base_url.clone(),
+        api_key: "sk-test".to_string(),
+        model: "gpt-4o".to_string(),
+        reasoning_effort: None,
+    };
+    let budget = LoopBudget {
+        max_tool_calls: 3,
+        max_tool_steps: 10,
+        max_llm_calls: 8,
+    };
+
+    let result = run_with_config_and_budget(
+        initial_messages("Investigate api"),
+        &registry,
+        &ctx,
+        &tx,
+        llm,
+        None,
+        "sess-budget-cap",
+        budget,
+    )
+    .await
+    .unwrap();
+    drop(tx);
+    let events = collect_events(&mut rx).await;
+
+    let tool_calls = events
+        .iter()
+        .filter(|event| matches!(event, AgentEvent::ToolCall { .. }))
+        .count();
+    assert_eq!(
+        tool_calls, 1,
+        "two-call batch is capped after reserving verification capacity"
+    );
+    assert_eq!(result.2.evidence.len(), 1);
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::Done { tool_calls: 1, .. }))
     );
 }

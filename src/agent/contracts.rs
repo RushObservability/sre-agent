@@ -178,6 +178,7 @@ pub enum SourceFamily {
     Logs,
     #[serde(rename = "otel_metrics")]
     OTelMetrics,
+    Database,
     Kubernetes,
     Deploys,
     Repository,
@@ -435,6 +436,7 @@ fn source_family_for_tool(tool_name: &str) -> SourceFamily {
         }
         "list_deploys" | "get_anomaly_context" => SourceFamily::Deploys,
         "list_repo_files" | "search_repo" | "read_repo_file" => SourceFamily::Repository,
+        "inspect_postgresql" => SourceFamily::Database,
         // Service RED metrics are currently calculated from spans in the
         // built-in implementation, so they intentionally remain traces.
         _ => SourceFamily::Traces,
@@ -464,6 +466,12 @@ fn source_tables_for_tool(tool_name: &str) -> Vec<String> {
         SourceFamily::Deploys => vec!["config_deploys".into()],
         SourceFamily::Repository => vec!["repository_api".into()],
         SourceFamily::OTelMetrics => vec!["otel_metrics".into()],
+        SourceFamily::Database => vec![
+            "spans".into(),
+            "logs".into(),
+            "metrics_gauge".into(),
+            "metrics_sum".into(),
+        ],
     }
 }
 

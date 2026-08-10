@@ -8,6 +8,33 @@ DEV_SRE_AGENT_PORT           := 8081
 DEV_CLICKHOUSE_URL           := http://localhost:8123
 DEV_QUERY_API_URL            := http://localhost:8080
 DEV_SRE_AGENT_INTERNAL_TOKEN := dev-local-agent-token
+DEV_CLICKHOUSE_CONTAINER     ?= wide-clickhouse-1
+
+# Resolve local ClickHouse credentials at recipe runtime so passwords never
+# appear in Make's echoed command. Explicit CLICKHOUSE_USER/PASSWORD values win;
+# otherwise the standard `wide` ClickHouse container supplies any missing value.
+define run-with-dev-env
+	@set -e; \
+	ch_user="$${CLICKHOUSE_USER:-}"; \
+	ch_password="$${CLICKHOUSE_PASSWORD:-}"; \
+	if [ "$(DEV_CLICKHOUSE_URL)" = "http://localhost:8123" ] && \
+	   { [ -z "$$ch_user" ] || [ -z "$$ch_password" ]; } && \
+	   command -v docker >/dev/null 2>&1 && \
+	   docker inspect "$(DEV_CLICKHOUSE_CONTAINER)" >/dev/null 2>&1; then \
+		ch_env="$$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$(DEV_CLICKHOUSE_CONTAINER)")"; \
+		if [ -z "$$ch_user" ]; then ch_user="$$(printf '%s\n' "$$ch_env" | sed -n 's/^CLICKHOUSE_USER=//p')"; fi; \
+		if [ -z "$$ch_password" ]; then ch_password="$$(printf '%s\n' "$$ch_env" | sed -n 's/^CLICKHOUSE_PASSWORD=//p')"; fi; \
+	fi; \
+	ch_user="$${ch_user:-default}"; \
+	SRE_AGENT_PORT=$(DEV_SRE_AGENT_PORT) \
+	CLICKHOUSE_URL=$(DEV_CLICKHOUSE_URL) \
+	CLICKHOUSE_USER="$$ch_user" \
+	CLICKHOUSE_PASSWORD="$$ch_password" \
+	QUERY_API_URL=$(DEV_QUERY_API_URL) \
+	SRE_AGENT_INTERNAL_TOKEN=$(DEV_SRE_AGENT_INTERNAL_TOKEN) \
+	RUST_LOG=sre_agent=debug,tower_http=debug \
+	$(1)
+endef
 
 .PHONY: build release run check test test-integration eval-replay eval-release-gate fmt lint clean docker docker-push help
 
@@ -20,12 +47,7 @@ release:              ## Build optimised release binary
 	cargo build --release
 
 dev:                  ## Run the agent with local development wiring
-	SRE_AGENT_PORT=$(DEV_SRE_AGENT_PORT) \
-	CLICKHOUSE_URL=$(DEV_CLICKHOUSE_URL) \
-	QUERY_API_URL=$(DEV_QUERY_API_URL) \
-	SRE_AGENT_INTERNAL_TOKEN=$(DEV_SRE_AGENT_INTERNAL_TOKEN) \
-	RUST_LOG=sre_agent=debug,tower_http=debug \
-	cargo run --bin $(BINARY)
+	$(call run-with-dev-env,cargo run --bin $(BINARY))
 
 run:                  ## Run the agent with variables sourced from .env
 	@set -e; \
@@ -34,12 +56,7 @@ run:                  ## Run the agent with variables sourced from .env
 	RUST_LOG="$${RUST_LOG:-sre_agent=info,tower_http=info}" cargo run --bin $(BINARY)
 
 watch:                ## Watch the agent with local development wiring
-	SRE_AGENT_PORT=$(DEV_SRE_AGENT_PORT) \
-	CLICKHOUSE_URL=$(DEV_CLICKHOUSE_URL) \
-	QUERY_API_URL=$(DEV_QUERY_API_URL) \
-	SRE_AGENT_INTERNAL_TOKEN=$(DEV_SRE_AGENT_INTERNAL_TOKEN) \
-	RUST_LOG=sre_agent=debug,tower_http=debug \
-	cargo watch -x "run --bin $(BINARY)"
+	$(call run-with-dev-env,cargo watch -x "run --bin $(BINARY)")
 
 ## Quality
 

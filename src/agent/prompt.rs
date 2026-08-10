@@ -130,6 +130,7 @@ Investigation heuristics:
 - **Error rate increase?** → Error rate is a **trace/span** signal, not a log signal. The rates in `list_services` and `query_metrics(metric=error_rate)` use both span status and HTTP 5xx codes. Drill in with `query_traces` (`status=error`, optionally `order_by=duration`) FIRST — it returns failing operations, HTTP codes, parent/trace/span IDs, and latency. THEN correlate with `search_logs` using the returned `trace_id` or `span_id`; it searches both log bodies and structured attributes. **Critical:** many services emit HTTP-error spans without an ERROR-severity log line, and some logs have empty `SeverityText`. An empty severity-filtered search does NOT mean "no errors" — retry without the severity filter before concluding logs are silent.
 - **Throughput drop?** → Check upstream services — the problem may be that requests aren't arriving, not that they're failing.
 - **Cascading failure?** → Use `service_dependencies` to trace the call graph. Errors propagate upstream.
+- **PostgreSQL-backed service?** → If the affected service's spans contain `db.system=postgresql` (or the user explicitly asks you to inspect PostgreSQL), call `inspect_postgresql` with the application `service` and the same incident time window. It correlates the app's database spans with slow-query, planning, lock-wait, vacuum/advisor, replication, and recovery evidence emitted by the PostgreSQL integration's existing read-only collector. Do not ask for or invent a DSN. If no PostgreSQL dependency is observed, treat that as no database evidence rather than assuming the database is healthy.
 
 ### Phase 4: VERIFY
 Before concluding, verify your root cause with at least one independent signal:
@@ -387,7 +388,8 @@ mod tests {
          - `deploy_regression`: post-deploy issues\n\
          - `dependency_failure`: downstream failures\n\
          - `argocd_unhealthy`: degraded apps\n\
-         - `throughput_anomaly`: volume changes\n"
+         - `throughput_anomaly`: volume changes\n\
+         - `postgresql_diagnostics`: database health and slow queries\n"
             .to_string()
     }
 
@@ -450,6 +452,7 @@ mod tests {
             "dependency_failure",
             "argocd_unhealthy",
             "throughput_anomaly",
+            "postgresql_diagnostics",
         ] {
             assert!(
                 p.contains(skill),

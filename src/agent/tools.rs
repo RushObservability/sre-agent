@@ -285,5 +285,6 @@ mod tests {
         assert!(names.contains(&"load_skill".to_string()));
         assert!(names.contains(&"get_argocd_app".to_string()));
         assert!(names.contains(&"get_flux_resource".to_string()));
+        assert!(names.contains(&"inspect_postgresql".to_string()));
     }
 }

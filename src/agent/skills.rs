@@ -383,6 +383,30 @@ Is the throughput increase causing latency degradation or errors? Use `query_met
 - Traffic patterns: `query_traces` to see which endpoints have changed volume"#,
     });
 
+    m.insert("postgresql_diagnostics", Skill {
+        name: "postgresql_diagnostics",
+        title: "PostgreSQL Diagnostics",
+        description: "Correlate application database spans with read-only PostgreSQL integration evidence",
+        content: r#"# PostgreSQL Diagnostics Playbook
+
+Use this playbook when the affected application uses PostgreSQL or the user explicitly asks for database investigation.
+
+## Correlate first
+1. Identify the affected application service and incident window.
+2. Call `inspect_postgresql` with the application `service`; include `around` or the exact incident bounds when available.
+3. Never request, expose, or invent a DSN. The tool reads evidence emitted by the PostgreSQL integration's existing read-only collector connection.
+
+## Interpret the evidence
+- High `mean_ms` or `p95_ms` query samples: inspect query shape, plan time, rows, cache misses, WAL, and the Explain handoff before recommending an index or query change.
+- Lock waits or prepared transactions: identify the relation and age, then correlate with long application transactions and deploys.
+- Advisor findings: treat them as evidence-backed recommendations, not automatic changes.
+- Replication/recovery findings: distinguish primary/standby behavior, replay freshness, archive failures, and logical subscription errors.
+- No PostgreSQL spans: do not claim the database is healthy; report that the application is not currently instrumented for a PostgreSQL dependency in the selected window.
+
+## Root-cause discipline
+The application service may be the symptom. Name PostgreSQL or the specific database-side mechanism only when the collector evidence supports it, and separate database evidence from the application's database-call latency."#,
+    });
+
     m
 }
 
@@ -415,6 +439,7 @@ mod tests {
             "dependency_failure",
             "argocd_unhealthy",
             "throughput_anomaly",
+            "postgresql_diagnostics",
         ];
         for name in expected {
             assert!(skills.contains_key(name), "missing skill: {name}");
@@ -449,6 +474,7 @@ mod tests {
             "kube_events",
             "list_services",
             "service_dependencies",
+            "inspect_postgresql",
         ];
         for (key, skill) in all_skills() {
             let mentions_any = tool_names.iter().any(|t| skill.content.contains(t));

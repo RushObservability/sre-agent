@@ -7,6 +7,7 @@ mod kube_tool;
 mod logs;
 mod metrics;
 mod past_incidents;
+mod postgres;
 mod repository_tools;
 mod service_analysis;
 mod services;
@@ -34,6 +35,7 @@ pub fn register_all(registry: &mut ToolRegistry) {
         Arc::new(deploys::ListDeploys),
         Arc::new(anomalies::GetAnomalyContext),
         Arc::new(past_incidents::SearchPastIncidents),
+        Arc::new(postgres::InspectPostgresql),
         Arc::new(repository_tools::ListRepositoryFiles),
         Arc::new(repository_tools::SearchRepository),
         Arc::new(repository_tools::ReadRepositoryFile),

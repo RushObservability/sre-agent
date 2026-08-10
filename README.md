@@ -11,7 +11,7 @@
 
 Give sre-agent an alert or a plain-English question and it forms a hypothesis and goes looking — across traces, logs, metrics, Kubernetes, ArgoCD, and deploy history — until it can name a likely cause. It streams its reasoning as it works, so you watch the investigation rather than wait for a verdict.
 
-Under the hood it's a ReAct loop over an OpenAI-compatible model with a dozen built-in tools. The interesting problems here aren't calling the LLM; they're knowing when to stop, what to keep in a small context window, and how to keep the model from chasing its own tail.
+Under the hood it's a ReAct loop over an OpenAI-compatible model with 25 built-in tools. The interesting problems here aren't calling the LLM; they're knowing when to stop, what to keep in a small context window, and how to keep the model from chasing its own tail.
 
 > Not a standalone product. sre-agent is one service in a [Rush](https://github.com/RushObservability) deployment and expects the rest to be running.
 
@@ -19,7 +19,7 @@ Under the hood it's a ReAct loop over an OpenAI-compatible model with a dozen bu
 
 Investigations follow a five-phase playbook — orient, hypothesize, gather evidence, verify, conclude — and the agent keeps a small working memory (suspect services, confirmed facts, things ruled out) that survives transcript compaction. Duplicate tool calls come back as errors written to teach the model to self-correct. Parse retries are counted apart from real work, so a malformed response doesn't eat the investigation budget. A run of empty results forces a summary instead of more thrashing.
 
-It reads telemetry straight from ClickHouse, fetches user-authored skills from [query-api](https://github.com/RushObservability/query-api) over HTTP (one source of truth, no shared volume), and reaches Kubernetes and ArgoCD through the in-cluster ServiceAccount.
+It reads telemetry straight from ClickHouse, fetches user-authored skills from [query-api](https://github.com/RushObservability/query-api) over HTTP (one source of truth, no shared volume), and reaches Kubernetes and ArgoCD/Flux through the in-cluster ServiceAccount. Investigation sessions and follow-up turns are persisted in tenant-scoped ClickHouse configuration tables.
 
 ## Read-only GitHub source access
 
@@ -57,10 +57,26 @@ query-api's tamper-evident audit log without tokens or source contents.
 | `search_logs` | logs by severity and text |
 | `query_metrics` | request rate, error rate, p50/p99 |
 | `list_services` / `service_dependencies` | health snapshot; call graph |
-| `list_deploys` / `get_anomaly_context` | recent deploys; anomaly rules and events |
-| `get_argocd_app` | Application health, sync, history |
+| `compare_service_windows` / `rank_slow_dependencies` | incident-vs-baseline service comparison; slow downstream ranking |
+| `analyze_trace_critical_path` | identify spans dominating a trace's duration |
+| `get_resource_saturation` / `list_metric_catalog` | resource pressure; available metric names and labels |
+| `detect_service_silence` | distinguish missing traffic from a healthy low-volume service |
+| `inspect_postgresql` | correlate an app's PostgreSQL spans with slow-query, lock, advisor, replication, recovery, and planning evidence from the existing read-only PostgreSQL collector |
+| `list_deploys` / `get_anomaly_context` / `search_past_incidents` | deploys; anomaly context; prior investigation leads |
+| `get_argocd_app` / `get_flux_resource` | ArgoCD and Flux resource health |
 | `kube_describe` / `kube_events` | describe resources in the caller's mapped namespaces; namespace events |
+| `list_repository_files` / `search_repository` / `read_repository_file` | bounded, read-only access to operator-approved GitHub repositories |
 | `load_skill` | load an investigation playbook |
+
+The built-in skills are `error_rate_spike`, `latency_degradation`,
+`deploy_regression`, `dependency_failure`, `argocd_unhealthy`,
+`flux_unhealthy`, `throughput_anomaly`, and `postgresql_diagnostics`.
+
+Custom skills are managed from **Settings → AI Agent → Custom skills** in the
+frontend. They are stored by query-api, loaded fresh for the next investigation,
+and merged with the built-ins. The agent only receives enabled skills. Custom
+skill bodies are treated as untrusted advisory content and never override the
+agent's system rules.
 
 ## Running it
 
@@ -82,11 +98,26 @@ make docker-push
 | `SRE_AGENT_PORT` | `8081` | listen port |
 | `SRE_AGENT_MAX_CONCURRENT_INVESTIGATIONS` | `4` | maximum investigations executing at once |
 | `SRE_AGENT_MAX_QUEUED_INVESTIGATIONS` | `16` | maximum investigations waiting for a slot |
+| `SRE_AGENT_MAX_TOOL_STEPS` | `40` | fallback maximum tool-bearing rounds per investigation; Settings takes precedence |
+| `SRE_AGENT_MAX_LLM_CALLS` | `55` | fallback maximum total provider calls, including retries and final review; Settings takes precedence |
 | `SRE_AGENT_RUNTIME_METRICS_INTERVAL_SECS` | `15` | process/runtime metric sampling interval |
+| `SRE_AGENT_INTERNAL_TOKEN` | required | shared query-api-to-agent credential; never expose it to browsers |
+| `QUERY_API_URL` | unset | query-api base URL for fetching custom skills; local ClickHouse config is the fallback |
 | `OPENAI_BASE_URL` | `https://api.openai.com` | any OpenAI-compatible endpoint |
 | `OPENAI_API_KEY` | required | provider credential |
 | `sre_agent_model` | `gpt-4o` | set in SRE Agent settings; not read from the environment |
 | `ARGOCD_NAMESPACE` | `argocd` | where ArgoCD Application CRDs live |
+
+The same agent settings can be managed at runtime in the frontend under
+**Settings → AI Agent**:
+
+- **Tenant access** enables the agent for all enabled tenants or an explicit list.
+- **Models** defines the allowlist, default model, and reasoning levels available to users.
+- **Investigation limits** changes the tool-step and LLM-call budgets for new investigations.
+- **Custom skills** creates, edits, enables/disables, and deletes user-authored playbooks.
+
+Runtime settings are stored by query-api and take effect for new investigations
+(budget changes may remain cached for up to 30 seconds).
 
 ### Kubernetes access boundaries
 
@@ -114,7 +145,7 @@ node, or namespace permissions.
 { "event_id": "", "question": "why is checkout slow?", "additional_context": "" }
 ```
 
-Events: `thinking_delta` (incremental reasoning), `tool_call`, `tool_result`, `summary` (the report), `error`, and `done` (token usage + round count).
+Events: `session_created` (for a new interactive session), `thinking_delta` (incremental reasoning), `tool_call`, `tool_result`, `summary` (final or preliminary report), `error`, and `done` (token usage + round count). Sessions can be continued with follow-up questions from the frontend.
 
 `GET /healthz` is a cheap liveness check. `GET /readyz` verifies ClickHouse and
 LLM configuration and returns `503` until both are available. `GET /metrics`

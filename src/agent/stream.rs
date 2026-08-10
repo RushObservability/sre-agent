@@ -28,7 +28,7 @@ pub enum AgentEvent {
     ToolResult {
         name: String,
         data: String,
-        provenance: ToolResultEnvelope,
+        provenance: Box<ToolResultEnvelope>,
     },
     #[serde(rename = "summary")]
     Summary {
@@ -100,12 +100,12 @@ mod tests {
         let out = as_string(AgentEvent::ToolResult {
             name: "search_logs".into(),
             data: "Found 10 logs".into(),
-            provenance: ToolResultEnvelope::from_legacy(
+            provenance: Box::new(ToolResultEnvelope::from_legacy(
                 "search_logs",
                 &json!({}),
                 "Found 10 logs",
                 None,
-            ),
+            )),
         });
         assert!(out.contains(r#""type":"tool_result""#));
         assert!(out.contains("Found 10 logs"));

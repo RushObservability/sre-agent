@@ -47,9 +47,9 @@ fn time_predicate(window: &InvestigationWindow, period: &str, column: &str) -> S
     )
 }
 
-fn envelope(
-    tool_name: &str,
-    args: &Value,
+struct EnvelopeParams<'a> {
+    tool_name: &'a str,
+    args: &'a Value,
     source_family: SourceFamily,
     source_tables: Vec<String>,
     window: InvestigationWindow,
@@ -63,27 +63,34 @@ fn envelope(
     baseline_value: Value,
     delta: Value,
     data: Value,
-) -> Result<String, serde_json::Error> {
-    let mut result = ToolResultEnvelope::from_legacy(tool_name, args, &summary, Some(&summary));
-    result.status = status.clone();
-    result.source_family = source_family;
-    result.source_tables = source_tables;
-    result.window = Some(window);
-    result.service = service;
-    result.operation = operation;
-    result.sample_count = sample_count;
-    result.incident_value = Some(incident_value);
-    result.baseline_value = Some(baseline_value);
-    result.absolute_delta = Some(delta);
+}
+
+fn envelope(params: EnvelopeParams<'_>) -> Result<String, serde_json::Error> {
+    let mut result = ToolResultEnvelope::from_legacy(
+        params.tool_name,
+        params.args,
+        &params.summary,
+        Some(&params.summary),
+    );
+    result.status = params.status.clone();
+    result.source_family = params.source_family;
+    result.source_tables = params.source_tables;
+    result.window = Some(params.window);
+    result.service = params.service;
+    result.operation = params.operation;
+    result.sample_count = params.sample_count;
+    result.incident_value = Some(params.incident_value);
+    result.baseline_value = Some(params.baseline_value);
+    result.absolute_delta = Some(params.delta);
     result.quality = ResultQuality {
-        band: match status {
+        band: match params.status {
             ResultStatus::Ok => QualityBand::High,
             ResultStatus::Partial => QualityBand::Medium,
             _ => QualityBand::Low,
         },
-        reasons: warnings,
+        reasons: params.warnings,
     };
-    serialize_tool_output(&result, data)
+    serialize_tool_output(&result, params.data)
 }
 
 fn denied(
@@ -378,23 +385,23 @@ impl Tool for AnalyzeTraceCriticalPath {
             .fetch_all::<CriticalSpanRow>()
             .await?;
         if rows.is_empty() {
-            return Ok(envelope(
-                self.name(),
-                &args,
-                SourceFamily::Traces,
-                vec!["spans".into()],
+            return Ok(envelope(EnvelopeParams {
+                tool_name: self.name(),
+                args: &args,
+                source_family: SourceFamily::Traces,
+                source_tables: vec!["spans".into()],
                 window,
-                ResultStatus::NoData,
-                "No spans were found for this trace in the incident window.".into(),
-                0,
-                trace_id.into(),
-                "critical_path".into(),
-                vec!["trace is absent or outside the requested window".into()],
-                json!({}),
-                json!({}),
-                json!({}),
-                json!({"trace_id":trace_id,"critical_path":[],"warnings":["no spans"]}),
-            )?);
+                status: ResultStatus::NoData,
+                summary: "No spans were found for this trace in the incident window.".into(),
+                sample_count: 0,
+                service: trace_id.into(),
+                operation: "critical_path".into(),
+                warnings: vec!["trace is absent or outside the requested window".into()],
+                incident_value: json!({}),
+                baseline_value: json!({}),
+                delta: json!({}),
+                data: json!({"trace_id":trace_id,"critical_path":[],"warnings":["no spans"]}),
+            })?);
         }
         let (data, warnings, sample_count) = critical_path_data(rows);
         let status = if data["warnings"]
@@ -408,23 +415,23 @@ impl Tool for AnalyzeTraceCriticalPath {
         let summary = format!(
             "Reconstructed trace {trace_id}; application self-time and downstream child wait are separated."
         );
-        Ok(envelope(
-            self.name(),
-            &args,
-            SourceFamily::Traces,
-            vec!["spans".into()],
+        Ok(envelope(EnvelopeParams {
+            tool_name: self.name(),
+            args: &args,
+            source_family: SourceFamily::Traces,
+            source_tables: vec!["spans".into()],
             window,
             status,
             summary,
             sample_count,
-            trace_id.into(),
-            "critical_path".into(),
+            service: trace_id.into(),
+            operation: "critical_path".into(),
             warnings,
-            data.clone(),
-            json!({}),
-            data.clone(),
+            incident_value: data.clone(),
+            baseline_value: json!({}),
+            delta: data.clone(),
             data,
-        )?)
+        })?)
     }
 }
 
@@ -566,26 +573,26 @@ impl Tool for GetResourceSaturation {
             }
         }
         if grouped.is_empty() {
-            return Ok(envelope(
-                self.name(),
-                &args,
-                SourceFamily::OTelMetrics,
-                vec!["metrics_gauge".into(), "metrics_sum".into()],
+            return Ok(envelope(EnvelopeParams {
+                tool_name: self.name(),
+                args: &args,
+                source_family: SourceFamily::OTelMetrics,
+                source_tables: vec!["metrics_gauge".into(), "metrics_sum".into()],
                 window,
-                ResultStatus::NoData,
-                format!("No resource metrics were found for service {service}."),
-                0,
-                service.into(),
-                "resource_saturation".into(),
-                vec![
+                status: ResultStatus::NoData,
+                summary: format!("No resource metrics were found for service {service}."),
+                sample_count: 0,
+                service: service.into(),
+                operation: "resource_saturation".into(),
+                warnings: vec![
                     "resource telemetry is not instrumented or was not emitted in either window"
                         .into(),
                 ],
-                json!([]),
-                json!([]),
-                json!([]),
-                json!({"service":service,"signals":[],"warnings":["not instrumented"]}),
-            )?);
+                incident_value: json!([]),
+                baseline_value: json!([]),
+                delta: json!([]),
+                data: json!({"service":service,"signals":[],"warnings":["not instrumented"]}),
+            })?);
         }
         let mut signals = Vec::new();
         let mut warnings = Vec::new();
@@ -618,23 +625,23 @@ impl Tool for GetResourceSaturation {
             ResultStatus::Partial
         };
         let data = json!({"service":service,"signals":signals,"warnings":warnings});
-        Ok(envelope(
-            self.name(),
-            &args,
-            SourceFamily::OTelMetrics,
-            vec!["metrics_gauge".into(), "metrics_sum".into()],
+        Ok(envelope(EnvelopeParams {
+            tool_name: self.name(),
+            args: &args,
+            source_family: SourceFamily::OTelMetrics,
+            source_tables: vec!["metrics_gauge".into(), "metrics_sum".into()],
             window,
             status,
-            format!("Compared resource saturation signals for {service}."),
+            summary: format!("Compared resource saturation signals for {service}."),
             sample_count,
-            service.into(),
-            "resource_saturation".into(),
-            Vec::new(),
-            data.clone(),
-            json!({}),
-            data.clone(),
+            service: service.into(),
+            operation: "resource_saturation".into(),
+            warnings: Vec::new(),
+            incident_value: data.clone(),
+            baseline_value: json!({}),
+            delta: data.clone(),
             data,
-        )?)
+        })?)
     }
 }
 
@@ -720,23 +727,23 @@ impl Tool for ListMetricCatalog {
             .fetch_all::<MetricCatalogRow>()
             .await?;
         if rows.is_empty() {
-            return Ok(envelope(
-                self.name(),
-                &args,
-                SourceFamily::OTelMetrics,
-                vec!["metrics_gauge".into(), "metrics_sum".into()],
+            return Ok(envelope(EnvelopeParams {
+                tool_name: self.name(),
+                args: &args,
+                source_family: SourceFamily::OTelMetrics,
+                source_tables: vec!["metrics_gauge".into(), "metrics_sum".into()],
                 window,
-                ResultStatus::NoData,
-                "No metrics were observed in the requested window.".into(),
-                0,
-                String::new(),
-                "metric_catalog".into(),
-                vec!["metric catalog is empty for this tenant and window".into()],
-                json!([]),
-                json!([]),
-                json!([]),
-                json!({"metrics":[]}),
-            )?);
+                status: ResultStatus::NoData,
+                summary: "No metrics were observed in the requested window.".into(),
+                sample_count: 0,
+                service: String::new(),
+                operation: "metric_catalog".into(),
+                warnings: vec!["metric catalog is empty for this tenant and window".into()],
+                incident_value: json!([]),
+                baseline_value: json!([]),
+                delta: json!([]),
+                data: json!({"metrics":[]}),
+            })?);
         }
         let sample_count = rows.iter().map(|row| row.sample_count).sum();
         let metrics: Vec<Value> = rows.into_iter().map(|row| json!({
@@ -745,26 +752,26 @@ impl Tool for ListMetricCatalog {
             "label_count":row.label_count,"sample_count":row.sample_count,"last_seen":row.last_seen,
         })).collect();
         let data = json!({"metrics":metrics,"warnings":[]});
-        Ok(envelope(
-            self.name(),
-            &args,
-            SourceFamily::OTelMetrics,
-            vec!["metrics_gauge".into(), "metrics_sum".into()],
+        Ok(envelope(EnvelopeParams {
+            tool_name: self.name(),
+            args: &args,
+            source_family: SourceFamily::OTelMetrics,
+            source_tables: vec!["metrics_gauge".into(), "metrics_sum".into()],
             window,
-            ResultStatus::Ok,
-            format!(
+            status: ResultStatus::Ok,
+            summary: format!(
                 "Cataloged {} metric definitions without returning label values.",
                 data["metrics"].as_array().map_or(0, Vec::len)
             ),
             sample_count,
-            String::new(),
-            "metric_catalog".into(),
-            Vec::new(),
-            data.clone(),
-            json!({}),
-            data.clone(),
+            service: String::new(),
+            operation: "metric_catalog".into(),
+            warnings: Vec::new(),
+            incident_value: data.clone(),
+            baseline_value: json!({}),
+            delta: data.clone(),
             data,
-        )?)
+        })?)
     }
 }
 
@@ -927,27 +934,27 @@ impl Tool for DetectServiceSilence {
             ResultStatus::Partial
         };
         let data = json!({"services":results,"warnings":warnings});
-        Ok(envelope(
-            self.name(),
-            &args,
-            SourceFamily::Traces,
-            vec!["spans".into()],
+        Ok(envelope(EnvelopeParams {
+            tool_name: self.name(),
+            args: &args,
+            source_family: SourceFamily::Traces,
+            source_tables: vec!["spans".into()],
             window,
             status,
-            if has_candidate {
+            summary: if has_candidate {
                 "Detected one or more services with sharply reduced server-span volume and caller-side expected traffic.".into()
             } else {
                 "No confirmed service silence was found in the requested comparison.".into()
             },
             sample_count,
-            services.join(", "),
-            "service_silence".into(),
-            Vec::new(),
-            data.clone(),
-            json!({}),
-            data.clone(),
+            service: services.join(", "),
+            operation: "service_silence".into(),
+            warnings: Vec::new(),
+            incident_value: data.clone(),
+            baseline_value: json!({}),
+            delta: data.clone(),
             data,
-        )?)
+        })?)
     }
 }
 

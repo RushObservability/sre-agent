@@ -1,6 +1,6 @@
 //! Portable process and Tokio runtime gauges for the agent.
 
-use crate::metrics::AgentMetrics;
+use crate::metrics::{AgentMetrics, ProcessRuntimeSample};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -23,16 +23,16 @@ pub fn sample(metrics: &AgentMetrics) {
     let (cpu_seconds, max_resident_memory_bytes) = resource_usage();
     let resident_memory_bytes = current_resident_memory(max_resident_memory_bytes);
     let runtime = tokio::runtime::Handle::current().metrics();
-    metrics.set_process_runtime(
+    metrics.set_process_runtime(ProcessRuntimeSample {
         resident_memory_bytes,
         max_resident_memory_bytes,
         cpu_seconds,
-        proc_count("/proc/self/fd"),
-        proc_threads(),
-        process_start_time_seconds(),
-        runtime.num_workers() as u64,
-        runtime.num_alive_tasks() as u64,
-    );
+        open_fds: proc_count("/proc/self/fd"),
+        threads: proc_threads(),
+        start_time_seconds: process_start_time_seconds(),
+        workers: runtime.num_workers() as u64,
+        alive_tasks: runtime.num_alive_tasks() as u64,
+    });
 }
 
 fn process_start_time_seconds() -> f64 {

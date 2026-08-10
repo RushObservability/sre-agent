@@ -87,6 +87,18 @@ pub struct AgentMetrics {
     clickhouse_probe_duration: Mutex<Histogram>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ProcessRuntimeSample {
+    pub resident_memory_bytes: u64,
+    pub max_resident_memory_bytes: u64,
+    pub cpu_seconds: f64,
+    pub open_fds: u64,
+    pub threads: u64,
+    pub start_time_seconds: f64,
+    pub workers: u64,
+    pub alive_tasks: u64,
+}
+
 /// RAII guard for an in-flight tool call. Dropping a cancelled future still
 /// closes the gauge, which prevents stale concurrency from hiding capacity.
 pub struct ToolCallGuard {
@@ -253,30 +265,23 @@ impl AgentMetrics {
         self.observe(&self.clickhouse_probe_duration, duration);
     }
 
-    pub fn set_process_runtime(
-        &self,
-        resident_memory_bytes: u64,
-        max_resident_memory_bytes: u64,
-        cpu_seconds: f64,
-        open_fds: u64,
-        threads: u64,
-        start_time_seconds: f64,
-        workers: u64,
-        alive_tasks: u64,
-    ) {
+    pub(crate) fn set_process_runtime(&self, sample: ProcessRuntimeSample) {
         self.process_resident_memory_bytes
-            .store(resident_memory_bytes, Ordering::Relaxed);
+            .store(sample.resident_memory_bytes, Ordering::Relaxed);
         self.process_max_resident_memory_bytes
-            .store(max_resident_memory_bytes, Ordering::Relaxed);
+            .store(sample.max_resident_memory_bytes, Ordering::Relaxed);
         self.process_cpu_seconds_bits
-            .store(cpu_seconds.to_bits(), Ordering::Relaxed);
-        self.process_open_fds.store(open_fds, Ordering::Relaxed);
-        self.process_threads.store(threads, Ordering::Relaxed);
+            .store(sample.cpu_seconds.to_bits(), Ordering::Relaxed);
+        self.process_open_fds
+            .store(sample.open_fds, Ordering::Relaxed);
+        self.process_threads
+            .store(sample.threads, Ordering::Relaxed);
         self.process_start_time_bits
-            .store(start_time_seconds.to_bits(), Ordering::Relaxed);
-        self.runtime_workers.store(workers, Ordering::Relaxed);
+            .store(sample.start_time_seconds.to_bits(), Ordering::Relaxed);
+        self.runtime_workers
+            .store(sample.workers, Ordering::Relaxed);
         self.runtime_alive_tasks
-            .store(alive_tasks, Ordering::Relaxed);
+            .store(sample.alive_tasks, Ordering::Relaxed);
     }
 
     pub fn tool_started(&self) {
@@ -685,7 +690,16 @@ mod tests {
         metrics.query_api_finished(Duration::from_millis(3), false);
         metrics.clickhouse_probe_finished(Duration::from_millis(2), true);
         metrics.investigation_reported("final", 3, 4, 128);
-        metrics.set_process_runtime(10, 20, 1.5, 4, 2, 100.0, 4, 8);
+        metrics.set_process_runtime(ProcessRuntimeSample {
+            resident_memory_bytes: 10,
+            max_resident_memory_bytes: 20,
+            cpu_seconds: 1.5,
+            open_fds: 4,
+            threads: 2,
+            start_time_seconds: 100.0,
+            workers: 4,
+            alive_tasks: 8,
+        });
         let output = metrics.render();
         assert!(output.contains("sre_agent_investigations_completed_total 1"));
         assert!(output.contains("sre_agent_investigation_duration_seconds_bucket"));

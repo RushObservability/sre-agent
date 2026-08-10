@@ -658,7 +658,7 @@ async fn run_one_case(
                 args: Value::Null,
                 data: data.clone(),
                 tenant_id: "default".into(),
-                provenance: provenance.clone(),
+                provenance: provenance.as_ref().clone(),
             }),
             _ => None,
         })

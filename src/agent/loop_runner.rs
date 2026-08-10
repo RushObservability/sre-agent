@@ -458,9 +458,8 @@ fn root_cause_gate(
     let active_evidence_count = memory.active_evidence_count();
     if active_evidence_count < 2 {
         gaps.push(format!(
-            "Fewer than 2 concrete evidence records in working memory (have {}). \
-             Run targeted queries that return timestamps, values, IDs, or specific messages before concluding.",
-            active_evidence_count
+            "Fewer than 2 concrete evidence records in working memory (have {active_evidence_count}). \
+             Run targeted queries that return timestamps, values, IDs, or specific messages before concluding."
         ));
     }
 
@@ -1493,7 +1492,7 @@ async fn run_inner(
             let facts = extract_facts_from_tool_result(&tc.name, args, &result);
             let useful_result = facts.has_data;
             let empty_result = facts.empty_result;
-            let context_tokens = (result.len() as u64 + 3) / 4;
+            let context_tokens = (result.len() as u64).div_ceil(4);
             telemetry.record(
                 &tc.name,
                 outcome.duration,
@@ -1547,7 +1546,7 @@ async fn run_inner(
                 .send(AgentEvent::ToolResult {
                     name: tc.name.clone(),
                     data: result.clone(),
-                    provenance,
+                    provenance: Box::new(provenance),
                 })
                 .await;
 

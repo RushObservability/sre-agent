@@ -208,11 +208,10 @@ fn red_select(
                 quantile(0.99)(duration_ns) / 1000000.0 AS p99_ms \
          FROM spans \
          PREWHERE tenant_id = '{{tenant}}' \
-             AND kind = '{server_kind}' \
+             AND kind = '{SERVER_SPAN_KIND}' \
              AND {{service_filter}} \
              AND {predicate} \
-         GROUP BY {group_by}",
-        server_kind = SERVER_SPAN_KIND
+         GROUP BY {group_by}"
     )
 }
 
@@ -394,9 +393,9 @@ fn impact_score(incident: &Option<RedStats>, baseline: &Option<RedStats>) -> f64
     (p99_delta * ((incident.request_count + 1) as f64).ln()) + error_delta * 10.0
 }
 
-fn compare_envelope(
-    tool_name: &str,
-    args: &Value,
+struct CompareEnvelopeParams<'a> {
+    tool_name: &'a str,
+    args: &'a Value,
     window: InvestigationWindow,
     status: ResultStatus,
     summary: String,
@@ -408,25 +407,32 @@ fn compare_envelope(
     service: String,
     operation: String,
     data: Value,
-) -> Result<String, serde_json::Error> {
-    let mut envelope = ToolResultEnvelope::from_legacy(tool_name, args, &summary, Some(&summary));
-    envelope.status = status.clone();
-    envelope.window = Some(window);
-    envelope.service = service;
-    envelope.operation = operation;
-    envelope.sample_count = sample_count;
-    envelope.incident_value = Some(incident_value);
-    envelope.baseline_value = Some(baseline_value);
-    envelope.absolute_delta = Some(delta);
+}
+
+fn compare_envelope(params: CompareEnvelopeParams<'_>) -> Result<String, serde_json::Error> {
+    let mut envelope = ToolResultEnvelope::from_legacy(
+        params.tool_name,
+        params.args,
+        &params.summary,
+        Some(&params.summary),
+    );
+    envelope.status = params.status.clone();
+    envelope.window = Some(params.window);
+    envelope.service = params.service;
+    envelope.operation = params.operation;
+    envelope.sample_count = params.sample_count;
+    envelope.incident_value = Some(params.incident_value);
+    envelope.baseline_value = Some(params.baseline_value);
+    envelope.absolute_delta = Some(params.delta);
     envelope.quality = ResultQuality {
-        band: match status {
+        band: match params.status {
             ResultStatus::Ok => QualityBand::High,
             ResultStatus::Partial => QualityBand::Medium,
             _ => QualityBand::Low,
         },
-        reasons: warnings,
+        reasons: params.warnings,
     };
-    serialize_tool_output(&envelope, data)
+    serialize_tool_output(&envelope, params.data)
 }
 
 fn access_denied_output(tool_name: &str, args: &Value) -> Result<String, serde_json::Error> {
@@ -503,26 +509,26 @@ impl Tool for CompareServiceWindows {
         let client_wait_data = client_wait_map(client_wait_rows);
 
         if service_data.is_empty() {
-            return compare_envelope(
-                self.name(),
-                &args,
+            return compare_envelope(CompareEnvelopeParams {
+                tool_name: self.name(),
+                args: &args,
                 window,
-                ResultStatus::NoData,
-                "No server-span data was found in either window.".into(),
-                0,
-                json!([]),
-                json!([]),
-                json!([]),
-                vec!["no server spans in the requested windows".into()],
-                services.join(", "),
-                "server_red".into(),
-                json!(ComparePayload {
+                status: ResultStatus::NoData,
+                summary: "No server-span data was found in either window.".into(),
+                sample_count: 0,
+                incident_value: json!([]),
+                baseline_value: json!([]),
+                delta: json!([]),
+                warnings: vec!["no server spans in the requested windows".into()],
+                service: services.join(", "),
+                operation: "server_red".into(),
+                data: json!(ComparePayload {
                     services: vec![],
                     endpoints: vec![],
                     client_wait: vec![],
                     warnings: vec!["no server spans in the requested windows".into()]
                 }),
-            )
+            })
             .map_err(Into::into);
         }
 
@@ -615,21 +621,21 @@ impl Tool for CompareServiceWindows {
             warnings: warnings.clone(),
         };
         let data = serde_json::to_value(&payload)?;
-        compare_envelope(
-            self.name(),
-            &args,
+        compare_envelope(CompareEnvelopeParams {
+            tool_name: self.name(),
+            args: &args,
             window,
             status,
             summary,
             sample_count,
-            data.clone(),
-            data.clone(),
-            data,
+            incident_value: data.clone(),
+            baseline_value: data.clone(),
+            delta: data,
             warnings,
-            services.join(", "),
-            "server_red_and_endpoints".into(),
-            serde_json::to_value(payload)?,
-        )
+            service: services.join(", "),
+            operation: "server_red_and_endpoints".into(),
+            data: serde_json::to_value(payload)?,
+        })
         .map_err(Into::into)
     }
 }
@@ -662,6 +668,10 @@ struct DependencyStats {
     caller_time_attributable_pct: f64,
 }
 
+type DependencyKey = (String, String, String);
+type DependencyPeriodPair = (Option<DependencyStats>, Option<DependencyStats>);
+type DependencyMap = BTreeMap<DependencyKey, DependencyPeriodPair>;
+
 #[derive(Debug, Serialize)]
 struct DependencyPayload {
     dependencies: Vec<DependencyComparison>,
@@ -689,13 +699,12 @@ fn build_dependency_period_sql(
              AND child.parent_span_id = parent.span_id \
          WHERE child.tenant_id = '{tenant}' \
              AND parent.tenant_id = '{tenant}' \
-             AND child.kind = '{server_kind}' \
+             AND child.kind = '{SERVER_SPAN_KIND}' \
              AND child.service_name != parent.service_name \
              AND {predicate} \
              AND {parent_predicate} \
          GROUP BY caller, callee, operation",
         tenant = sql_quote(tenant_id),
-        server_kind = SERVER_SPAN_KIND,
     )
 }
 
@@ -705,9 +714,7 @@ pub(crate) fn build_rank_dependencies_sql(window: &InvestigationWindow, tenant_i
     format!("{incident} UNION ALL {baseline}")
 }
 
-fn dependency_map(
-    rows: impl IntoIterator<Item = DependencyPeriodRow>,
-) -> BTreeMap<(String, String, String), (Option<DependencyStats>, Option<DependencyStats>)> {
+fn dependency_map(rows: impl IntoIterator<Item = DependencyPeriodRow>) -> DependencyMap {
     let mut map = BTreeMap::new();
     for row in rows {
         let stats = DependencyStats {
@@ -794,21 +801,21 @@ impl Tool for RankSlowDependencies {
                 dependencies: vec![],
                 warnings: vec![warning.clone()],
             };
-            return compare_envelope(
-                self.name(),
-                &args,
+            return compare_envelope(CompareEnvelopeParams {
+                tool_name: self.name(),
+                args: &args,
                 window,
-                ResultStatus::NoData,
-                "No cross-service dependency data was found in either window.".into(),
-                0,
-                json!([]),
-                json!([]),
-                json!([]),
-                vec![warning],
-                String::new(),
-                "dependency_edges".into(),
-                serde_json::to_value(payload)?,
-            )
+                status: ResultStatus::NoData,
+                summary: "No cross-service dependency data was found in either window.".into(),
+                sample_count: 0,
+                incident_value: json!([]),
+                baseline_value: json!([]),
+                delta: json!([]),
+                warnings: vec![warning],
+                service: String::new(),
+                operation: "dependency_edges".into(),
+                data: serde_json::to_value(payload)?,
+            })
             .map_err(Into::into);
         }
 
@@ -875,21 +882,21 @@ impl Tool for RankSlowDependencies {
             warnings: warnings.clone(),
         };
         let data = serde_json::to_value(&payload)?;
-        compare_envelope(
-            self.name(),
-            &args,
+        compare_envelope(CompareEnvelopeParams {
+            tool_name: self.name(),
+            args: &args,
             window,
             status,
             summary,
             sample_count,
-            data.clone(),
-            data.clone(),
-            data.clone(),
+            incident_value: data.clone(),
+            baseline_value: data.clone(),
+            delta: data.clone(),
             warnings,
-            String::new(),
-            "dependency_edges".into(),
+            service: String::new(),
+            operation: "dependency_edges".into(),
             data,
-        )
+        })
         .map_err(Into::into)
     }
 }

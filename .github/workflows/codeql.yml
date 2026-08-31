@@ -1,0 +1,35 @@
+# CodeQL static analysis. Requires the repository to be public (or GitHub
+# Advanced Security); on a private free-plan repo the upload step 403s.
+name: codeql
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Weekly, so advisories added after a PR merges still surface.
+    - cron: "17 3 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: analyze (rust)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write # required to upload SARIF results
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: 1.88.0
+      - uses: github/codeql-action/init@486fec2a3ea2626afcd8c7e9208b4f515078dd7e # codeql-bundle-v2.26.4
+        with:
+          languages: rust
+          queries: security-and-quality
+      - uses: github/codeql-action/analyze@486fec2a3ea2626afcd8c7e9208b4f515078dd7e # codeql-bundle-v2.26.4
+        with:
+          category: "/language:rust"

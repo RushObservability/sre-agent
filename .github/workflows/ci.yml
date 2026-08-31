@@ -9,6 +9,11 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# Least privilege: this workflow only ever reads the repo. Without this block
+# the token inherits the repository/org default, which is often read-write.
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -38,3 +43,26 @@ jobs:
           cargo run --bin sre_evals -- release-gate \
             --current evals/out/pr6-ci.json \
             --baseline evals/baseline-pr6.json
+
+  # Fails the build on any crate with a known RustSec advisory. Requires the
+  # committed Cargo.lock -- cargo-audit resolves transitive deps from the lock.
+  #
+  # Note this covers the RustSec database only, which is NOT the same set as
+  # GitHub's advisory database behind Dependabot alerts. Neither is a superset
+  # of the other, so both are kept on.
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: 1.88.0
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Install cargo-audit
+        run: cargo install --locked cargo-audit
+      # No --deny warnings: it also fails on "unmaintained" advisories, which
+      # today would red-build on three crates pulled in transitively by kube
+      # 0.98 (backoff, instant, rustls-pemfile). Those are not vulnerabilities.
+      # Default behaviour gates on actual vulnerabilities only.
+      - name: Audit dependencies
+        run: cargo audit

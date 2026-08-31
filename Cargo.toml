@@ -54,7 +54,7 @@ jsonwebtoken = "11"
 flate2 = "1"
 tar = "0.4"
 walkdir = "2"
-sha2 = "0.10"
+sha2 = "0.11"
 
 # Utilities
 async-trait = "0.1"

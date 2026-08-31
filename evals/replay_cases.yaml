@@ -1,0 +1,386 @@
+# Deterministic PR6 replay suite. These are report/tool-result fixtures, not
+# claims about current production telemetry. They exercise the release scorer
+# across the failure modes listed in the causal RCA PRD.
+cases:
+  - id: replay-service-down
+    source: replay
+    description: Service becomes unavailable and its caller times out.
+    input: {kind: question, text: "The gateway is timing out on catalog requests. Find the root cause."}
+    ground_truth: {root_cause_service: catalog, reason: "catalog is down and no longer serves requests", related: [gateway]}
+    expectation: {mechanism_keywords: [down, unavailable, timeout], causal_path: [catalog, gateway], evidence_classes: [traces, logs], minimum_corroboration: 2, report_kind: final}
+    replay:
+      tenant_id: tenant-a
+      wall_time_ms: 180
+      prompt_tokens: 900
+      completion_tokens: 180
+      report: |
+        ## Root Cause
+        catalog is unavailable and down; gateway calls time out.
+        ## Causal Chain
+        catalog -> gateway timeout.
+        ## Confidence
+        0.94
+      tool_results:
+        - {name: query_traces, args: {service: catalog}, data: "catalog spans stopped; gateway timeout", tenant_id: tenant-a, source_family: traces, source_tables: [spans], status: ok}
+        - {name: search_logs, args: {service: catalog}, data: "connection refused from catalog", tenant_id: tenant-a, source_family: logs, source_tables: [logs], status: ok}
+
+  - id: replay-silent-service
+    source: replay
+    description: A service is silent while downstream traffic falls.
+    input: {kind: question, text: "Notifications stopped delivering without obvious errors. What happened?"}
+    ground_truth: {root_cause_service: identity, reason: "identity stopped emitting events, starving notifications", related: [notifications]}
+    expectation: {mechanism_keywords: [silent, starving, events], causal_path: [identity, notifications], evidence_classes: [traces, logs], minimum_corroboration: 2, report_kind: final}
+    replay:
+      tenant_id: tenant-a
+      wall_time_ms: 160
+      prompt_tokens: 860
+      completion_tokens: 170
+      report: |
+        ## Root Cause
+        identity is silent and stopped emitting events, starving notifications.
+        ## Causal Chain
+        identity -> notifications.
+        ## Confidence
+        0.88
+      tool_results:
+        - {name: query_traces, args: {service: identity}, data: "identity request volume is zero", tenant_id: tenant-a, source_family: traces, source_tables: [spans], status: ok}
+        - {name: search_logs, args: {service: notifications}, data: "no delivery errors; no upstream events", tenant_id: tenant-a, source_family: logs, source_tables: [logs], status: ok}
+
+  - id: replay-cpu-throttling
+    source: replay
+    description: CPU starvation produces latency without an outage.
+    input: {kind: question, text: "Media p99 latency rose but requests still complete. Find the cause."}
+    ground_truth: {root_cause_service: media, reason: "media is CPU throttled and slow", related: [gateway]}
+    expectation: {mechanism_keywords: [cpu, throttled, latency], causal_path: [media, gateway], evidence_classes: [traces, logs], minimum_corroboration: 2, report_kind: final}
+    replay:
+      tenant_id: tenant-a
+      wall_time_ms: 210
+      prompt_tokens: 920
+      completion_tokens: 190
+      report: |
+        ## Root Cause
+        media is CPU throttled, causing latency that gateway inherits.
+        ## Causal Chain
+        media -> gateway latency.
+        ## Confidence
+        0.91
+      tool_results:
+        - {name: query_traces, args: {service: media}, data: "media spans show queueing and high duration", tenant_id: tenant-a, source_family: traces, source_tables: [spans], status: ok}
+        - {name: search_logs, args: {service: media}, data: "CPU throttling observed", tenant_id: tenant-a, source_family: logs, source_tables: [logs], status: ok}
+
+  - id: replay-memory-pressure
+    source: replay
+    description: Memory pressure causes restarts and elevated errors.
+    input: {kind: question, text: "The worker is restarting and errors increased. Find the root cause."}
+    ground_truth: {root_cause_service: worker, reason: "worker hit memory pressure and was OOM killed", related: [gateway]}
+    expectation: {mechanism_keywords: [memory, oom, killed], causal_path: [worker, gateway], evidence_classes: [traces, logs], minimum_corroboration: 2, report_kind: final}
+    replay:
+      tenant_id: tenant-a
+      report: |
+        ## Root Cause
+        worker hit memory pressure and was OOM killed; gateway saw errors.
+        ## Causal Chain
+        worker -> gateway errors.
+        ## Confidence
+        0.9
+      tool_results:
+        - {name: query_traces, args: {service: worker}, data: "worker spans end at restart", tenant_id: tenant-a, source_family: traces, source_tables: [spans], status: ok}
+        - {name: search_logs, args: {service: worker}, data: "OOM killed after memory pressure", tenant_id: tenant-a, source_family: logs, source_tables: [logs], status: ok}
+
+  - id: replay-database-latency
+    source: replay
+    description: Database latency dominates application transactions.
+    input: {kind: question, text: "Checkout latency is high. Is the database involved?"}
+    ground_truth: {root_cause_service: payments-db, reason: "database queries became slow", related: [payments]}
+    expectation: {mechanism_keywords: [database, query, slow], causal_path: [payments-db, payments], evidence_classes: [traces, logs], minimum_corroboration: 2, report_kind: final}
+    replay:
+      tenant_id: tenant-a
+      report: |
+        ## Root Cause
+        payments-db database queries became slow and payments waited on them.
+        ## Causal Chain
+        payments-db -> payments.
+        ## Confidence
+        0.87
+      tool_results:
+        - {name: query_traces, args: {service: payments}, data: "database child spans dominate duration", tenant_id: tenant-a, source_family: traces, source_tables: [spans], status: ok}
+        - {name: search_logs, args: {service: payments-db}, data: "slow query duration increased", tenant_id: tenant-a, source_family: logs, source_tables: [logs], status: ok}
+
+  - id: replay-pool-exhaustion
+    source: replay
+    description: Application database pool exhaustion creates queued requests.
+    input: {kind: question, text: "Orders are timing out while database CPU looks normal. Find the cause."}
+    ground_truth: {root_cause_service: orders, reason: "orders exhausted its database connection pool", related: [gateway]}
+    expectation: {mechanism_keywords: [pool, exhaustion, queued], causal_path: [orders, gateway], evidence_classes: [traces, logs], minimum_corroboration: 2, report_kind: final}
+    replay:
+      tenant_id: tenant-a
+      report: |
+        ## Root Cause
+        orders exhausted its database connection pool, leaving requests queued.
+        ## Causal Chain
+        orders -> gateway timeout.
+        ## Confidence
+        0.86
+      tool_results:
+        - {name: query_traces, args: {service: orders}, data: "pool wait spans dominate request time", tenant_id: tenant-a, source_family: traces, source_tables: [spans], status: ok}
+        - {name: search_logs, args: {service: orders}, data: "connection pool exhausted", tenant_id: tenant-a, source_family: logs, source_tables: [logs], status: ok}
+
+  - id: replay-downstream-slow
+    source: replay
+    description: A downstream dependency slows its caller.
+    input: {kind: question, text: "The articles page is slow. Find the dependency causing it."}
+    ground_truth: {root_cause_service: media, reason: "media became slow and propagated latency to articles", related: [articles]}
+    expectation: {mechanism_keywords: [downstream, slow, propagated], causal_path: [media, articles], evidence_classes: [traces, logs], minimum_corroboration: 2, report_kind: final}
+    replay:
+      tenant_id: tenant-a
+      report: |
+        ## Root Cause
+        the downstream media service is slow; its latency propagated to articles.
+        ## Causal Chain
+        media -> articles.
+        ## Confidence
+        0.93
+      tool_results:
+        - {name: query_traces, args: {service: articles}, data: "media child span is the largest component", tenant_id: tenant-a, source_family: traces, source_tables: [spans], status: ok}
+        - {name: search_logs, args: {service: media}, data: "downstream response slow", tenant_id: tenant-a, source_family: logs, source_tables: [logs], status: ok}
+
+  - id: replay-traffic-surge
+    source: replay
+    description: A traffic surge overloads a service.
+    input: {kind: question, text: "Search latency and errors rose after a traffic spike. Find the cause."}
+    ground_truth: {root_cause_service: search, reason: "a traffic surge overloaded search", related: [gateway]}
+    expectation: {mechanism_keywords: [traffic, surge, overloaded], causal_path: [search, gateway], evidence_classes: [traces, logs], minimum_corroboration: 2, report_kind: final}
+    replay:
+      tenant_id: tenant-a
+      report: |
+        ## Root Cause
+        a traffic surge overloaded search and caused gateway errors.
+        ## Causal Chain
+        search -> gateway.
+        ## Confidence
+        0.89
+      tool_results:
+        - {name: query_traces, args: {service: search}, data: "request rate doubled before latency", tenant_id: tenant-a, source_family: traces, source_tables: [spans], status: ok}
+        - {name: search_logs, args: {service: search}, data: "overloaded worker queue", tenant_id: tenant-a, source_family: logs, source_tables: [logs], status: ok}
+
+  - id: replay-traffic-skew
+    source: replay
+    description: A traffic skew overloads one tenant shard.
+    input: {kind: question, text: "Only one customer segment sees failures. Find the root cause."}
+    ground_truth: {root_cause_service: shard-a, reason: "traffic skew concentrated load on shard-a", related: [gateway]}
+    expectation: {mechanism_keywords: [traffic, skew, concentrated], causal_path: [shard-a, gateway], evidence_classes: [traces, logs], minimum_corroboration: 2, report_kind: final}
+    replay:
+      tenant_id: tenant-a
+      report: |
+        ## Root Cause
+        traffic skew concentrated load on shard-a; gateway is the symptom.
+        ## Causal Chain
+        shard-a -> gateway.
+        ## Confidence
+        0.84
+      tool_results:
+        - {name: query_traces, args: {service: shard-a}, data: "one shard receives skewed traffic", tenant_id: tenant-a, source_family: traces, source_tables: [spans], status: ok}
+        - {name: search_logs, args: {service: gateway}, data: "failures limited to affected segment", tenant_id: tenant-a, source_family: logs, source_tables: [logs], status: ok}
+
+  - id: replay-bad-deploy
+    source: replay
+    description: A deployment correlates with a new error mode.
+    input: {kind: question, text: "Payments errors began immediately after a release. Find the cause."}
+    ground_truth: {root_cause_service: payments, reason: "a bad payments deploy introduced a regression", related: [gateway]}
+    expectation: {mechanism_keywords: [deploy, regression, release], causal_path: [payments, gateway], evidence_classes: [traces, logs], minimum_corroboration: 2, report_kind: final}
+    replay:
+      tenant_id: tenant-a
+      report: |
+        ## Root Cause
+        the bad payments deploy introduced a regression; gateway inherited 500s.
+        ## Causal Chain
+        payments -> gateway.
+        ## Confidence
+        0.96
+      tool_results:
+        - {name: query_traces, args: {service: payments}, data: "500 rate starts at new release", tenant_id: tenant-a, source_family: traces, source_tables: [spans], status: ok}
+        - {name: list_deploys, args: {service: payments}, data: "new deployment immediately before regression", tenant_id: tenant-a, source_family: deploys, source_tables: [deploys], status: ok}
+
+  - id: replay-bad-configuration
+    source: replay
+    description: A configuration change disables a safety behavior.
+    input: {kind: question, text: "Retries disappeared after a configuration change. Find the cause."}
+    ground_truth: {root_cause_service: gateway, reason: "a bad gateway configuration disabled retries", related: [payments]}
+    expectation: {mechanism_keywords: [configuration, disabled, retries], causal_path: [gateway, payments], evidence_classes: [traces, logs], minimum_corroboration: 2, report_kind: final}
+    replay:
+      tenant_id: tenant-a
+      report: |
+        ## Root Cause
+        a bad gateway configuration disabled retries, exposing payments errors.
+        ## Causal Chain
+        gateway -> payments.
+        ## Confidence
+        0.92
+      tool_results:
+        - {name: query_traces, args: {service: gateway}, data: "retry spans absent after change", tenant_id: tenant-a, source_family: traces, source_tables: [spans], status: ok}
+        - {name: search_logs, args: {service: gateway}, data: "configuration reload disabled retries", tenant_id: tenant-a, source_family: logs, source_tables: [logs], status: ok}
+
+  - id: replay-queue-saturation
+    source: replay
+    description: Queue depth saturation causes consumer lag.
+    input: {kind: question, text: "The event consumer is falling behind. Find the root cause."}
+    ground_truth: {root_cause_service: events-queue, reason: "the events queue is saturated and causing consumer lag", related: [consumer]}
+    expectation: {mechanism_keywords: [queue, saturated, lag], causal_path: [events-queue, consumer], evidence_classes: [traces, logs], minimum_corroboration: 2, report_kind: final}
+    replay:
+      tenant_id: tenant-a
+      report: |
+        ## Root Cause
+        events-queue is saturated, causing consumer lag.
+        ## Causal Chain
+        events-queue -> consumer.
+        ## Confidence
+        0.9
+      tool_results:
+        - {name: query_traces, args: {service: consumer}, data: "consumer wait time follows queue depth", tenant_id: tenant-a, source_family: traces, source_tables: [spans], status: ok}
+        - {name: search_logs, args: {service: events-queue}, data: "queue saturated and oldest message age rising", tenant_id: tenant-a, source_family: logs, source_tables: [logs], status: ok}
+
+  - id: replay-disk-saturation
+    source: replay
+    description: Disk saturation slows a persistence service.
+    input: {kind: question, text: "The ingest pipeline is slow and disk usage is high. Find the cause."}
+    ground_truth: {root_cause_service: ingest, reason: "ingest disk saturation caused write latency", related: [gateway]}
+    expectation: {mechanism_keywords: [disk, saturation, write], causal_path: [ingest, gateway], evidence_classes: [traces, logs], minimum_corroboration: 2, report_kind: final}
+    replay:
+      tenant_id: tenant-a
+      report: |
+        ## Root Cause
+        ingest hit disk saturation, increasing write latency for gateway.
+        ## Causal Chain
+        ingest -> gateway.
+        ## Confidence
+        0.85
+      tool_results:
+        - {name: query_traces, args: {service: ingest}, data: "write spans slow", tenant_id: tenant-a, source_family: traces, source_tables: [spans], status: ok}
+        - {name: search_logs, args: {service: ingest}, data: "disk saturation and write queue", tenant_id: tenant-a, source_family: logs, source_tables: [logs], status: ok}
+
+  - id: replay-network-saturation
+    source: replay
+    description: Network saturation increases dependency time.
+    input: {kind: question, text: "Uploads are timing out while application CPU is normal. Find the cause."}
+    ground_truth: {root_cause_service: edge-network, reason: "network saturation caused upload timeouts", related: [uploads]}
+    expectation: {mechanism_keywords: [network, saturation, timeout], causal_path: [edge-network, uploads], evidence_classes: [traces, logs], minimum_corroboration: 2, report_kind: final}
+    replay:
+      tenant_id: tenant-a
+      report: |
+        ## Root Cause
+        edge-network saturation caused upload timeout; uploads is the symptom.
+        ## Causal Chain
+        edge-network -> uploads.
+        ## Confidence
+        0.83
+      tool_results:
+        - {name: query_traces, args: {service: uploads}, data: "network wait dominates spans", tenant_id: tenant-a, source_family: traces, source_tables: [spans], status: ok}
+        - {name: search_logs, args: {service: edge-network}, data: "network saturation and packet loss", tenant_id: tenant-a, source_family: logs, source_tables: [logs], status: ok}
+
+  - id: replay-no-logs
+    source: replay
+    description: Logs are absent but traces still identify the failure.
+    input: {kind: question, text: "The service has no logs in the incident window. What can be concluded?"}
+    ground_truth: {root_cause_service: profile, reason: "profile stopped serving while logs were absent", related: [gateway]}
+    expectation: {mechanism_keywords: [no logs, stopped serving, traces], causal_path: [profile, gateway], evidence_classes: [traces, logs], minimum_corroboration: 2, report_kind: final}
+    replay:
+      tenant_id: tenant-a
+      report: |
+        ## Root Cause
+        profile stopped serving; there are no logs, but traces show gateway timeouts.
+        ## Causal Chain
+        profile -> gateway.
+        ## Confidence
+        0.78
+      tool_results:
+        - {name: query_traces, args: {service: profile}, data: "profile spans disappear; gateway times out", tenant_id: tenant-a, source_family: traces, source_tables: [spans], status: ok}
+        - {name: search_logs, args: {service: profile}, data: "no logs in incident window", tenant_id: tenant-a, source_family: logs, source_tables: [logs], status: no_data}
+
+  - id: replay-partial-traces
+    source: replay
+    description: Partial traces require corroboration from logs.
+    input: {kind: question, text: "Only part of the request path is traced. Find the likely cause."}
+    ground_truth: {root_cause_service: recommendations, reason: "recommendations is slow even though traces are partial", related: [gateway]}
+    expectation: {mechanism_keywords: [partial, traces, slow], causal_path: [recommendations, gateway], evidence_classes: [traces, logs], minimum_corroboration: 2, report_kind: final}
+    replay:
+      tenant_id: tenant-a
+      report: |
+        ## Root Cause
+        traces are partial, but recommendations is slow and logs corroborate it.
+        ## Causal Chain
+        recommendations -> gateway.
+        ## Confidence
+        0.76
+      tool_results:
+        - {name: query_traces, args: {service: recommendations}, data: "partial trace coverage; observed slow child", tenant_id: tenant-a, source_family: traces, source_tables: [spans], status: partial}
+        - {name: search_logs, args: {service: recommendations}, data: "slow handler duration in logs", tenant_id: tenant-a, source_family: logs, source_tables: [logs], status: ok}
+
+  - id: replay-contradictory-signals
+    source: replay
+    description: Contradictory health signals must be called out explicitly.
+    input: {kind: question, text: "Metrics look healthy but users report failures. Resolve the contradiction."}
+    ground_truth: {root_cause_service: checkout, reason: "checkout has a narrow error path hidden by aggregate healthy metrics", related: [gateway]}
+    expectation: {mechanism_keywords: [contradictory, narrow, error], causal_path: [checkout, gateway], evidence_classes: [traces, logs], minimum_corroboration: 2, report_kind: final}
+    replay:
+      tenant_id: tenant-a
+      report: |
+        ## Root Cause
+        contradictory signals hide a narrow checkout error path; aggregate metrics are healthy.
+        ## Causal Chain
+        checkout -> gateway.
+        ## Confidence
+        0.7
+      tool_results:
+        - {name: query_traces, args: {service: checkout}, data: "errors isolated to one endpoint", tenant_id: tenant-a, source_family: traces, source_tables: [spans], status: ok}
+        - {name: search_logs, args: {service: checkout}, data: "narrow error path; aggregate traffic healthy", tenant_id: tenant-a, source_family: logs, source_tables: [logs], status: ok}
+
+  - id: replay-ambiguous-onset
+    source: replay
+    description: Onset is ambiguous; the safe result is preliminary.
+    input: {kind: question, text: "Latency is elevated but the onset is ambiguous. Investigate."}
+    ground_truth: {root_cause_service: billing, reason: "billing may have a slow query but onset is not proven", related: [gateway]}
+    expectation: {mechanism_keywords: [ambiguous, slow, query], causal_path: [billing, gateway], evidence_classes: [traces], minimum_corroboration: 1, report_kind: preliminary}
+    replay:
+      tenant_id: tenant-a
+      report: |
+        ## Preliminary Findings
+        billing has a slow query, but onset is ambiguous. Open question: verify the deploy.
+        ## Causal Chain
+        billing -> gateway.
+        Confidence 0.55; next test is a deploy comparison.
+      tool_results:
+        - {name: query_traces, args: {service: billing}, data: "slow query candidate, onset uncertain", tenant_id: tenant-a, source_family: traces, source_tables: [spans], status: ok}
+
+  - id: replay-model-failure
+    source: replay
+    description: Model failure is surfaced as a useful preliminary result.
+    input: {kind: question, text: "Investigate this incident despite an incomplete model response."}
+    ground_truth: {root_cause_service: api, reason: "api evidence is incomplete after a model failure", related: [gateway]}
+    expectation: {mechanism_keywords: [incomplete, model, evidence], causal_path: [api, gateway], evidence_classes: [logs], minimum_corroboration: 1, report_kind: preliminary}
+    replay:
+      tenant_id: tenant-a
+      report: |
+        ## Preliminary Findings
+        api is the leading candidate, but model failure left incomplete evidence.
+        Open question: collect a second signal before a final cause.
+        ## Causal Chain
+        api -> gateway.
+      tool_results:
+        - {name: search_logs, args: {service: api}, data: "partial error evidence", tenant_id: tenant-a, source_family: logs, source_tables: [logs], status: partial}
+
+  - id: replay-tool-failure
+    source: replay
+    description: Tool failure is not presented as a false final.
+    input: {kind: question, text: "The first investigation tool failed. What is safe to say?"}
+    ground_truth: {root_cause_service: auth, reason: "auth is a candidate but tool failure prevents confirmation", related: [gateway]}
+    expectation: {mechanism_keywords: [candidate, tool failure, confirmation], causal_path: [auth, gateway], evidence_classes: [logs], minimum_corroboration: 1, report_kind: preliminary}
+    replay:
+      tenant_id: tenant-a
+      report: |
+        ## Preliminary Findings
+        auth is a candidate, but tool failure prevents confirmation.
+        Open question: retry the logs query before a final report.
+        ## Causal Chain
+        auth -> gateway.
+      tool_results:
+        - {name: search_logs, args: {service: auth}, data: "Tool error: backend unavailable", tenant_id: tenant-a, source_family: logs, source_tables: [logs], status: error}

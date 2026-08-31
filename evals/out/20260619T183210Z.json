@@ -1,0 +1,26 @@
+{
+  "run_id": "20260619T183210Z",
+  "started_at": "2026-06-19T18:32:10.450063+00:00",
+  "case_count": 1,
+  "ac1_rate": 0.0,
+  "ac3_rate": 0.0,
+  "reason_accuracy": 0.0,
+  "avg_tool_calls": 0.0,
+  "cases": [
+    {
+      "id": "articles-down-cascade",
+      "source": "seeded",
+      "ac1": false,
+      "ac3": false,
+      "reason_match": null,
+      "reason_why": null,
+      "candidates": [],
+      "ground_truth_service": "articles",
+      "report_kind": "error",
+      "tool_calls": 0,
+      "prompt_tokens": 0,
+      "completion_tokens": 0,
+      "error": "agent loop returned an error: error sending request for url (https://api.openai.com/v1/chat/completions): client error (SendRequest): connection closed before message completed"
+    }
+  ]
+}

@@ -1,0 +1,68 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Least privilege: this workflow only ever reads the repo. Without this block
+# the token inherits the repository/org default, which is often read-write.
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Pin to the repo's rust-toolchain.toml channel and install the components
+      # for THAT toolchain. Using @stable installed rustfmt/clippy for the latest
+      # stable, but rust-toolchain.toml forces 1.88.0 — so `cargo fmt`/`clippy`
+      # ran under 1.88.0, which had no components ("cargo-fmt is not installed").
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: 1.88.0
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy -- -D warnings
+      - name: Build
+        run: cargo build --verbose
+      - name: Test
+        run: cargo test --verbose
+      - name: PR6 deterministic replay release gate
+        run: |
+          SRE_EVALS_RUN_ID=pr6-ci cargo run --bin sre_evals -- replay \
+            --cases evals/replay_cases.yaml --out evals/out
+          cargo run --bin sre_evals -- release-gate \
+            --current evals/out/pr6-ci.json \
+            --baseline evals/baseline-pr6.json
+
+  # Fails the build on any crate with a known RustSec advisory. Requires the
+  # committed Cargo.lock -- cargo-audit resolves transitive deps from the lock.
+  #
+  # Note this covers the RustSec database only, which is NOT the same set as
+  # GitHub's advisory database behind Dependabot alerts. Neither is a superset
+  # of the other, so both are kept on.
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: 1.88.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Install cargo-audit
+        run: cargo install --locked cargo-audit
+      # No --deny warnings: it also fails on "unmaintained" advisories, which
+      # today would red-build on three crates pulled in transitively by kube
+      # 0.98 (backoff, instant, rustls-pemfile). Those are not vulnerabilities.
+      # Default behaviour gates on actual vulnerabilities only.
+      - name: Audit dependencies
+        run: cargo audit

@@ -1,0 +1,28 @@
+{
+  "run_id": "20260619T213743Z",
+  "started_at": "2026-06-19T21:37:43.376772+00:00",
+  "case_count": 1,
+  "ac1_rate": 1.0,
+  "ac3_rate": 1.0,
+  "reason_accuracy": 0.0,
+  "avg_tool_calls": 46.0,
+  "cases": [
+    {
+      "id": "articles-down-cascade",
+      "source": "seeded",
+      "ac1": true,
+      "ac3": true,
+      "reason_match": null,
+      "reason_why": null,
+      "candidates": [
+        "articles",
+        "gateway"
+      ],
+      "ground_truth_service": "articles",
+      "report_kind": "final",
+      "tool_calls": 46,
+      "prompt_tokens": 269284,
+      "completion_tokens": 40621
+    }
+  ]
+}

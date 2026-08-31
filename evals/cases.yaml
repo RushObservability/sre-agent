@@ -1,0 +1,87 @@
+# SRE Agent RCA evaluation cases.
+#
+# Each entry is one labeled incident the harness drives the agent over and
+# scores for root-cause localization (AC@1 / AC@3) plus an LLM-judge reason
+# match. See evals/README.md for the schema and how to author real cases.
+#
+# ─────────────────────────────────────────────────────────────────────────
+# THE CASES BELOW ARE ILLUSTRATIVE PLACEHOLDERS (source: seeded).
+# They reference services that exist in the local demo stack
+# (articles, gateway, media, notifications, payments, users) but the incident
+# windows, timestamps, and "ground truth" reasons are FABRICATED for shape
+# demonstration. They have NOT been run or validated against real telemetry.
+# Replace them with real labeled incidents (source: curated) or with genuinely
+# seeded faults you injected and labeled (see README Source B) before trusting
+# any score.
+# ─────────────────────────────────────────────────────────────────────────
+
+cases:
+  - id: seeded-payments-deploy-regression
+    description: >-
+      PLACEHOLDER. Illustrates a deploy-regression case: a bad payments deploy
+      raises the error rate. Replace timestamp/window/reason with a real
+      injected fault before use.
+    source: seeded
+    input:
+      kind: question
+      text: >-
+        Checkout is failing for some users with 500 errors. Error rate on the
+        payments service jumped sharply. What is the root cause?
+      around: "2026-06-18T14:30:00Z"
+    window:
+      start: "2026-06-18T14:20:00Z"
+      end: "2026-06-18T15:00:00Z"
+    ground_truth:
+      root_cause_service: payments
+      reason: >-
+        A bad deploy of the payments service introduced a regression that
+        raised the HTTP 500 error rate starting at the deploy time.
+      related:
+        - gateway
+
+  - id: seeded-media-latency-dependency
+    description: >-
+      PLACEHOLDER. Illustrates a dependency-latency case: the articles service
+      looks slow but the real cause is the upstream media service it calls.
+      Replace with a real injected latency fault before use.
+    source: seeded
+    input:
+      kind: question
+      text: >-
+        The articles page is loading slowly. p99 latency on the articles
+        service is elevated. Find the root cause.
+      around: "2026-06-18T09:05:00Z"
+    window:
+      start: "2026-06-18T09:00:00Z"
+      end: "2026-06-18T09:30:00Z"
+    ground_truth:
+      root_cause_service: media
+      reason: >-
+        The media service (a downstream dependency of articles) developed high
+        response latency, which propagated upstream and inflated articles p99.
+      related:
+        - articles
+
+  - id: seeded-notifications-throughput-drop
+    description: >-
+      PLACEHOLDER. Illustrates a throughput-drop case: notifications stop being
+      delivered because its upstream users service stopped emitting events.
+      Replace with a real injected fault before use.
+    source: seeded
+    input:
+      kind: question
+      text: >-
+        Notification delivery throughput dropped to near zero. No errors are
+        obvious. What happened?
+      around: "2026-06-17T22:15:00Z"
+    window:
+      start: "2026-06-17T22:00:00Z"
+      end: "2026-06-17T22:45:00Z"
+    ground_truth:
+      root_cause_service: users
+      reason: >-
+        The users service stopped emitting account-event traffic, so requests
+        never arrived at notifications — the throughput drop is an upstream
+        starvation, not a notifications failure.
+      related:
+        - notifications

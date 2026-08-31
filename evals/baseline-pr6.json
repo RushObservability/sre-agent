@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "run_id": "pr6-baseline",
+  "suite": "sre-agent-pr6-replay",
+  "started_at": "2026-08-01T00:00:00Z",
+  "metrics": {
+    "case_count": 20,
+    "ac1_rate": 1.0,
+    "ac3_rate": 1.0,
+    "mechanism_accuracy": 0.95,
+    "causal_chain_completeness": 1.0,
+    "confidence_brier": 0.054155,
+    "false_final_rate": 0.0,
+    "preliminary_usefulness": 0.1,
+    "avg_tool_calls": 1.85,
+    "median_tool_calls": 2.0,
+    "prompt_tokens": 2680,
+    "completion_tokens": 540,
+    "wall_time_ms": 550,
+    "tenant_scope_failures": 0,
+    "provenance_failures": 0
+  },
+  "cases": [],
+  "artifacts": []
+}

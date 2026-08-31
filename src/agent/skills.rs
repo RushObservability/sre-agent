@@ -407,6 +407,24 @@ Use this playbook when the affected application uses PostgreSQL or the user expl
 The application service may be the symptom. Name PostgreSQL or the specific database-side mechanism only when the collector evidence supports it, and separate database evidence from the application's database-call latency."#,
     });
 
+    m.insert("mysql_diagnostics", Skill {
+        name: "mysql_diagnostics",
+        title: "MySQL Diagnostics",
+        description: "Correlate application MySQL spans with read-only query, wait, lock, and advisor evidence",
+        content: r#"# MySQL Diagnostics Playbook
+
+Use this playbook when the affected service uses MySQL or the user asks for database-side evidence.
+
+1. Establish the incident and baseline windows before diagnosing the database.
+2. Call `inspect_mysql` with the application `service` and the exact incident bounds.
+3. Rank normalized digests by database time, then separate execution work from lock time, rows examined, temp tables, and waits.
+4. If locks are present, use the waiter-to-blocker evidence to identify the object and both normalized digests. Do not infer lock key values.
+5. Treat index and settings findings as evidence to validate, never as permission to change MySQL.
+6. Distinguish replication lag or worker errors from primary workload pressure.
+
+The tool reads telemetry from the existing licensed collector. Never request or invent a DSN. If no `db.system=mysql` spans exist, say the application dependency is not instrumented in this window; do not call MySQL healthy."#,
+    });
+
     m
 }
 

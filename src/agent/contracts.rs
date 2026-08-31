@@ -431,12 +431,14 @@ pub fn require_window_from_args(args: &serde_json::Value) -> Result<Investigatio
 fn source_family_for_tool(tool_name: &str) -> SourceFamily {
     match tool_name {
         "search_logs" => SourceFamily::Logs,
-        "get_argocd_app" | "get_flux_resource" | "kube_describe" | "kube_events" => {
-            SourceFamily::Kubernetes
-        }
+        "get_argocd_app"
+        | "get_flux_resource"
+        | "kube_describe"
+        | "kube_events"
+        | "search_kubernetes_access" => SourceFamily::Kubernetes,
         "list_deploys" | "get_anomaly_context" => SourceFamily::Deploys,
         "list_repo_files" | "search_repo" | "read_repo_file" => SourceFamily::Repository,
-        "inspect_postgresql" => SourceFamily::Database,
+        "inspect_postgresql" | "inspect_mysql" => SourceFamily::Database,
         // Service RED metrics are currently calculated from spans in the
         // built-in implementation, so they intentionally remain traces.
         _ => SourceFamily::Traces,
@@ -459,6 +461,9 @@ pub fn serialize_tool_output(
 }
 
 fn source_tables_for_tool(tool_name: &str) -> Vec<String> {
+    if tool_name == "search_kubernetes_access" {
+        return vec!["config_kubernetes_access_events".into()];
+    }
     match source_family_for_tool(tool_name) {
         SourceFamily::Logs => vec!["logs".into()],
         SourceFamily::Traces => vec!["spans".into()],
@@ -723,6 +728,21 @@ mod tests {
             ToolResultEnvelope::from_legacy("query_traces", &json!({}), "Found 1 span", None);
         let logs = ToolResultEnvelope::from_legacy("search_logs", &json!({}), "Found 1 log", None);
         assert!(trace.is_independent_from(&logs));
+    }
+
+    #[test]
+    fn kubernetes_access_uses_its_recorded_event_provenance() {
+        let access = ToolResultEnvelope::from_legacy(
+            "search_kubernetes_access",
+            &json!({}),
+            "Found 1 recorded action",
+            None,
+        );
+        assert_eq!(access.source_family, SourceFamily::Kubernetes);
+        assert_eq!(
+            access.source_tables,
+            vec!["config_kubernetes_access_events"]
+        );
     }
 
     #[test]

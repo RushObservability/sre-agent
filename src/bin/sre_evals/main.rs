@@ -862,8 +862,8 @@ fn ledger_ranked_services(report: &str, vocabulary: &[String]) -> Vec<String> {
             continue;
         }
 
-        // Confidence is conventionally the LAST column; scan all cells to be
-        // robust to column drift.
+        // Confidence is conventionally the LAST column; scan all cells to
+        // handle column drift.
         let conf = if joined.contains("high") {
             3
         } else if joined.contains("med") {

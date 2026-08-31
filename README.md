@@ -65,6 +65,7 @@ query-api's tamper-evident audit log without tokens or source contents.
 | `list_deploys` / `get_anomaly_context` / `search_past_incidents` | deploys; anomaly context; prior investigation leads |
 | `get_argocd_app` / `get_flux_resource` | ArgoCD and Flux resource health |
 | `kube_describe` / `kube_events` | describe resources in the caller's mapped namespaces; namespace events |
+| `search_kubernetes_access` | correlate a suspected operator action with tenant-scoped Kubernetes access metadata when the paid add-on is enabled |
 | `list_repository_files` / `search_repository` / `read_repository_file` | bounded, read-only access to operator-approved GitHub repositories |
 | `load_skill` | load an investigation playbook |
 

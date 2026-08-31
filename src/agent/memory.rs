@@ -1031,6 +1031,7 @@ pub fn clip_tool_result(tool_name: &str, result: &str) -> String {
         "get_flux_resource" => 3000,
         "kube_describe" => 2500,
         "kube_events" => 2500,
+        "search_kubernetes_access" => 8000,
         "load_skill" => 6000, // skills are intentional content
         "compare_service_windows" | "rank_slow_dependencies" => 12_000,
         _ => 2000,

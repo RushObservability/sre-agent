@@ -244,9 +244,11 @@ fn tool_signal_type(tool_name: &str) -> Option<&'static str> {
         | "analyze_trace_critical_path"
         | "detect_service_silence" => Some("traces"),
         "query_metrics" | "get_resource_saturation" | "list_metric_catalog" => Some("metrics"),
-        "kube_describe" | "kube_events" | "get_argocd_app" | "get_flux_resource" => {
-            Some("kubernetes")
-        }
+        "kube_describe"
+        | "kube_events"
+        | "get_argocd_app"
+        | "get_flux_resource"
+        | "search_kubernetes_access" => Some("kubernetes"),
         "list_deploys" => Some("deploys"),
         _ => None,
     }
@@ -2278,6 +2280,7 @@ mod tests {
             "kube_events",
             "get_argocd_app",
             "get_flux_resource",
+            "search_kubernetes_access",
         ] {
             assert_eq!(tool_signal_type(t), Some("kubernetes"), "{t}");
         }

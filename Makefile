@@ -17,14 +17,14 @@ define run-with-dev-env
 	$(1)
 endef
 
-.PHONY: build release run check test test-integration eval-replay eval-release-gate fmt lint clean docker docker-push help
+.PHONY: build build-release release run check test test-integration eval-replay eval-release-gate fmt lint clean docker docker-push help
 
 ## Development
 
 build:                ## Build debug binary
 	cargo build
 
-release:              ## Build optimised release binary
+build-release:        ## Build optimised release binary
 	cargo build --release
 
 dev:                  ## Run the agent with local development wiring
@@ -68,6 +68,11 @@ fmt:                  ## Format code
 
 lint:                 ## Run clippy lints
 	cargo clippy -- -D warnings
+
+## Release
+
+release:              ## Open a version-bump PR: make release VERSION=0.1.2
+	@VERSION="$(VERSION)" DRY_RUN="$(DRY_RUN)" ./scripts/release.sh
 
 ## Docker
 

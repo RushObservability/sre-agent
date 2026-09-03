@@ -1,6 +1,6 @@
 [package]
 name = "sre-agent"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 default-run = "sre-agent"
 description = "AI-powered SRE investigation agent for the Rush Observability platform"

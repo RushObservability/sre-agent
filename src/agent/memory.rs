@@ -189,7 +189,7 @@ impl WorkingMemory {
     }
 
     /// Deserialize and migrate a persisted memory object. The database row
-    /// itself remains tenant-scoped by ConfigDb; this method only handles the
+    /// itself remains tenant-scoped by query-api; this method only handles the
     /// JSON payload and never changes the owning session or tenant.
     pub fn from_json(raw: &str) -> Result<Self, String> {
         let mut memory: Self = serde_json::from_str(raw).map_err(|e| e.to_string())?;

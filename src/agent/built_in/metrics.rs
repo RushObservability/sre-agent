@@ -1,6 +1,5 @@
 use crate::agent::tools::{Tool, ToolContext};
 use anyhow::Result;
-use clickhouse::Row;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -13,6 +12,7 @@ pub struct QueryMetrics;
 /// single quote (`''`); the model-supplied `minutes` is clamped here so a
 /// hostile value can never widen the scan window.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) fn build_query_metrics_sql(
     service: &str,
     metric: &str,
@@ -144,10 +144,39 @@ pub(crate) fn build_query_metrics_sql(
     }
 }
 
-#[derive(Debug, Row, Deserialize)]
+#[derive(Debug, Deserialize)]
 struct MetricRow {
     bucket: String,
     value: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct SpanTimeseriesResponse {
+    buckets: Vec<SpanBucket>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SpanBucket {
+    bucket: String,
+    count: u64,
+    error_count: u64,
+    p50_ms: f64,
+    p99_ms: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct PromResponse {
+    data: PromData,
+}
+
+#[derive(Debug, Deserialize)]
+struct PromData {
+    result: Vec<PromSeries>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PromSeries {
+    values: Vec<(f64, String)>,
 }
 
 #[async_trait::async_trait]
@@ -236,23 +265,68 @@ impl Tool for QueryMetrics {
             format!("last {minutes}m")
         };
 
-        let Some((query, label)) = build_query_metrics_sql(
-            service,
-            metric,
-            metric_name,
-            metric_type,
-            around,
-            around_minutes,
-            minutes,
-            &ctx.tenant_id,
-        ) else {
+        if service.is_empty() && metric_name.is_empty() {
             return Ok("Provide either 'service' + 'metric' or 'metric_name'.".to_string());
-        };
-
-        let rows: Vec<MetricRow> =
-            crate::state::tenant_query(&ctx.state.ch, &query, &ctx.tenant_id)
-                .fetch_all()
+        }
+        let (from, to) = crate::query_api::bounded_time_range(around, around_minutes, minutes)?;
+        let from_dt = chrono::DateTime::parse_from_rfc3339(&from)?;
+        let to_dt = chrono::DateTime::parse_from_rfc3339(&to)?;
+        let (rows, label) = if !metric_name.is_empty() {
+            let response: PromResponse = ctx
+                .state
+                .query_api
+                .prom_query_range(
+                    &ctx.tenant_id,
+                    metric_name,
+                    from_dt.timestamp(),
+                    to_dt.timestamp(),
+                    60,
+                )
                 .await?;
+            let mut rows = response
+                .data
+                .result
+                .into_iter()
+                .flat_map(|series| series.values)
+                .filter_map(|(timestamp, value)| {
+                    value.parse::<f64>().ok().map(|value| MetricRow {
+                        bucket: chrono::DateTime::from_timestamp(timestamp as i64, 0)
+                            .map(|time| time.to_rfc3339())
+                            .unwrap_or_else(|| timestamp.to_string()),
+                        value,
+                    })
+                })
+                .collect::<Vec<_>>();
+            rows.sort_by(|a, b| a.bucket.cmp(&b.bucket));
+            (rows, format!("{metric_name} {metric_type}"))
+        } else {
+            let response: SpanTimeseriesResponse = ctx
+                .state
+                .query_api
+                .query_span_timeseries(
+                    &ctx.tenant_id,
+                    &json!({
+                        "time_range": {"from":from,"to":to},
+                        "filters": [{"field":"service_name","op":"=","value":service}],
+                        "interval": "1m"
+                    }),
+                )
+                .await?;
+            let rows = response
+                .buckets
+                .into_iter()
+                .map(|bucket| MetricRow {
+                    bucket: bucket.bucket,
+                    value: match metric {
+                        "error_rate" => bucket.error_count as f64,
+                        "p50_latency" => bucket.p50_ms,
+                        "p99_latency" => bucket.p99_ms,
+                        _ => bucket.count as f64,
+                    },
+                })
+                .collect();
+            (rows, format!("{service} {metric}"))
+        };
 
         if rows.is_empty() {
             return Ok(format!("No data for {label} ({time_desc})."));

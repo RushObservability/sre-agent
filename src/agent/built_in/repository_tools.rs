@@ -45,7 +45,7 @@ async fn linked_snapshot(
 ) -> Result<(ServiceLink, PathBuf, RevisionInfo)> {
     let link = ctx
         .state
-        .config_db
+        .query_api
         .get_service_link(&ctx.tenant_id, service_name)
         .await?
         .with_context(|| {
@@ -58,11 +58,11 @@ async fn linked_snapshot(
     // unverified rather than presented as the healthy deployed revision.
     let deployment = match ctx
         .state
-        .config_db
-        .list_deploy_markers(Some(service_name), None, None)
+        .query_api
+        .list_deploy_markers(&ctx.tenant_id, Some(service_name), None, None)
         .await
     {
-        Ok(mut markers) => markers.pop(),
+        Ok(markers) => markers.into_iter().next(),
         Err(error) => {
             tracing::warn!(%error, service = service_name, "deployed revision metadata unavailable");
             None
@@ -159,30 +159,14 @@ fn read_text_file(path: &Path, max_bytes: u64) -> Result<String> {
 /// This is intentionally fire-and-forget so an unavailable audit sink cannot
 /// stall an investigation; failures are still emitted to the agent log.
 fn audit_access(ctx: &ToolContext, link: &ServiceLink, action: &'static str, path: &str) {
-    let Some(base_url) = ctx.state.query_api_url.clone() else {
-        return;
-    };
-    let token = ctx.state.internal_auth_token.clone();
+    let api = ctx.state.query_api.clone();
     let tenant_id = ctx.tenant_id.clone();
     let service_name = link.service_name.clone();
     let repository = link.github_repo.clone();
     let path = path.to_string();
     tokio::spawn(async move {
-        let result = reqwest::Client::new()
-            .post(format!(
-                "{}/api/v1/internal/repository-access-audit",
-                base_url.trim_end_matches('/')
-            ))
-            .header("x-rush-internal-token", token)
-            .json(&json!({
-                "tenant_id": tenant_id,
-                "service_name": service_name,
-                "repository": repository,
-                "action": action,
-                "path": path,
-                "outcome": "success"
-            }))
-            .send()
+        let result = api
+            .audit_repository_access(&tenant_id, &service_name, &repository, action, &path)
             .await;
         if let Err(error) = result {
             tracing::warn!(%error, "failed to submit repository access audit event");
@@ -462,6 +446,7 @@ mod tests {
             github_repository_id: 2,
             default_branch: "main".into(),
             root_path: String::new(),
+            updated_at: String::new(),
         }
     }
 

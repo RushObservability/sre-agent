@@ -47,11 +47,11 @@ most recent release only; there are no backports to earlier tags.
 ## Scope
 
 This agent executes investigations against live infrastructure and holds
-credentials for ClickHouse, Kubernetes and LLM providers. Reports touching the
-following are especially valuable:
+credentials for query-api, Kubernetes, and LLM providers. It does not receive
+ClickHouse credentials. Reports touching the following are especially valuable:
 
 - Authentication and authorization on the HTTP API, including JWT handling
-- Command, query or prompt injection reaching the Kubernetes or ClickHouse tools
+- Command, query, or prompt injection reaching Kubernetes or query-api tools
 - Leakage of credentials or customer telemetry into logs, traces or LLM prompts
 - Sandbox escape from any tool the agent can invoke
 

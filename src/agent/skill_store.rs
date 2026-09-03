@@ -2,21 +2,12 @@
 //! investigation. Built fresh per investigation so edits to custom skills are
 //! picked up on the next run without restarting the agent.
 
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Duration;
-
-use serde::Deserialize;
-
 use crate::agent::skills::all_skills as all_built_in_skills;
-use crate::config_db::ConfigDb;
 use crate::metrics::AgentMetrics;
 use crate::models::custom_skills::CustomSkill;
-
-#[derive(Debug, Deserialize)]
-struct CustomSkillsResponse {
-    skills: Vec<CustomSkill>,
-}
+use crate::query_api::QueryApiClient;
+use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Source of a skill for display and trust purposes.
 #[derive(Debug, Clone, PartialEq)]
@@ -60,17 +51,8 @@ impl SkillStore {
     /// This is the synchronous variant used in tests and when no query-api URL
     /// is configured. In the cluster, prefer [`load_unified`] which fetches
     /// custom skills over HTTP from query-api (the single source of truth).
-    pub async fn load(config_db: &Arc<ConfigDb>) -> Self {
-        let mut store = Self::with_built_ins();
-        match config_db.list_enabled_custom_skills().await {
-            Ok(custom) => store.extend_with_custom(custom),
-            Err(e) => {
-                tracing::warn!(
-                    "failed to load custom skills from local db (continuing with built-ins only): {e}"
-                );
-            }
-        }
-        store
+    pub async fn load(query_api: &Arc<QueryApiClient>, tenant_id: &str) -> Self {
+        Self::load_with_metrics(query_api, tenant_id, None).await
     }
 
     /// Build a SkillStore preferring HTTP fetch against query-api for custom skills,
@@ -79,64 +61,37 @@ impl SkillStore {
     ///
     /// `query_api_url` should be the base URL, e.g. `http://rush-o11y-query-api:8080`.
     /// When `None`, this is equivalent to [`SkillStore::load`].
-    pub async fn load_unified(config_db: &Arc<ConfigDb>, query_api_url: Option<&str>) -> Self {
-        Self::load_unified_with_metrics(config_db, query_api_url, None).await
-    }
-
-    pub async fn load_unified_with_metrics(
-        config_db: &Arc<ConfigDb>,
-        query_api_url: Option<&str>,
+    pub async fn load_with_metrics(
+        query_api: &Arc<QueryApiClient>,
+        tenant_id: &str,
         metrics: Option<&AgentMetrics>,
     ) -> Self {
         let mut store = Self::with_built_ins();
-
-        // Prefer HTTP fetch if a query-api URL is configured. This is the path
-        // the cluster uses: query-api owns the custom_skills table, sre-agent
-        // reads it over HTTP so the two services don't have to share a volume.
-        if let Some(url) = query_api_url {
-            let started = std::time::Instant::now();
-            if let Some(metrics) = metrics {
-                metrics.query_api_started();
-            }
-            match fetch_custom_skills_http(url).await {
-                Ok(custom) => {
-                    if let Some(metrics) = metrics {
-                        metrics.query_api_finished(started.elapsed(), true);
-                    }
-                    tracing::info!(
-                        "loaded {} custom skill(s) from query-api at {url}",
-                        custom.len()
-                    );
-                    store.extend_with_custom(custom);
-                    return store;
-                }
-                Err(e) => {
-                    if let Some(metrics) = metrics {
-                        metrics.query_api_finished(started.elapsed(), false);
-                    }
-                    tracing::warn!(
-                        "HTTP custom-skill fetch from {url} failed ({e}); falling back to local db"
-                    );
-                }
-            }
+        let started = std::time::Instant::now();
+        if let Some(metrics) = metrics {
+            metrics.query_api_started();
         }
-
-        // Fallback: read from the local config_db. In the cluster this is
-        // always empty for the sre-agent pod, but keeps local dev working.
-        match config_db.list_enabled_custom_skills().await {
-            Ok(custom) => store.extend_with_custom(custom),
+        match query_api.list_enabled_custom_skills(tenant_id).await {
+            Ok(custom) => {
+                if let Some(metrics) = metrics {
+                    metrics.query_api_finished(started.elapsed(), true);
+                }
+                store.extend_with_custom(custom);
+            }
             Err(e) => {
+                if let Some(metrics) = metrics {
+                    metrics.query_api_finished(started.elapsed(), false);
+                }
                 tracing::warn!(
-                    "failed to load custom skills from local db (continuing with built-ins only): {e}"
+                    "failed to load custom skills from query-api; continuing with built-ins: {e}"
                 );
             }
         }
-
         store
     }
 
     /// Build a SkillStore that only contains the built-in registry.
-    fn with_built_ins() -> Self {
+    pub(crate) fn with_built_ins() -> Self {
         let mut entries: HashMap<String, SkillEntry> = HashMap::new();
         let mut order: Vec<String> = Vec::new();
 
@@ -248,52 +203,22 @@ impl SkillStore {
     }
 }
 
-/// Fetch enabled custom skills from query-api's `/api/v1/custom-skills` endpoint.
-/// Short per-request timeout so a slow or unreachable query-api never stalls an
-/// investigation — the caller logs the error and proceeds with built-ins only.
-async fn fetch_custom_skills_http(base_url: &str) -> anyhow::Result<Vec<CustomSkill>> {
-    // Shared client — keeps the connection pool to query-api warm instead of
-    // paying TCP/TLS setup on every fetch.
-    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    let client = CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .timeout(Duration::from_secs(3))
-            .build()
-            .expect("failed to build skills HTTP client")
-    });
-
-    let url = format!("{}/api/v1/custom-skills", base_url.trim_end_matches('/'));
-    let resp = client.get(&url).send().await?;
-    if !resp.status().is_success() {
-        anyhow::bail!("query-api returned {}", resp.status());
-    }
-    let body: CustomSkillsResponse = resp.json().await?;
-    // Only surface enabled skills to the agent even if the list endpoint
-    // returned disabled ones. Keeps the trust surface minimal.
-    Ok(body.skills.into_iter().filter(|s| s.enabled).collect())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Build a SkillStore against a live ClickHouse. The DB-backed tests below
-    /// are `#[ignore]`d because they require a running ClickHouse with the
-    /// query-api `config_*` schema; the rendering/catalog assertions are also
-    /// covered by the pure-logic tests that follow, which need no database.
+    /// Build a SkillStore against a live query-api. These tests are ignored
+    /// because they require the local API and its configuration data.
     async fn live_store() -> SkillStore {
-        let url =
-            std::env::var("CLICKHOUSE_URL").unwrap_or_else(|_| "http://localhost:8123".to_string());
-        let database =
-            std::env::var("CLICKHOUSE_DATABASE").unwrap_or_else(|_| "observability".to_string());
-        let user = std::env::var("CLICKHOUSE_USER").unwrap_or_else(|_| "default".to_string());
-        let password = std::env::var("CLICKHOUSE_PASSWORD").unwrap_or_default();
-        let db = Arc::new(ConfigDb::open(&url, &user, &password).await.unwrap());
-        SkillStore::load(&db).await
+        let url = std::env::var("QUERY_API_URL").unwrap_or_else(|_| "http://localhost:8080".into());
+        let token = std::env::var("SRE_AGENT_INTERNAL_TOKEN")
+            .unwrap_or_else(|_| "dev-local-agent-token".into());
+        let api = Arc::new(QueryApiClient::new(&url, token).unwrap());
+        SkillStore::load(&api, "default").await
     }
 
     #[tokio::test]
-    #[ignore = "requires a live ClickHouse with query-api config schema"]
+    #[ignore = "requires a live query-api"]
     async fn load_with_empty_db_still_has_built_ins() {
         let store = live_store().await;
         // Should have at least the 6 known built-ins
@@ -303,7 +228,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires a live ClickHouse with query-api config schema"]
+    #[ignore = "requires a live query-api"]
     async fn built_in_entries_have_builtin_source() {
         let store = live_store().await;
         let entry = store.get("error_rate_spike").unwrap();
@@ -313,7 +238,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires a live ClickHouse with query-api config schema"]
+    #[ignore = "requires a live query-api"]
     async fn catalog_lists_all_entries() {
         let store = live_store().await;
         let cat = store.catalog();

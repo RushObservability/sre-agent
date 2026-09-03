@@ -1,7 +1,7 @@
 //! Deterministic PR6 evaluation and release-gate support.
 //!
 //! Replay cases are deliberately data-only: they exercise the same report
-//! scoring rules used by the live harness, but replace ClickHouse and the LLM
+//! scoring rules used by the live harness, but replace query-api and the LLM
 //! with captured tool results and a captured report. This makes the suite
 //! suitable for every pull request and gives release comparisons stable input.
 

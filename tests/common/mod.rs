@@ -269,7 +269,7 @@ pub async fn start_mock(scripts: Vec<Script>) -> MockServer {
 // ────────────────────────────────────────────────────────────────────────────
 
 /// A fake tool that returns a fixed response. Used in place of real tools
-/// that would hit ClickHouse/kube.
+/// that would hit query-api or Kubernetes.
 pub struct FakeTool {
     pub name_s: &'static str,
     pub response: String,
@@ -327,19 +327,14 @@ impl Tool for SleepTool {
     }
 }
 
-/// Build a ToolContext with NO live backends: the ClickHouse client and the
-/// ConfigDb both point at an unroutable port, so any accidental query fails
-/// fast instead of hanging. Skill loading tolerates the failure (falls back
-/// to built-ins), so this works in plain `cargo test` with no infrastructure.
+/// Build a ToolContext with no live backend. Any accidental API request fails
+/// fast instead of hanging.
 pub async fn make_ctx() -> ToolContext {
-    let ch = clickhouse::Client::default().with_url("http://127.0.0.1:1");
-    let config_db = Arc::new(sre_agent::config_db::ConfigDb::new_disconnected_for_tests());
-    let skill_store = Arc::new(sre_agent::agent::skill_store::SkillStore::load(&config_db).await);
+    let query_api = Arc::new(sre_agent::query_api::QueryApiClient::new_disconnected_for_tests());
+    let skill_store = Arc::new(sre_agent::agent::skill_store::SkillStore::empty());
     ToolContext {
         state: sre_agent::AppState {
-            ch,
-            config_db,
-            query_api_url: None,
+            query_api,
             internal_auth_token: "test-not-an-http-server".to_string(),
             caches: Arc::new(Default::default()),
             metrics: Arc::new(sre_agent::metrics::AgentMetrics::new()),

@@ -491,6 +491,7 @@ impl Tool for KubeEvents {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod policy_tests {
     use super::{cluster_scope_allowed_for, namespace_allowed_for, parse_namespace_policy};
 

@@ -33,16 +33,16 @@ impl Tool for GetAnomalyContext {
         if !rule_id.is_empty() {
             let rule = ctx
                 .state
-                .config_db
-                .get_anomaly_rule(rule_id)
+                .query_api
+                .get_anomaly_rule(&ctx.tenant_id, rule_id)
                 .await
                 .map_err(|e| anyhow::anyhow!("failed to get rule: {e}"))?
                 .ok_or_else(|| anyhow::anyhow!("anomaly rule not found: {rule_id}"))?;
 
             let events = ctx
                 .state
-                .config_db
-                .list_anomaly_events(rule_id, 10)
+                .query_api
+                .list_anomaly_events(&ctx.tenant_id, rule_id, 10)
                 .await
                 .map_err(|e| anyhow::anyhow!("failed to get events: {e}"))?;
 
@@ -79,8 +79,8 @@ impl Tool for GetAnomalyContext {
         } else {
             let rules = ctx
                 .state
-                .config_db
-                .list_anomaly_rules()
+                .query_api
+                .list_anomaly_rules(&ctx.tenant_id)
                 .await
                 .map_err(|e| anyhow::anyhow!("failed to list rules: {e}"))?;
 

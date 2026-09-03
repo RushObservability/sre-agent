@@ -6,7 +6,6 @@ use crate::agent::contracts::{
 use crate::agent::tools::{Tool, ToolContext};
 use anyhow::Result;
 use chrono::{Duration, Utc};
-use clickhouse::Row;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -28,7 +27,7 @@ const MYSQL_METRICS: &[&str] = &[
 
 pub struct InspectMysql;
 
-#[derive(Debug, Row, Deserialize)]
+#[derive(Debug, Deserialize)]
 struct CallRow {
     target: String,
     database: String,
@@ -39,7 +38,7 @@ struct CallRow {
     p95_ms: f64,
 }
 
-#[derive(Debug, Row, Deserialize)]
+#[derive(Debug, Deserialize)]
 struct EvidenceRow {
     timestamp: String,
     event: String,
@@ -59,13 +58,65 @@ struct EvidenceRow {
     error_code: String,
 }
 
-#[derive(Debug, Row, Deserialize)]
+#[derive(Debug, Deserialize)]
 struct MetricRow {
     name: String,
     value: f64,
     timestamp: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct SpanApiResponse {
+    rows: Vec<SpanApiRow>,
+}
+#[derive(Debug, Deserialize)]
+struct SpanApiRow {
+    attributes: String,
+    status: String,
+    http_status_code: u16,
+    duration_ns: u64,
+}
+#[derive(Debug, Deserialize)]
+struct LogApiResponse {
+    rows: Vec<LogApiRow>,
+}
+#[derive(Debug, Deserialize)]
+struct LogApiRow {
+    #[serde(rename = "Timestamp")]
+    timestamp: i64,
+    #[serde(rename = "Body")]
+    body: String,
+    #[serde(rename = "LogAttributes")]
+    attributes: Value,
+}
+#[derive(Debug, Deserialize)]
+struct PromResponse {
+    data: PromData,
+}
+#[derive(Debug, Deserialize)]
+struct PromData {
+    result: Vec<PromSeries>,
+}
+#[derive(Debug, Deserialize)]
+struct PromSeries {
+    values: Vec<(f64, String)>,
+}
+
+fn attr<'a>(attributes: &'a Value, key: &str) -> &'a str {
+    attributes.get(key).and_then(Value::as_str).unwrap_or("")
+}
+fn span_attr<'a>(attributes: &'a Value, keys: &[&str]) -> &'a str {
+    keys.iter()
+        .find_map(|key| {
+            attributes
+                .get(*key)
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or("")
+}
+
+#[cfg(test)]
 fn quote(value: &str) -> String {
     value.replace('\'', "''")
 }
@@ -108,6 +159,7 @@ fn time_window(args: &Value) -> Result<(String, Option<InvestigationWindow>, Str
     ))
 }
 
+#[cfg(test)]
 fn calls_sql(service: &str, time: &str, tenant: &str) -> String {
     format!(
         "SELECT multiIf(JSONExtractString(attributes, 'server.address') != '', JSONExtractString(attributes, 'server.address'), JSONExtractString(attributes, 'net.peer.name') != '', JSONExtractString(attributes, 'net.peer.name'), 'database') AS target, \
@@ -124,6 +176,7 @@ fn calls_sql(service: &str, time: &str, tenant: &str) -> String {
     )
 }
 
+#[cfg(test)]
 fn selectors(targets: &[String], host: &str, db: &str, map: &str, service: &str) -> Vec<String> {
     let mut out = Vec::new();
     for target in targets {
@@ -144,6 +197,7 @@ fn selectors(targets: &[String], host: &str, db: &str, map: &str, service: &str)
     out
 }
 
+#[cfg(test)]
 fn logs_sql(targets: &[String], host: &str, db: &str, time: &str, tenant: &str) -> Option<String> {
     let selectors = selectors(targets, host, db, "LogAttributes", "ServiceName");
     if selectors.is_empty() {
@@ -166,6 +220,8 @@ fn logs_sql(targets: &[String], host: &str, db: &str, time: &str, tenant: &str) 
     ))
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn metrics_sql(
     targets: &[String],
     host: &str,
@@ -285,16 +341,73 @@ impl Tool for InspectMysql {
             .and_then(Value::as_str)
             .unwrap_or("")
             .trim();
-        let (time, window, time_label) = time_window(&args)?;
+        let (_time, window, time_label) = time_window(&args)?;
+        let effective_window = window
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("unable to resolve MySQL query window"))?;
+        let from = effective_window.incident_start.to_rfc3339();
+        let to = effective_window.incident_end.to_rfc3339();
         let mut calls = Vec::<CallRow>::new();
         if ctx.has_scope("traces") && !service.is_empty() {
-            calls = crate::state::tenant_query(
-                &ctx.state.ch,
-                &calls_sql(service, &time, &ctx.tenant_id),
-                &ctx.tenant_id,
-            )
-            .fetch_all()
-            .await?;
+            let response: SpanApiResponse = ctx.state.query_api.query_spans(&ctx.tenant_id, &json!({
+                "time_range":{"from":from,"to":to},"filters":[{"field":"service_name","op":"=","value":service}],"limit":1000,"offset":0
+            })).await?;
+            let mut grouped =
+                std::collections::HashMap::<(String, String, String), Vec<SpanApiRow>>::new();
+            for row in response.rows {
+                let attributes: Value =
+                    serde_json::from_str(&row.attributes).unwrap_or_else(|_| json!({}));
+                if !matches!(
+                    span_attr(&attributes, &["db.system", "db.system.name"]),
+                    "mysql" | "mariadb"
+                ) {
+                    continue;
+                }
+                let target = span_attr(&attributes, &["server.address", "net.peer.name"]);
+                let database = span_attr(&attributes, &["db.name", "db.namespace"]);
+                let operation = span_attr(&attributes, &["db.operation.name", "db.operation"]);
+                grouped
+                    .entry((
+                        if target.is_empty() {
+                            "database"
+                        } else {
+                            target
+                        }
+                        .into(),
+                        database.into(),
+                        operation.into(),
+                    ))
+                    .or_default()
+                    .push(row);
+            }
+            calls = grouped
+                .into_iter()
+                .map(|((target, database, operation), rows)| {
+                    let mut durations = rows.iter().map(|row| row.duration_ns).collect::<Vec<_>>();
+                    durations.sort_unstable();
+                    CallRow {
+                        target,
+                        database,
+                        operation,
+                        calls: rows.len() as u64,
+                        errors: rows
+                            .iter()
+                            .filter(|row| {
+                                matches!(row.status.as_str(), "STATUS_CODE_ERROR" | "ERROR")
+                                    || row.http_status_code >= 500
+                            })
+                            .count() as u64,
+                        total_ms: durations.iter().sum::<u64>() as f64 / 1e6,
+                        p95_ms: durations
+                            .get((durations.len().saturating_sub(1) * 95) / 100)
+                            .copied()
+                            .unwrap_or(0) as f64
+                            / 1e6,
+                    }
+                })
+                .collect();
+            calls.sort_by(|a, b| b.total_ms.total_cmp(&a.total_ms));
+            calls.truncate(20);
         }
         let mut targets = Vec::new();
         for row in &calls {
@@ -302,26 +415,76 @@ impl Tool for InspectMysql {
             targets.push(row.database.clone());
         }
         let evidence = if ctx.has_scope("logs") {
-            match logs_sql(&targets, host, db, &time, &ctx.tenant_id) {
-                Some(sql) => {
-                    crate::state::tenant_query(&ctx.state.ch, &sql, &ctx.tenant_id)
-                        .fetch_all::<EvidenceRow>()
-                        .await?
-                }
-                None => Vec::new(),
-            }
+            let response:LogApiResponse=ctx.state.query_api.query_logs(&ctx.tenant_id,&json!({"time_range":{"from":from,"to":to},"filters":[{"field":"log.event","op":"IN","value":["mysql.query_stats","mysql.wait_stats","mysql.lock_wait","mysql.metadata_lock_wait","mysql.advisor","mysql.replication","mysql.replication_error","mysql.error"]}],"limit":200,"offset":0,"slim":false})).await?;
+            response
+                .rows
+                .into_iter()
+                .filter_map(|row| {
+                    let row_host = attr(&row.attributes, "host").to_string();
+                    let row_db = attr(&row.attributes, "db").to_string();
+                    let matches = (host.is_empty() || row_host == host)
+                        && (db.is_empty() || row_db == db)
+                        && (targets.is_empty()
+                            || targets
+                                .iter()
+                                .any(|target| target == &row_host || target == &row_db));
+                    matches.then(|| EvidenceRow {
+                        timestamp: crate::query_api::format_nanos_timestamp(row.timestamp),
+                        event: attr(&row.attributes, "event").into(),
+                        body: row.body,
+                        host: row_host,
+                        db: row_db,
+                        digest: attr(&row.attributes, "digest").into(),
+                        calls: attr(&row.attributes, "calls").into(),
+                        total_ms: attr(&row.attributes, "total_ms").into(),
+                        mean_ms: attr(&row.attributes, "mean_ms").into(),
+                        lock_ms: attr(&row.attributes, "lock_ms").into(),
+                        waiting_pid: attr(&row.attributes, "waiting_pid").into(),
+                        blocking_pid: attr(&row.attributes, "blocking_pid").into(),
+                        check: attr(&row.attributes, "check").into(),
+                        severity: attr(&row.attributes, "severity").into(),
+                        recommendation: attr(&row.attributes, "recommendation").into(),
+                        error_code: attr(&row.attributes, "error_code").into(),
+                    })
+                })
+                .collect()
         } else {
             Vec::new()
         };
         let metrics = if ctx.has_scope("metrics") {
-            match metrics_sql(&targets, host, db, &time, &ctx.tenant_id) {
-                Some(sql) => {
-                    crate::state::tenant_query(&ctx.state.ch, &sql, &ctx.tenant_id)
-                        .fetch_all::<MetricRow>()
-                        .await?
+            let mut rows = Vec::new();
+            for name in MYSQL_METRICS {
+                let response: PromResponse = ctx
+                    .state
+                    .query_api
+                    .prom_query_range(
+                        &ctx.tenant_id,
+                        name,
+                        effective_window.incident_start.timestamp(),
+                        effective_window.incident_end.timestamp(),
+                        60,
+                    )
+                    .await?;
+                if let Some((timestamp, value)) = response
+                    .data
+                    .result
+                    .into_iter()
+                    .flat_map(|series| series.values)
+                    .filter_map(|(timestamp, value)| {
+                        value.parse::<f64>().ok().map(|value| (timestamp, value))
+                    })
+                    .next_back()
+                {
+                    rows.push(MetricRow {
+                        name: (*name).into(),
+                        value,
+                        timestamp: chrono::DateTime::from_timestamp(timestamp as i64, 0)
+                            .map(|time| time.to_rfc3339())
+                            .unwrap_or_else(|| timestamp.to_string()),
+                    });
                 }
-                None => Vec::new(),
             }
+            rows
         } else {
             Vec::new()
         };

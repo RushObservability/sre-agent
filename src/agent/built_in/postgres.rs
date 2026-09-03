@@ -11,7 +11,6 @@ use crate::agent::contracts::{
 use crate::agent::tools::{Tool, ToolContext};
 use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
-use clickhouse::Row;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -38,7 +37,7 @@ const POSTGRES_METRICS: &[&str] = &[
 
 pub struct InspectPostgresql;
 
-#[derive(Debug, Row, Deserialize)]
+#[derive(Debug, Deserialize)]
 struct DatabaseCallRow {
     system: String,
     target: String,
@@ -50,7 +49,7 @@ struct DatabaseCallRow {
     p95_ms: f64,
 }
 
-#[derive(Debug, Row, Deserialize)]
+#[derive(Debug, Deserialize)]
 struct DatabaseLogRow {
     timestamp: String,
     event: String,
@@ -71,13 +70,68 @@ struct DatabaseLogRow {
     recommendation: String,
 }
 
-#[derive(Debug, Row, Deserialize)]
+#[derive(Debug, Deserialize)]
 struct DatabaseMetricRow {
     name: String,
     value: f64,
     timestamp: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct SpanApiResponse {
+    rows: Vec<SpanApiRow>,
+}
+#[derive(Debug, Deserialize)]
+struct SpanApiRow {
+    attributes: String,
+    status: String,
+    http_status_code: u16,
+    duration_ns: u64,
+}
+#[derive(Debug, Deserialize)]
+struct LogApiResponse {
+    rows: Vec<LogApiRow>,
+}
+#[derive(Debug, Deserialize)]
+struct LogApiRow {
+    #[serde(rename = "Timestamp")]
+    timestamp: i64,
+    #[serde(rename = "Body")]
+    body: String,
+    #[serde(rename = "SeverityText")]
+    severity: String,
+    #[serde(rename = "LogAttributes")]
+    attributes: Value,
+}
+#[derive(Debug, Deserialize)]
+struct PromResponse {
+    data: PromData,
+}
+#[derive(Debug, Deserialize)]
+struct PromData {
+    result: Vec<PromSeries>,
+}
+#[derive(Debug, Deserialize)]
+struct PromSeries {
+    values: Vec<(f64, String)>,
+}
+
+fn attr<'a>(attributes: &'a Value, key: &str) -> &'a str {
+    attributes.get(key).and_then(Value::as_str).unwrap_or("")
+}
+
+fn span_attr<'a>(attributes: &'a Value, keys: &[&str]) -> &'a str {
+    keys.iter()
+        .find_map(|key| {
+            attributes
+                .get(*key)
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or("")
+}
+
+#[cfg(test)]
 fn sql_quote(value: &str) -> String {
     value.replace('\'', "''")
 }
@@ -153,6 +207,7 @@ fn window_sql(args: &Value) -> Result<(String, Option<InvestigationWindow>, Stri
     ))
 }
 
+#[cfg(test)]
 fn database_span_predicate() -> &'static str {
     "(JSONExtractString(attributes, 'db.system') IN ('postgresql', 'postgres') \
         OR JSONExtractString(attributes, 'db.system.name') IN ('postgresql', 'postgres') \
@@ -161,6 +216,7 @@ fn database_span_predicate() -> &'static str {
         OR JSONExtractString(attributes, 'db.statement') != '')"
 }
 
+#[cfg(test)]
 fn build_database_calls_sql(
     service: &str,
     time_predicate: &str,
@@ -197,6 +253,7 @@ fn build_database_calls_sql(
     )
 }
 
+#[cfg(test)]
 fn build_database_logs_sql(
     targets: &[String],
     database_host: &str,
@@ -254,6 +311,7 @@ fn build_database_logs_sql(
     ))
 }
 
+#[cfg(test)]
 fn build_database_metrics_sql(
     targets: &[String],
     database_host: &str,
@@ -431,21 +489,101 @@ impl Tool for InspectPostgresql {
             .and_then(Value::as_str)
             .unwrap_or("")
             .trim();
-        let (time_predicate, window, time_desc) = window_sql(&args)?;
+        let (_time_predicate, window, time_desc) = window_sql(&args)?;
+        let effective_window = window
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("unable to resolve PostgreSQL query window"))?;
+        let from = effective_window.incident_start.to_rfc3339();
+        let to = effective_window.incident_end.to_rfc3339();
         let mut dependencies: Vec<DatabaseCallRow> = Vec::new();
         let mut log_rows: Vec<DatabaseLogRow> = Vec::new();
         let mut metric_rows: Vec<DatabaseMetricRow> = Vec::new();
 
         if ctx.has_scope("traces") && !service.is_empty() {
-            let sql = build_database_calls_sql(
-                service,
-                &time_predicate,
-                &ctx.tenant_id,
-                MAX_DEPENDENCIES,
-            );
-            dependencies = crate::state::tenant_query(&ctx.state.ch, &sql, &ctx.tenant_id)
-                .fetch_all()
+            let response: SpanApiResponse = ctx
+                .state
+                .query_api
+                .query_spans(
+                    &ctx.tenant_id,
+                    &json!({
+                        "time_range":{"from":from,"to":to},
+                        "filters":[{"field":"service_name","op":"=","value":service}],
+                        "limit":1000,"offset":0
+                    }),
+                )
                 .await?;
+            let mut grouped = std::collections::HashMap::<
+                (String, String, String, String),
+                Vec<SpanApiRow>,
+            >::new();
+            for row in response.rows {
+                let attributes: Value =
+                    serde_json::from_str(&row.attributes).unwrap_or_else(|_| json!({}));
+                let system = span_attr(&attributes, &["db.system", "db.system.name"]);
+                if !matches!(system, "postgresql" | "postgres")
+                    && span_attr(
+                        &attributes,
+                        &["db.operation.name", "db.operation", "db.statement"],
+                    )
+                    .is_empty()
+                {
+                    continue;
+                }
+                let target = span_attr(
+                    &attributes,
+                    &["server.address", "net.peer.name", "db.namespace", "db.name"],
+                );
+                let database_name = span_attr(&attributes, &["db.name", "db.namespace"]);
+                let operation = span_attr(&attributes, &["db.operation.name", "db.operation"]);
+                grouped
+                    .entry((
+                        if system.is_empty() {
+                            "postgresql"
+                        } else {
+                            system
+                        }
+                        .into(),
+                        if target.is_empty() {
+                            "database"
+                        } else {
+                            target
+                        }
+                        .into(),
+                        database_name.into(),
+                        operation.into(),
+                    ))
+                    .or_default()
+                    .push(row);
+            }
+            dependencies = grouped
+                .into_iter()
+                .map(|((system, target, database, operation), rows)| {
+                    let mut durations = rows.iter().map(|row| row.duration_ns).collect::<Vec<_>>();
+                    durations.sort_unstable();
+                    DatabaseCallRow {
+                        system,
+                        target,
+                        database,
+                        operation,
+                        calls: rows.len() as u64,
+                        errors: rows
+                            .iter()
+                            .filter(|row| {
+                                matches!(row.status.as_str(), "STATUS_CODE_ERROR" | "ERROR")
+                                    || row.http_status_code >= 500
+                            })
+                            .count() as u64,
+                        total_ms: durations.iter().sum::<u64>() as f64 / 1e6,
+                        p95_ms: durations
+                            .get((durations.len().saturating_sub(1) * 95) / 100)
+                            .copied()
+                            .unwrap_or(0) as f64
+                            / 1e6,
+                    }
+                })
+                .collect();
+            dependencies.sort_by(|a, b| b.total_ms.total_cmp(&a.total_ms));
+            dependencies.truncate(MAX_DEPENDENCIES);
         }
 
         let mut targets = Vec::new();
@@ -456,29 +594,74 @@ impl Tool for InspectPostgresql {
             }
         }
         if ctx.has_scope("logs") {
-            if let Some(sql) = build_database_logs_sql(
-                &targets,
-                database_host,
-                database,
-                &time_predicate,
-                &ctx.tenant_id,
-            ) {
-                log_rows = crate::state::tenant_query(&ctx.state.ch, &sql, &ctx.tenant_id)
-                    .fetch_all()
-                    .await?;
-            }
+            let response: LogApiResponse = ctx.state.query_api.query_logs(&ctx.tenant_id, &json!({
+                "time_range":{"from":from,"to":to},
+                "filters":[{"field":"log.event","op":"IN","value":["postgres.query_stats","postgres.long_transaction","postgres.lock_wait","postgres.advisor","postgres.replication","postgres.archiver"]}],
+                "limit":MAX_LOG_ROWS,"offset":0,"slim":false
+            })).await?;
+            log_rows = response
+                .rows
+                .into_iter()
+                .filter_map(|row| {
+                    let host = attr(&row.attributes, "host");
+                    let db = attr(&row.attributes, "db");
+                    let matches = (database_host.is_empty() || host == database_host)
+                        && (database.is_empty() || db == database)
+                        && (targets.is_empty()
+                            || targets.iter().any(|target| target == host || target == db));
+                    matches.then(|| DatabaseLogRow {
+                        timestamp: crate::query_api::format_nanos_timestamp(row.timestamp),
+                        event: attr(&row.attributes, "event").into(),
+                        body: row.body,
+                        host: host.into(),
+                        db: db.into(),
+                        severity: row.severity,
+                        queryid: attr(&row.attributes, "queryid").into(),
+                        mean_ms: attr(&row.attributes, "mean_ms").into(),
+                        total_ms: attr(&row.attributes, "total_ms").into(),
+                        calls: attr(&row.attributes, "calls").into(),
+                        plan_ms: attr(&row.attributes, "plan_ms").into(),
+                        max_age_s: attr(&row.attributes, "max_age_s").into(),
+                        waiting: attr(&row.attributes, "waiting").into(),
+                        severity_attr: attr(&row.attributes, "severity").into(),
+                        check: attr(&row.attributes, "check").into(),
+                        current: attr(&row.attributes, "current").into(),
+                        recommendation: attr(&row.attributes, "recommendation").into(),
+                    })
+                })
+                .collect();
         }
         if ctx.has_scope("metrics") {
-            if let Some(sql) = build_database_metrics_sql(
-                &targets,
-                database_host,
-                database,
-                &time_predicate,
-                &ctx.tenant_id,
-            ) {
-                metric_rows = crate::state::tenant_query(&ctx.state.ch, &sql, &ctx.tenant_id)
-                    .fetch_all()
+            for name in POSTGRES_METRICS {
+                let response: PromResponse = ctx
+                    .state
+                    .query_api
+                    .prom_query_range(
+                        &ctx.tenant_id,
+                        name,
+                        effective_window.incident_start.timestamp(),
+                        effective_window.incident_end.timestamp(),
+                        60,
+                    )
                     .await?;
+                if let Some((timestamp, value)) = response
+                    .data
+                    .result
+                    .into_iter()
+                    .flat_map(|series| series.values)
+                    .filter_map(|(timestamp, value)| {
+                        value.parse::<f64>().ok().map(|value| (timestamp, value))
+                    })
+                    .next_back()
+                {
+                    metric_rows.push(DatabaseMetricRow {
+                        name: (*name).into(),
+                        value,
+                        timestamp: chrono::DateTime::from_timestamp(timestamp as i64, 0)
+                            .map(|time| time.to_rfc3339())
+                            .unwrap_or_else(|| timestamp.to_string()),
+                    });
+                }
             }
         }
 

@@ -31,9 +31,6 @@ serde_json = "1"
 # YAML for the eval harness case files (src/bin/sre_evals.rs).
 serde_yaml = "0.9"
 
-# ClickHouse client (for log/trace/metric queries + shared config tables)
-clickhouse = { version = "0.13", features = ["time", "uuid"] }
-
 # Kubernetes client (for argocd + kube tools)
 kube = { version = "4.0", features = ["client", "runtime", "derive"] }
 k8s-openapi = { version = "0.28", features = ["v1_32"] }

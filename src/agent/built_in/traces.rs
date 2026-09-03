@@ -1,6 +1,5 @@
 use crate::agent::tools::{Tool, ToolContext};
 use anyhow::Result;
-use clickhouse::Row;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -11,6 +10,7 @@ pub struct QueryTraces;
 /// model-supplied `minutes`/`limit` are clamped here so a hostile value can
 /// never widen the scan window or row count.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) fn build_query_traces_sql(
     service: &str,
     status: &str,
@@ -85,6 +85,7 @@ pub(crate) fn build_query_traces_sql(
 /// Pure SQL builder for `get_trace`. Both interpolated values (`trace_id`,
 /// `tenant_id`) are escaped with the ClickHouse-standard doubled single
 /// quote (`''`).
+#[cfg(test)]
 pub(crate) fn build_get_trace_sql(trace_id: &str, tenant_id: &str) -> String {
     let tenant_id = tenant_id.replace('\'', "''");
     format!(
@@ -99,8 +100,8 @@ pub(crate) fn build_get_trace_sql(trace_id: &str, tenant_id: &str) -> String {
     )
 }
 
-#[derive(Debug, Row, Deserialize)]
-#[allow(dead_code)] // fields populated by ClickHouse row deserialization
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)] // fields populated by query-api response deserialization
 struct TraceRow {
     trace_id: String,
     span_id: String,
@@ -112,7 +113,12 @@ struct TraceRow {
     http_status_code: u16,
     status: String,
     duration_ns: u64,
-    ts_str: String,
+    timestamp: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct QueryResponse {
+    rows: Vec<TraceRow>,
 }
 
 #[async_trait::async_trait]
@@ -207,22 +213,43 @@ impl Tool for QueryTraces {
             .unwrap_or(20)
             .min(100);
 
-        let query = build_query_traces_sql(
-            service,
-            status,
-            span_name,
-            min_duration_ms,
-            order_by,
-            around,
-            around_minutes,
-            minutes,
-            limit,
-            &ctx.tenant_id,
-        );
-
-        let rows: Vec<TraceRow> = crate::state::tenant_query(&ctx.state.ch, &query, &ctx.tenant_id)
-            .fetch_all()
+        let (from, to) = crate::query_api::bounded_time_range(around, around_minutes, minutes)?;
+        let mut filters = Vec::new();
+        if !service.is_empty() {
+            filters.push(json!({"field":"service_name","op":"=","value":service}));
+        }
+        if !span_name.is_empty() {
+            filters.push(json!({"field":"span_name","op":"=","value":span_name}));
+        }
+        if min_duration_ms > 0 {
+            filters.push(json!({"field":"duration_ns","op":">=","value":min_duration_ms.saturating_mul(1_000_000)}));
+        }
+        let response: QueryResponse = ctx
+            .state
+            .query_api
+            .query_spans(
+                &ctx.tenant_id,
+                &json!({
+                    "time_range": {"from":from,"to":to},
+                    "filters": filters,
+                    "limit": 1000,
+                    "offset": 0
+                }),
+            )
             .await?;
+        let mut rows = response
+            .rows
+            .into_iter()
+            .filter(|row| {
+                status.is_empty()
+                    || (status == "error" && is_error(&row.status, row.http_status_code))
+                    || (status == "ok" && !is_error(&row.status, row.http_status_code))
+            })
+            .collect::<Vec<_>>();
+        if order_by == "duration" {
+            rows.sort_by(|a, b| b.duration_ns.cmp(&a.duration_ns));
+        }
+        rows.truncate(limit as usize);
 
         if rows.is_empty() {
             return Ok("No matching spans found.".to_string());
@@ -288,7 +315,7 @@ impl Tool for QueryTraces {
             for s in error_samples {
                 out.push_str(&format!(
                     "  [{ts}] {svc} {span} {method} {path} → {code} ({dur:.1}ms) trace={tid} span={sid} parent={pid}\n",
-                    ts = s.ts_str,
+                    ts = crate::query_api::format_nanos_timestamp(s.timestamp),
                     svc = s.service_name,
                     span = s.span_name,
                     method = s.http_method,
@@ -312,8 +339,8 @@ fn is_error(status: &str, http_status_code: u16) -> bool {
 
 pub struct GetTrace;
 
-#[derive(Debug, Row, Deserialize)]
-#[allow(dead_code)] // fields populated by ClickHouse row deserialization
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)] // fields populated by query-api response deserialization
 struct SpanRow {
     span_id: String,
     parent_span_id: String,
@@ -323,8 +350,16 @@ struct SpanRow {
     http_status_code: u16,
     status: String,
     duration_ns: u64,
-    attributes: String,
-    ts_str: String,
+    attributes: Value,
+    timestamp: String,
+    #[serde(default)]
+    children: Vec<SpanRow>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TraceResponse {
+    spans: Vec<SpanRow>,
+    span_count: usize,
 }
 
 #[async_trait::async_trait]
@@ -359,18 +394,29 @@ impl Tool for GetTrace {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("trace_id is required"))?;
 
-        let query = build_get_trace_sql(trace_id, &ctx.tenant_id);
-
-        let rows: Vec<SpanRow> = crate::state::tenant_query(&ctx.state.ch, &query, &ctx.tenant_id)
-            .fetch_all()
-            .await?;
+        let Some(trace): Option<TraceResponse> = ctx
+            .state
+            .query_api
+            .get_trace(&ctx.tenant_id, trace_id)
+            .await?
+        else {
+            return Ok(format!("No spans found for trace {trace_id}"));
+        };
+        let mut rows = Vec::with_capacity(trace.span_count);
+        fn flatten<'a>(nodes: &'a [SpanRow], rows: &mut Vec<&'a SpanRow>) {
+            for node in nodes {
+                rows.push(node);
+                flatten(&node.children, rows);
+            }
+        }
+        flatten(&trace.spans, &mut rows);
 
         if rows.is_empty() {
             return Ok(format!("No spans found for trace {trace_id}"));
         }
 
         let mut out = format!("Trace {trace_id}: {} spans\n\n", rows.len());
-        for s in &rows {
+        for s in rows {
             let indent = if s.parent_span_id.is_empty() {
                 ""
             } else {
@@ -378,7 +424,7 @@ impl Tool for GetTrace {
             };
             out.push_str(&format!(
                 "{indent}[{ts}] {svc} {method} {path} → {status} {code} ({dur:.1}ms)\n",
-                ts = s.ts_str,
+                ts = s.timestamp,
                 svc = s.service_name,
                 method = s.http_method,
                 path = s.http_path,
@@ -390,7 +436,7 @@ impl Tool for GetTrace {
                 code = s.http_status_code,
                 dur = s.duration_ns as f64 / 1e6,
             ));
-            if !s.attributes.is_empty() && s.attributes != "{}" {
+            if !s.attributes.is_null() && s.attributes != json!({}) {
                 out.push_str(&format!(
                     "    span={} parent={} attributes={}\n",
                     s.span_id,
@@ -399,7 +445,7 @@ impl Tool for GetTrace {
                     } else {
                         &s.parent_span_id
                     },
-                    crate::agent::memory::truncate_at_char_boundary(&s.attributes, 500)
+                    crate::agent::memory::truncate_at_char_boundary(&s.attributes.to_string(), 500)
                 ));
             }
         }

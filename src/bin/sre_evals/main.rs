@@ -10,7 +10,8 @@
 //!   C) public-benchmark adapter     (source: "benchmark", via `convert-*`)
 //!
 //! REQUIREMENTS to actually RUN (not needed to build):
-//!   - a live ClickHouse populated with telemetry (CLICKHOUSE_URL/USER/PASSWORD/DATABASE)
+//!   - a live query-api backed by populated telemetry (QUERY_API_URL)
+//!   - the shared SRE_AGENT_INTERNAL_TOKEN
 //!   - OPENAI_API_KEY (+ optional OPENAI_BASE_URL) for both the agent and the judge
 //!
 //! Usage:
@@ -39,7 +40,7 @@ use sre_agent::agent::prompt::{question_context, system_prompt};
 use sre_agent::agent::skill_store::SkillStore;
 use sre_agent::agent::stream::AgentEvent;
 use sre_agent::agent::tools::{ToolContext, ToolRegistry};
-use sre_agent::config_db::ConfigDb;
+use sre_agent::query_api::QueryApiClient;
 
 mod rca_convert;
 mod replay;
@@ -78,7 +79,7 @@ pub struct EvalCase {
     #[serde(default)]
     pub expectation: ReplayExpectation,
     /// Replayed tool results and a captured report for offline regression
-    /// testing. This is intentionally separate from live ClickHouse cases.
+    /// testing. This is intentionally separate from live query-api cases.
     #[serde(default)]
     pub replay: Option<ReplayFixture>,
     /// "curated" | "seeded" | "benchmark"
@@ -178,14 +179,14 @@ fn print_usage() {
          \x20 sre_evals convert-rcaeval <labels-file.csv|json>\n\
          \x20 sre_evals convert-openrca <labels-file.json>\n\n\
          Defaults: --cases evals/cases.yaml  --out evals/out\n\
-         RUN requires a live ClickHouse and OPENAI_API_KEY in the environment."
+         RUN requires a live query-api and OPENAI_API_KEY in the environment."
     );
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Load .env the same way the production binary does, so CLICKHOUSE_* /
-    // LLM_* line up with a local dev setup.
+    // Load .env the same way the production binary does, so query-api and LLM
+    // settings line up with a local dev setup.
     dotenvy::dotenv().ok();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -476,38 +477,20 @@ async fn run_command(args: &[String]) -> Result<()> {
 }
 
 /// Construct [`AppState`] from env vars, mirroring `src/main.rs` exactly so the
-/// harness talks to the same ClickHouse / config tables as production.
+/// harness talks to the same query-api endpoints as production.
 async fn build_app_state() -> Result<AppState> {
-    let clickhouse_url =
-        std::env::var("CLICKHOUSE_URL").unwrap_or_else(|_| "http://localhost:8123".to_string());
-    let clickhouse_db =
-        std::env::var("CLICKHOUSE_DATABASE").unwrap_or_else(|_| "observability".to_string());
-    let clickhouse_user =
-        std::env::var("CLICKHOUSE_USER").unwrap_or_else(|_| "default".to_string());
-    let clickhouse_password = std::env::var("CLICKHOUSE_PASSWORD").unwrap_or_default();
-
-    let ch = clickhouse::Client::default()
-        .with_url(&clickhouse_url)
-        .with_database(&clickhouse_db)
-        .with_user(&clickhouse_user)
-        .with_password(&clickhouse_password)
-        .with_option("max_execution_time", "30");
-
-    sre_agent::state::probe_row_policy_support(&ch).await;
-
-    // ConfigDb lives in the session-default database (matches main.rs).
-    let config_db =
-        Arc::new(ConfigDb::open(&clickhouse_url, &clickhouse_user, &clickhouse_password).await?);
-
-    let query_api_url = std::env::var("QUERY_API_URL")
-        .ok()
-        .filter(|v| !v.trim().is_empty());
+    let query_api_url =
+        std::env::var("QUERY_API_URL").unwrap_or_else(|_| "http://localhost:8080".into());
+    let internal_auth_token = std::env::var("SRE_AGENT_INTERNAL_TOKEN")
+        .unwrap_or_else(|_| "dev-local-agent-token".into());
+    let query_api = Arc::new(QueryApiClient::new(
+        &query_api_url,
+        internal_auth_token.clone(),
+    )?);
 
     Ok(AppState {
-        ch,
-        config_db,
-        query_api_url,
-        internal_auth_token: "evals-not-an-http-server".to_string(),
+        query_api,
+        internal_auth_token,
         caches: Arc::new(Default::default()),
         metrics: Arc::new(sre_agent::metrics::AgentMetrics::new()),
         admission: Arc::new(sre_agent::state::InvestigationAdmission::new(
@@ -541,7 +524,7 @@ async fn run_one_case(
     let scopes = vec!["all".to_string()];
 
     // Skill store + system prompt, built the same way the HTTP handler does.
-    let skill_store = Arc::new(SkillStore::load(&state.config_db).await);
+    let skill_store = Arc::new(SkillStore::load(&state.query_api, "default").await);
     let gitops = gitops_from_env();
     let system_content = system_prompt(&skill_store.catalog(), &scopes, &gitops);
 

@@ -61,8 +61,6 @@ pub struct AgentMetrics {
     query_api_in_flight: AtomicI64,
     query_api_requests: AtomicU64,
     query_api_errors: AtomicU64,
-    clickhouse_probes: AtomicU64,
-    clickhouse_errors: AtomicU64,
     process_resident_memory_bytes: AtomicU64,
     process_max_resident_memory_bytes: AtomicU64,
     process_cpu_seconds_bits: AtomicU64,
@@ -84,7 +82,6 @@ pub struct AgentMetrics {
     tool_duration: Mutex<Histogram>,
     cancellation_latency: Mutex<Histogram>,
     query_api_duration: Mutex<Histogram>,
-    clickhouse_probe_duration: Mutex<Histogram>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -255,14 +252,6 @@ impl AgentMetrics {
         }
         self.query_api_in_flight.fetch_sub(1, Ordering::Relaxed);
         self.observe(&self.query_api_duration, duration);
-    }
-
-    pub fn clickhouse_probe_finished(&self, duration: Duration, ok: bool) {
-        self.clickhouse_probes.fetch_add(1, Ordering::Relaxed);
-        if !ok {
-            self.clickhouse_errors.fetch_add(1, Ordering::Relaxed);
-        }
-        self.observe(&self.clickhouse_probe_duration, duration);
     }
 
     pub(crate) fn set_process_runtime(&self, sample: ProcessRuntimeSample) {
@@ -488,18 +477,6 @@ impl AgentMetrics {
             "Requests to query-api that failed.",
             self.query_api_errors.load(Ordering::Relaxed),
         );
-        counter(
-            &mut output,
-            "sre_agent_clickhouse_probes_total",
-            "ClickHouse dependency probes.",
-            self.clickhouse_probes.load(Ordering::Relaxed),
-        );
-        counter(
-            &mut output,
-            "sre_agent_clickhouse_probe_errors_total",
-            "ClickHouse dependency probes that failed.",
-            self.clickhouse_errors.load(Ordering::Relaxed),
-        );
         gauge_u64(
             &mut output,
             "sre_agent_process_resident_memory_bytes",
@@ -619,12 +596,6 @@ impl AgentMetrics {
             "Query-api dependency request duration in seconds.",
             &self.query_api_duration,
         );
-        histogram(
-            &mut output,
-            "sre_agent_clickhouse_probe_duration_seconds",
-            "ClickHouse dependency probe duration in seconds.",
-            &self.clickhouse_probe_duration,
-        );
         output
     }
 }
@@ -688,7 +659,6 @@ mod tests {
         metrics.llm_usage(11, 7);
         metrics.query_api_started();
         metrics.query_api_finished(Duration::from_millis(3), false);
-        metrics.clickhouse_probe_finished(Duration::from_millis(2), true);
         metrics.investigation_reported("final", 3, 4, 128);
         metrics.set_process_runtime(ProcessRuntimeSample {
             resident_memory_bytes: 10,

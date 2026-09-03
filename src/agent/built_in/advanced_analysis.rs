@@ -10,7 +10,6 @@ use crate::agent::contracts::{
 };
 use crate::agent::tools::{Tool, ToolContext};
 use anyhow::Result;
-use clickhouse::Row;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -19,14 +18,17 @@ const MAX_METRIC_ROWS: usize = 100;
 const MAX_SILENCE_SERVICES: usize = 20;
 const MAX_TRACE_SPANS: usize = 5000;
 
+#[cfg(test)]
 fn sql_quote(value: &str) -> String {
     value.replace('\'', "''")
 }
 
+#[cfg(test)]
 fn sql_timestamp(value: chrono::DateTime<chrono::Utc>) -> String {
     value.format("%Y-%m-%d %H:%M:%S.%f").to_string()
 }
 
+#[cfg(test)]
 fn period_bounds(
     window: &InvestigationWindow,
     period: &str,
@@ -38,6 +40,7 @@ fn period_bounds(
     }
 }
 
+#[cfg(test)]
 fn time_predicate(window: &InvestigationWindow, period: &str, column: &str) -> String {
     let (start, end) = period_bounds(window, period);
     format!(
@@ -117,7 +120,7 @@ fn denied(
 
 // ── Critical path ──────────────────────────────────────────────────────────
 
-#[derive(Debug, Row, Deserialize)]
+#[derive(Debug, Deserialize)]
 struct CriticalSpanRow {
     trace_id: String,
     span_id: String,
@@ -128,6 +131,81 @@ struct CriticalSpanRow {
     start_ns: i64,
     duration_ns: u64,
     status: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CriticalTraceResponse {
+    spans: Vec<CriticalApiSpan>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CriticalApiSpan {
+    span_id: String,
+    parent_span_id: String,
+    service_name: String,
+    #[serde(default)]
+    span_name: String,
+    #[serde(default)]
+    kind: String,
+    timestamp: String,
+    duration_ns: u64,
+    status: String,
+    #[serde(default)]
+    children: Vec<CriticalApiSpan>,
+}
+
+fn trace_timestamp_nanos(value: &str) -> Option<i64> {
+    chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f")
+        .ok()
+        .map(|time| time.and_utc().timestamp_nanos_opt().unwrap_or(0))
+}
+
+fn flatten_critical_spans(
+    trace_id: &str,
+    spans: Vec<CriticalApiSpan>,
+    window: &InvestigationWindow,
+) -> Vec<CriticalSpanRow> {
+    fn visit(
+        trace_id: &str,
+        span: CriticalApiSpan,
+        window: &InvestigationWindow,
+        rows: &mut Vec<CriticalSpanRow>,
+    ) {
+        let timestamp = trace_timestamp_nanos(&span.timestamp);
+        if timestamp.is_some_and(|value| {
+            value
+                >= window
+                    .incident_start
+                    .timestamp_nanos_opt()
+                    .unwrap_or(i64::MIN)
+                && value
+                    < window
+                        .incident_end
+                        .timestamp_nanos_opt()
+                        .unwrap_or(i64::MAX)
+        }) {
+            rows.push(CriticalSpanRow {
+                trace_id: trace_id.to_string(),
+                span_id: span.span_id,
+                parent_span_id: span.parent_span_id,
+                service_name: span.service_name,
+                span_name: span.span_name,
+                kind: span.kind,
+                start_ns: timestamp.unwrap_or(0),
+                duration_ns: span.duration_ns,
+                status: span.status,
+            });
+        }
+        for child in span.children {
+            visit(trace_id, child, window, rows);
+        }
+    }
+    let mut rows = Vec::new();
+    for span in spans {
+        visit(trace_id, span, window, &mut rows);
+    }
+    rows.truncate(MAX_TRACE_SPANS);
+    rows
 }
 
 #[derive(Debug, Clone)]
@@ -144,6 +222,7 @@ struct SpanNode {
     children: Vec<String>,
 }
 
+#[cfg(test)]
 fn build_critical_path_sql(
     trace_id: &str,
     window: &InvestigationWindow,
@@ -380,10 +459,15 @@ impl Tool for AnalyzeTraceCriticalPath {
             Ok(window) => window,
             Err(message) => return Ok(format!("Tool error: {message}")),
         };
-        let sql = build_critical_path_sql(trace_id, &window, &ctx.tenant_id);
-        let rows = crate::state::tenant_query(&ctx.state.ch, &sql, &ctx.tenant_id)
-            .fetch_all::<CriticalSpanRow>()
-            .await?;
+        let rows = match ctx
+            .state
+            .query_api
+            .get_trace::<CriticalTraceResponse>(&ctx.tenant_id, trace_id)
+            .await?
+        {
+            Some(trace) => flatten_critical_spans(trace_id, trace.spans, &window),
+            None => Vec::new(),
+        };
         if rows.is_empty() {
             return Ok(envelope(EnvelopeParams {
                 tool_name: self.name(),
@@ -437,7 +521,7 @@ impl Tool for AnalyzeTraceCriticalPath {
 
 // ── Resource saturation ────────────────────────────────────────────────────
 
-#[derive(Debug, Row, Deserialize)]
+#[derive(Debug, Deserialize)]
 struct ResourceMetricRow {
     metric_name: String,
     metric_type: String,
@@ -448,10 +532,50 @@ struct ResourceMetricRow {
     maximum: f64,
 }
 
+#[derive(Debug, Deserialize)]
+struct PromApiResponse {
+    data: PromApiData,
+}
+#[derive(Debug, Deserialize)]
+struct PromApiData {
+    result: Vec<PromApiSeries>,
+}
+#[derive(Debug, Deserialize)]
+struct PromApiSeries {
+    values: Vec<(f64, String)>,
+}
+
+fn resource_metric_row(
+    metric_name: String,
+    period: &str,
+    response: PromApiResponse,
+) -> Option<ResourceMetricRow> {
+    let values = response
+        .data
+        .result
+        .into_iter()
+        .flat_map(|series| series.values)
+        .filter_map(|(_, value)| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite())
+        .collect::<Vec<_>>();
+    let latest = *values.last()?;
+    Some(ResourceMetricRow {
+        metric_name,
+        metric_type: "promql".into(),
+        period: period.into(),
+        sample_count: values.len() as u64,
+        latest,
+        average: values.iter().sum::<f64>() / values.len() as f64,
+        maximum: values.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+    })
+}
+
+#[cfg(test)]
 fn resource_metric_predicate() -> &'static str {
     "(lower(MetricName) LIKE '%cpu%' OR lower(MetricName) LIKE '%memory%' OR lower(MetricName) LIKE '%mem%' OR lower(MetricName) LIKE '%throttl%' OR lower(MetricName) LIKE '%oom%' OR lower(MetricName) LIKE '%restart%' OR lower(MetricName) LIKE '%evict%' OR lower(MetricName) LIKE '%gc%' OR lower(MetricName) LIKE '%queue%' OR lower(MetricName) LIKE '%connection%')"
 }
 
+#[cfg(test)]
 pub(crate) fn build_resource_saturation_sql(
     service: &str,
     window: &InvestigationWindow,
@@ -554,10 +678,60 @@ impl Tool for GetResourceSaturation {
             Ok(value) => value,
             Err(message) => return Ok(format!("Tool error: {message}")),
         };
-        let sql = build_resource_saturation_sql(service, &window, &ctx.tenant_id);
-        let rows = crate::state::tenant_query(&ctx.state.ch, &sql, &ctx.tenant_id)
-            .fetch_all::<ResourceMetricRow>()
+        let catalog_start = window.baseline_start.min(window.incident_start).timestamp();
+        let catalog_end = window.baseline_end.max(window.incident_end).timestamp();
+        let names = ctx
+            .state
+            .query_api
+            .prom_label_values(&ctx.tenant_id, "__name__", catalog_start, catalog_end)
             .await?;
+        let names = names
+            .into_iter()
+            .filter(|name| {
+                let lower = name.to_ascii_lowercase();
+                [
+                    "cpu",
+                    "memory",
+                    "mem",
+                    "throttl",
+                    "oom",
+                    "restart",
+                    "evict",
+                    "gc",
+                    "queue",
+                    "connection",
+                ]
+                .iter()
+                .any(|term| lower.contains(term))
+            })
+            .take(40)
+            .collect::<Vec<_>>();
+        let service_label = service.replace('\\', "\\\\").replace('"', "\\\"");
+        let mut rows = Vec::new();
+        for name in names {
+            let query = format!("{name}{{service_name=\"{service_label}\"}}");
+            for (period, start, end) in [
+                (
+                    "incident",
+                    window.incident_start.timestamp(),
+                    window.incident_end.timestamp(),
+                ),
+                (
+                    "baseline",
+                    window.baseline_start.timestamp(),
+                    window.baseline_end.timestamp(),
+                ),
+            ] {
+                let response: PromApiResponse = ctx
+                    .state
+                    .query_api
+                    .prom_query_range(&ctx.tenant_id, &query, start, end, 60)
+                    .await?;
+                if let Some(row) = resource_metric_row(name.clone(), period, response) {
+                    rows.push(row);
+                }
+            }
+        }
         let mut grouped: BTreeMap<
             (String, String),
             (Option<ResourceMetricRow>, Option<ResourceMetricRow>),
@@ -582,7 +756,7 @@ impl Tool for GetResourceSaturation {
                 status: ResultStatus::NoData,
                 summary: format!("No resource metrics were found for service {service}."),
                 sample_count: 0,
-                service: service.into(),
+                service: service.to_string(),
                 operation: "resource_saturation".into(),
                 warnings: vec![
                     "resource telemetry is not instrumented or was not emitted in either window"
@@ -647,7 +821,7 @@ impl Tool for GetResourceSaturation {
 
 // ── Metric catalog ──────────────────────────────────────────────────────────
 
-#[derive(Debug, Row, Deserialize)]
+#[derive(Debug, Deserialize)]
 struct MetricCatalogRow {
     metric_name: String,
     metric_type: String,
@@ -661,6 +835,7 @@ struct MetricCatalogRow {
     last_seen: String,
 }
 
+#[cfg(test)]
 pub(crate) fn build_metric_catalog_sql(
     window: &InvestigationWindow,
     tenant_id: &str,
@@ -722,10 +897,32 @@ impl Tool for ListMetricCatalog {
             Err(message) => return Ok(format!("Tool error: {message}")),
         };
         let prefix = args.get("prefix").and_then(Value::as_str).unwrap_or("");
-        let sql = build_metric_catalog_sql(&window, &ctx.tenant_id, prefix);
-        let rows = crate::state::tenant_query(&ctx.state.ch, &sql, &ctx.tenant_id)
-            .fetch_all::<MetricCatalogRow>()
-            .await?;
+        let rows = ctx
+            .state
+            .query_api
+            .prom_label_values(
+                &ctx.tenant_id,
+                "__name__",
+                window.incident_start.timestamp(),
+                window.incident_end.timestamp(),
+            )
+            .await?
+            .into_iter()
+            .filter(|name| name.starts_with(prefix))
+            .take(MAX_METRIC_ROWS)
+            .map(|metric_name| MetricCatalogRow {
+                metric_name,
+                metric_type: "prometheus".into(),
+                description: String::new(),
+                unit: String::new(),
+                observed_services: Vec::new(),
+                label_names: Vec::new(),
+                series_count: 0,
+                label_count: 0,
+                sample_count: 0,
+                last_seen: window.incident_end.to_rfc3339(),
+            })
+            .collect::<Vec<_>>();
         if rows.is_empty() {
             return Ok(envelope(EnvelopeParams {
                 tool_name: self.name(),
@@ -777,13 +974,23 @@ impl Tool for ListMetricCatalog {
 
 // ── Service silence ─────────────────────────────────────────────────────────
 
-#[derive(Debug, Row, Deserialize)]
+#[derive(Debug, Deserialize)]
 struct SilenceRow {
     service: String,
     period: String,
     server_count: u64,
     expected_calls: u64,
     caller_count: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct SpanCountResponse {
+    total: u64,
+    rows: Vec<SpanServiceRow>,
+}
+#[derive(Debug, Deserialize)]
+struct SpanServiceRow {
+    service_name: String,
 }
 
 fn service_values(args: &Value) -> Vec<String> {
@@ -812,6 +1019,7 @@ fn service_values(args: &Value) -> Vec<String> {
     services
 }
 
+#[cfg(test)]
 pub(crate) fn build_service_silence_sql(
     services: &[String],
     window: &InvestigationWindow,
@@ -884,10 +1092,52 @@ impl Tool for DetectServiceSilence {
             Ok(value) => value,
             Err(message) => return Ok(format!("Tool error: {message}")),
         };
-        let sql = build_service_silence_sql(&services, &window, &ctx.tenant_id);
-        let rows = crate::state::tenant_query(&ctx.state.ch, &sql, &ctx.tenant_id)
-            .fetch_all::<SilenceRow>()
-            .await?;
+        let mut rows = Vec::new();
+        for service in &services {
+            for (period, start, end) in [
+                ("incident", window.incident_start, window.incident_end),
+                ("baseline", window.baseline_start, window.baseline_end),
+            ] {
+                let server: SpanCountResponse = ctx
+                    .state
+                    .query_api
+                    .query_spans(
+                        &ctx.tenant_id,
+                        &json!({
+                            "time_range":{"from":start.to_rfc3339(),"to":end.to_rfc3339()},
+                            "filters":[
+                                {"field":"service_name","op":"=","value":service},
+                                {"field":"kind","op":"=","value":"SPAN_KIND_SERVER"}
+                            ],
+                            "limit":1,"offset":0,"columns":"list"
+                        }),
+                    )
+                    .await?;
+                let mut expected_calls = 0u64;
+                let mut callers = HashSet::new();
+                if period == "incident" {
+                    for attribute in ["attributes.peer.service", "attributes.server.address"] {
+                        let calls: SpanCountResponse = ctx.state.query_api.query_spans(&ctx.tenant_id, &json!({
+                            "time_range":{"from":start.to_rfc3339(),"to":end.to_rfc3339()},
+                            "filters":[
+                                {"field":"kind","op":"IN","value":["SPAN_KIND_CLIENT","SPAN_KIND_PRODUCER","SPAN_KIND_CONSUMER"]},
+                                {"field":attribute,"op":"=","value":service}
+                            ],
+                            "limit":1000,"offset":0,"columns":"list"
+                        })).await?;
+                        expected_calls = expected_calls.saturating_add(calls.total);
+                        callers.extend(calls.rows.into_iter().map(|row| row.service_name));
+                    }
+                }
+                rows.push(SilenceRow {
+                    service: service.clone(),
+                    period: period.into(),
+                    server_count: server.total,
+                    expected_calls,
+                    caller_count: callers.len() as u64,
+                });
+            }
+        }
         let mut grouped: BTreeMap<String, (Option<SilenceRow>, Option<SilenceRow>)> =
             BTreeMap::new();
         for row in rows {

@@ -12,9 +12,7 @@ pub struct ToolContext {
     /// Built fresh per investigation so edits to custom skills are picked up
     /// on the next invocation.
     pub skill_store: Arc<SkillStore>,
-    /// Tenant ID for multi-tenant ClickHouse query scoping. Every ClickHouse
-    /// query will include `AND tenant_id = '{tenant_id}'` to restrict results
-    /// to the caller's tenant.
+    /// Tenant ID forwarded on every query-api tool request.
     pub tenant_id: String,
     /// Scopes the caller has access to (e.g., ["logs", "traces", "metrics"] or ["all"]).
     /// Tools that query signals outside these scopes return a friendly error
@@ -111,7 +109,6 @@ impl ToolRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config_db::ConfigDb;
     use async_trait::async_trait;
     use serde_json::json;
 
@@ -139,18 +136,11 @@ mod tests {
     }
 
     async fn test_ctx() -> ToolContext {
-        let ch = clickhouse::Client::default().with_url("http://localhost:8123");
-        let config_db = Arc::new(
-            ConfigDb::open("http://localhost:8123", "default", "")
-                .await
-                .unwrap(),
-        );
-        let skill_store = Arc::new(crate::agent::skill_store::SkillStore::load(&config_db).await);
+        let query_api = Arc::new(crate::query_api::QueryApiClient::new_disconnected_for_tests());
+        let skill_store = Arc::new(crate::agent::skill_store::SkillStore::empty());
         ToolContext {
             state: crate::AppState {
-                ch,
-                config_db,
-                query_api_url: None,
+                query_api,
                 internal_auth_token: "test-not-an-http-server".to_string(),
                 caches: Arc::new(Default::default()),
                 metrics: Arc::new(crate::metrics::AgentMetrics::new()),
@@ -245,7 +235,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires a live ClickHouse with query-api config schema"]
     async fn execute_known_tool_returns_result() {
         let mut r = ToolRegistry::new();
         r.register(Arc::new(FakeTool {
@@ -259,7 +248,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires a live ClickHouse with query-api config schema"]
     async fn execute_unknown_tool_errors() {
         let r = ToolRegistry::new();
         let ctx = test_ctx().await;

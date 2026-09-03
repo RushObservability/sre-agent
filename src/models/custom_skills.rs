@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 /// User-defined investigation skill. The sre-agent reads these from the
-/// shared ClickHouse `config_custom_skills` table (owned and written by
+/// query-api custom-skill store (owned and written by
 /// query-api) and exposes them via the `load_skill` tool to LLM investigation
 /// loops.
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -110,7 +110,7 @@ struct InvestigateRequest {
     /// send the full prior conversation. Ignored when `session_id` is set.
     #[serde(default)]
     prior_messages: Vec<serde_json::Value>,
-    /// Tenant ID for multi-tenant ClickHouse query scoping.
+    /// Tenant ID forwarded to query-api for server-side data isolation.
     #[serde(default = "default_tenant")]
     tenant_id: String,
     /// Scopes the caller has access to.
@@ -144,23 +144,18 @@ async fn healthz() -> Json<serde_json::Value> {
 }
 
 async fn readyz(State(state): State<AppState>) -> Response {
-    #[derive(clickhouse::Row, serde::Deserialize)]
-    struct Probe {
-        _n: u8,
-    }
-
-    let clickhouse_started = std::time::Instant::now();
-    let clickhouse_ready = tokio::time::timeout(
+    let query_api_started = std::time::Instant::now();
+    let query_api_ready = tokio::time::timeout(
         std::time::Duration::from_secs(2),
-        state.ch.query("SELECT 1 AS _n").fetch_one::<Probe>(),
+        state.query_api.ready("default"),
     )
     .await
     .is_ok_and(|result| result.is_ok());
     state
         .metrics
-        .clickhouse_probe_finished(clickhouse_started.elapsed(), clickhouse_ready);
+        .query_api_finished(query_api_started.elapsed(), query_api_ready);
     let llm_ready = agent::loop_runner::LlmConfig::from_env().is_ok();
-    let ready = clickhouse_ready && llm_ready;
+    let ready = query_api_ready && llm_ready;
     state.metrics.set_ready(ready);
     let status = if ready {
         StatusCode::OK
@@ -172,7 +167,7 @@ async fn readyz(State(state): State<AppState>) -> Response {
         Json(serde_json::json!({
             "status": if ready { "ready" } else { "not_ready" },
             "checks": {
-                "clickhouse": clickhouse_ready,
+                "query_api": query_api_ready,
                 "llm": llm_ready,
             }
         })),
@@ -285,9 +280,9 @@ async fn investigate(
         Some(store) => store,
         None => {
             let store = Arc::new(
-                SkillStore::load_unified_with_metrics(
-                    &state.config_db,
-                    state.query_api_url.as_deref(),
+                SkillStore::load_with_metrics(
+                    &state.query_api,
+                    &req.tenant_id,
                     Some(state.metrics.as_ref()),
                 )
                 .await,
@@ -322,7 +317,7 @@ async fn investigate(
             "New investigation".to_string()
         };
         state
-            .config_db
+            .query_api
             .create_session(
                 &session_id,
                 &req.tenant_id,
@@ -335,8 +330,8 @@ async fn investigate(
     } else if !is_new_session && session_mode {
         // Load session from DB and verify tenant
         let session = state
-            .config_db
-            .get_session(&session_id)
+            .query_api
+            .get_session(&req.tenant_id, &session_id)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
             .ok_or_else(|| (StatusCode::NOT_FOUND, "session not found".to_string()))?;
@@ -351,8 +346,8 @@ async fn investigate(
         // Reactivate completed sessions on follow-up
         if session.status == "completed" || session.status == "paused" {
             state
-                .config_db
-                .update_session_status(&session_id, "active")
+                .query_api
+                .update_session_status(&req.tenant_id, &session_id, "active")
                 .await
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         }
@@ -373,14 +368,14 @@ async fn investigate(
     // Build the user turn content.
     let user_content = if !req.event_id.is_empty() {
         let event = state
-            .config_db
-            .get_anomaly_event(&req.event_id)
+            .query_api
+            .get_anomaly_event(&req.tenant_id, &req.event_id)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
             .ok_or_else(|| (StatusCode::NOT_FOUND, "anomaly event not found".to_string()))?;
         let rule = state
-            .config_db
-            .get_anomaly_rule(&event.rule_id)
+            .query_api
+            .get_anomaly_rule(&req.tenant_id, &event.rule_id)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
             .ok_or_else(|| (StatusCode::NOT_FOUND, "anomaly rule not found".to_string()))?;
@@ -423,14 +418,15 @@ async fn investigate(
     // Save user turn to DB (session mode only).
     if session_mode {
         let turn_index = state
-            .config_db
-            .count_turns(&session_id)
+            .query_api
+            .count_turns(&req.tenant_id, &session_id)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         let turn_id = uuid::Uuid::new_v4().to_string();
         state
-            .config_db
+            .query_api
             .add_turn(
+                &req.tenant_id,
                 &turn_id,
                 &session_id,
                 turn_index,
@@ -509,8 +505,8 @@ async fn investigate(
         if !is_new_session {
             let context_turns = default_context_turns();
             let recent = state
-                .config_db
-                .get_recent_turns(&session_id, context_turns as i64)
+                .query_api
+                .get_recent_turns(&req.tenant_id, &session_id, context_turns as i64)
                 .await
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
             for turn in &recent {
@@ -595,7 +591,7 @@ async fn investigate(
     let tool_ctx = ToolContext {
         state: state.clone(),
         skill_store,
-        tenant_id: req.tenant_id,
+        tenant_id: req.tenant_id.clone(),
         scopes: req.scopes,
     };
 
@@ -630,9 +626,10 @@ async fn investigate(
         Some(b) => b,
         None => {
             let read = |key: &'static str, env: &'static str| {
-                let db = state.config_db.clone();
+                let api = state.query_api.clone();
+                let tenant_id = req.tenant_id.clone();
                 async move {
-                    match db.get_setting(key).await {
+                    match api.get_setting(&tenant_id, key).await {
                         Ok(Some(v)) => v.trim().parse::<u32>().ok(),
                         _ => std::env::var(env)
                             .ok()
@@ -682,7 +679,8 @@ async fn investigate(
     }
 
     // Spawn the agent loop in a background task, then persist results
-    let config_db = state.config_db.clone();
+    let query_api = state.query_api.clone();
+    let tenant_id_for_task = req.tenant_id.clone();
     let session_id_for_task = session_id.clone();
     let session_mode_for_task = session_mode;
     let restored_mem = restored_memory;
@@ -704,8 +702,8 @@ async fn investigate(
     // Parse the allowed-models policy. Empty/missing/bad → no policy (preserve
     // pre-governance behavior: honor the `sre_agent_model` default setting).
     let allowed = state
-        .config_db
-        .get_setting("sre_agent_allowed_models")
+        .query_api
+        .get_setting(&req.tenant_id, "sre_agent_allowed_models")
         .await
         .ok()
         .flatten()
@@ -721,8 +719,8 @@ async fn investigate(
 
     // Default model setting (admin's chosen default; may be empty → code default).
     let default_model = state
-        .config_db
-        .get_setting("sre_agent_model")
+        .query_api
+        .get_setting(&req.tenant_id, "sre_agent_model")
         .await
         .ok()
         .flatten()
@@ -817,8 +815,8 @@ async fn investigate(
             )) => {
                 // Persist assistant turn and updated working memory
                 if session_mode_for_task {
-                    let turn_index = config_db
-                        .count_turns(&session_id_for_task)
+                    let turn_index = query_api
+                        .count_turns(&tenant_id_for_task, &session_id_for_task)
                         .await
                         .unwrap_or(0);
                     let turn_id = uuid::Uuid::new_v4().to_string();
@@ -827,8 +825,9 @@ async fn investigate(
                         agent::stream::ReportKind::Preliminary => "preliminary",
                         agent::stream::ReportKind::Question => "question",
                     };
-                    let _ = config_db
+                    let _ = query_api
                         .add_turn(
+                            &tenant_id_for_task,
                             &turn_id,
                             &session_id_for_task,
                             turn_index,
@@ -849,8 +848,9 @@ async fn investigate(
                     } else {
                         None
                     };
-                    let _ = config_db
+                    let _ = query_api
                         .update_session_after_turn(
+                            &tenant_id_for_task,
                             &session_id_for_task,
                             &mem_json,
                             total_prompt,
@@ -909,7 +909,7 @@ async fn list_sessions(
     Query(params): Query<ListSessionsQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let sessions = state
-        .config_db
+        .query_api
         .list_sessions(&params.tenant_id, params.limit)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -940,17 +940,18 @@ async fn list_sessions(
 async fn get_session(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Query(params): Query<ListSessionsQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let session = state
-        .config_db
-        .get_session(&id)
+        .query_api
+        .get_session(&params.tenant_id, &id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "session not found".to_string()))?;
 
     let turns = state
-        .config_db
-        .get_turns(&id)
+        .query_api
+        .get_turns(&params.tenant_id, &id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -975,11 +976,12 @@ async fn get_session(
 async fn delete_session(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Query(params): Query<ListSessionsQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     // Soft-delete: archive instead of hard delete
     state
-        .config_db
-        .update_session_status(&id, "archived")
+        .query_api
+        .update_session_status(&params.tenant_id, &id, "archived")
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(serde_json::json!({"ok": true})))

@@ -61,13 +61,13 @@ impl Tool for SearchPastIncidents {
 
         let sessions = ctx
             .state
-            .config_db
+            .query_api
             .list_sessions(&ctx.tenant_id, SCAN_LIMIT)
             .await?;
 
         // Only completed investigations are useful priors (skip active/in-progress).
         let q_tokens = tokenize(query);
-        let mut scored: Vec<(u32, &crate::config_db::InvestigationSession)> = sessions
+        let mut scored: Vec<(u32, &crate::query_api::InvestigationSession)> = sessions
             .iter()
             .filter(|s| s.status == "completed")
             .map(|s| (score(&q_tokens, s), s))
@@ -136,7 +136,7 @@ fn tokenize(s: &str) -> Vec<String> {
 }
 
 /// Overlap score of query tokens against a session's title (weighted 2x) + working memory.
-fn score(q_tokens: &[String], s: &crate::config_db::InvestigationSession) -> u32 {
+fn score(q_tokens: &[String], s: &crate::query_api::InvestigationSession) -> u32 {
     if q_tokens.is_empty() {
         return 0;
     }

@@ -62,8 +62,13 @@ impl Tool for ListDeploys {
 
         let deploys = ctx
             .state
-            .config_db
-            .list_deploy_markers(svc_filter.as_deref(), Some(&from_str), until_str.as_deref())
+            .query_api
+            .list_deploy_markers(
+                &ctx.tenant_id,
+                svc_filter.as_deref(),
+                Some(&from_str),
+                until_str.as_deref(),
+            )
             .await
             .map_err(|e| anyhow::anyhow!("failed to list deploys: {e}"))?;
 

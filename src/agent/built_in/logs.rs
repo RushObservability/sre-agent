@@ -1,12 +1,12 @@
 use crate::agent::tools::{Tool, ToolContext};
 use anyhow::Result;
-use clickhouse::Row;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 pub struct SearchLogs;
 
-/// Pure SQL builder for `search_logs`. Every interpolated string value is
+#[cfg(test)]
+/// Legacy SQL-shape regression fixture. Every interpolated string value is
 /// escaped with the ClickHouse-standard doubled single quote (`''`); the
 /// model-supplied `minutes`/`limit` are clamped here so a hostile value can
 /// never widen the scan window or row count.
@@ -96,17 +96,30 @@ pub(crate) fn build_search_logs_sql(
     )
 }
 
-#[derive(Debug, Row, Deserialize)]
-#[allow(dead_code)] // fields populated by ClickHouse row deserialization
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)] // fields populated by query-api response deserialization
 struct LogRow {
-    timestamp: String,
+    #[serde(rename = "Timestamp")]
+    timestamp: i64,
+    #[serde(rename = "ServiceName")]
     service_name: String,
+    #[serde(rename = "SeverityText")]
     severity: String,
+    #[serde(rename = "Body")]
     body: String,
+    #[serde(rename = "TraceId")]
     trace_id: String,
+    #[serde(rename = "SpanId")]
     span_id: String,
-    log_attributes: String,
-    resource_attributes: String,
+    #[serde(rename = "LogAttributes")]
+    log_attributes: Value,
+    #[serde(rename = "ResourceAttributes")]
+    resource_attributes: Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct LogResponse {
+    rows: Vec<LogRow>,
 }
 
 #[async_trait::async_trait]
@@ -193,22 +206,42 @@ impl Tool for SearchLogs {
             .unwrap_or(50)
             .min(200);
 
-        let sql = build_search_logs_sql(
-            service,
-            severity,
-            query_text,
-            trace_id,
-            span_id,
-            around,
-            around_minutes,
-            minutes,
-            limit,
-            &ctx.tenant_id,
-        );
-
-        let rows: Vec<LogRow> = crate::state::tenant_query(&ctx.state.ch, &sql, &ctx.tenant_id)
-            .fetch_all()
+        let (from, to) = crate::query_api::bounded_time_range(around, around_minutes, minutes)?;
+        let mut filters = Vec::new();
+        if !service.is_empty() {
+            filters.push(json!({"field":"service_name","op":"=","value":service}));
+        }
+        if !trace_id.is_empty() {
+            filters.push(json!({"field":"trace_id","op":"=","value":trace_id}));
+        }
+        if !span_id.is_empty() {
+            filters.push(json!({"field":"span_id","op":"=","value":span_id}));
+        }
+        if !severity.is_empty() {
+            let levels: Vec<&str> = match severity.to_uppercase().as_str() {
+                "ERROR" => vec!["ERROR", "FATAL", "CRITICAL"],
+                "WARN" => vec!["WARN", "WARNING", "ERROR", "FATAL", "CRITICAL"],
+                "INFO" => vec!["INFO", "WARN", "WARNING", "ERROR", "FATAL", "CRITICAL"],
+                _ => vec![severity],
+            };
+            filters.push(json!({"field":"severity","op":"IN","value":levels}));
+        }
+        let response: LogResponse = ctx
+            .state
+            .query_api
+            .query_logs(
+                &ctx.tenant_id,
+                &json!({
+                    "time_range": {"from": from, "to": to},
+                    "filters": filters,
+                    "search": (!query_text.is_empty()).then_some(query_text),
+                    "limit": limit,
+                    "offset": 0,
+                    "slim": false
+                }),
+            )
             .await?;
+        let rows = response.rows;
 
         if rows.is_empty() {
             return Ok("No matching logs found.".to_string());
@@ -250,7 +283,7 @@ impl Tool for SearchLogs {
             if seen.insert(key.to_string()) {
                 out.push_str(&format!(
                     "  [{ts}] [{sev}] {svc}: {body}{correlation}{attrs}\n",
-                    ts = r.timestamp,
+                    ts = crate::query_api::format_nanos_timestamp(r.timestamp),
                     sev = r.severity,
                     svc = r.service_name,
                     body = if r.body.len() > 300 {
@@ -266,12 +299,15 @@ impl Tool for SearchLogs {
                     } else {
                         format!(" [trace={} span={}]", r.trace_id, r.span_id)
                     },
-                    attrs = if r.log_attributes.is_empty() || r.log_attributes == "{}" {
+                    attrs = if r.log_attributes.is_null() || r.log_attributes == json!({}) {
                         String::new()
                     } else {
                         format!(
                             " attrs={}",
-                            crate::agent::memory::truncate_at_char_boundary(&r.log_attributes, 240)
+                            crate::agent::memory::truncate_at_char_boundary(
+                                &r.log_attributes.to_string(),
+                                240
+                            )
                         )
                     },
                 ));

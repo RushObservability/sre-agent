@@ -493,6 +493,7 @@ mod tests {
             "list_services",
             "service_dependencies",
             "inspect_postgresql",
+            "inspect_mysql",
         ];
         for (key, skill) in all_skills() {
             let mentions_any = tool_names.iter().any(|t| skill.content.contains(t));

@@ -1,9 +1,8 @@
 //! PR 2 comparative service and dependency analysis.
 //!
-//! The query shapes intentionally mirror query-api's service definitions:
+//! The request shapes mirror query-api's frontend query language:
 //! service RED uses `SPAN_KIND_SERVER`, endpoint mode groups server spans by
 //! HTTP method/path, and dependency latency uses the downstream server span.
-//! Aggregates are computed in ClickHouse before the bounded result is returned.
 
 use crate::agent::contracts::{
     InvestigationWindow, QualityBand, ResultQuality, ResultStatus, ToolResultEnvelope,
@@ -11,7 +10,6 @@ use crate::agent::contracts::{
 };
 use crate::agent::tools::{Tool, ToolContext};
 use anyhow::Result;
-use clickhouse::Row;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
@@ -83,7 +81,7 @@ struct ComparePayload {
     warnings: Vec<String>,
 }
 
-#[derive(Debug, Row, Deserialize)]
+#[derive(Debug, Deserialize)]
 struct ServicePeriodRow {
     service_name: String,
     period: String,
@@ -96,7 +94,7 @@ struct ServicePeriodRow {
     p99_ms: f64,
 }
 
-#[derive(Debug, Row, Deserialize)]
+#[derive(Debug, Deserialize)]
 struct EndpointPeriodRow {
     service_name: String,
     endpoint: String,
@@ -110,7 +108,7 @@ struct EndpointPeriodRow {
     p99_ms: f64,
 }
 
-#[derive(Debug, Row, Deserialize)]
+#[derive(Debug, Deserialize)]
 struct ClientWaitPeriodRow {
     service_name: String,
     period: String,
@@ -119,7 +117,7 @@ struct ClientWaitPeriodRow {
     p99_ms: f64,
 }
 
-#[derive(Debug, Row, Deserialize)]
+#[derive(Debug, Deserialize)]
 struct DependencyPeriodRow {
     caller: String,
     callee: String,
@@ -134,10 +132,211 @@ struct DependencyPeriodRow {
     caller_time_attributable_pct: f64,
 }
 
+#[derive(Debug, Deserialize)]
+struct GroupedTimeseriesResponse {
+    buckets: Vec<GroupedTimeseriesBucket>,
+}
+#[derive(Debug, Deserialize)]
+struct GroupedTimeseriesBucket {
+    group_key: String,
+    count: u64,
+    error_count: u64,
+    p50_ms: f64,
+    p95_ms: f64,
+    p99_ms: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ComparisonSpanResponse {
+    rows: Vec<ComparisonSpan>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ComparisonSpan {
+    service_name: String,
+    span_name: String,
+    kind: String,
+    status: String,
+    http_method: String,
+    http_path: String,
+    http_status_code: u16,
+    duration_ns: u64,
+}
+
+fn percentile_ms(values: &mut [u64], percentile: usize) -> f64 {
+    values.sort_unstable();
+    values
+        .get((values.len().saturating_sub(1) * percentile) / 100)
+        .copied()
+        .unwrap_or(0) as f64
+        / 1e6
+}
+
+fn is_error(status: &str, http_status_code: u16) -> bool {
+    matches!(status, "STATUS_CODE_ERROR" | "ERROR") || http_status_code >= 500
+}
+
+async fn fetch_detail_periods(
+    ctx: &ToolContext,
+    services: &[String],
+    period: &str,
+    start: chrono::DateTime<chrono::Utc>,
+    end: chrono::DateTime<chrono::Utc>,
+    seconds: f64,
+) -> Result<(Vec<EndpointPeriodRow>, Vec<ClientWaitPeriodRow>, bool)> {
+    const DETAIL_LIMIT: usize = 1000;
+    let response: ComparisonSpanResponse = ctx
+        .state
+        .query_api
+        .query_spans(
+            &ctx.tenant_id,
+            &json!({
+                "time_range":{"from":start.to_rfc3339(),"to":end.to_rfc3339()},
+                "filters":[{"field":"service_name","op":"IN","value":services}],
+                "limit":DETAIL_LIMIT,"offset":0
+            }),
+        )
+        .await?;
+    let capped = response.rows.len() == DETAIL_LIMIT;
+    let mut endpoints: BTreeMap<(String, String), Vec<&ComparisonSpan>> = BTreeMap::new();
+    let mut waits: BTreeMap<String, Vec<&ComparisonSpan>> = BTreeMap::new();
+    for span in &response.rows {
+        if span.kind == SERVER_SPAN_KIND {
+            let endpoint = if span.http_path.is_empty() {
+                span.span_name.clone()
+            } else if span.http_method.is_empty() {
+                span.http_path.clone()
+            } else {
+                format!("{} {}", span.http_method, span.http_path)
+            };
+            endpoints
+                .entry((span.service_name.clone(), endpoint))
+                .or_default()
+                .push(span);
+        } else if matches!(
+            span.kind.as_str(),
+            "SPAN_KIND_CLIENT" | "SPAN_KIND_PRODUCER" | "SPAN_KIND_CONSUMER"
+        ) {
+            waits
+                .entry(span.service_name.clone())
+                .or_default()
+                .push(span);
+        }
+    }
+
+    let endpoint_rows = endpoints
+        .into_iter()
+        .map(|((service_name, endpoint), spans)| {
+            let request_count = spans.len() as u64;
+            let error_count = spans
+                .iter()
+                .filter(|span| is_error(&span.status, span.http_status_code))
+                .count() as u64;
+            let mut durations = spans
+                .iter()
+                .map(|span| span.duration_ns)
+                .collect::<Vec<_>>();
+            EndpointPeriodRow {
+                service_name,
+                endpoint,
+                period: period.into(),
+                request_count,
+                request_rate_per_second: request_count as f64 / seconds,
+                error_count,
+                error_rate_pct: error_count as f64 * 100.0 / request_count.max(1) as f64,
+                p50_ms: percentile_ms(&mut durations, 50),
+                p95_ms: percentile_ms(&mut durations, 95),
+                p99_ms: percentile_ms(&mut durations, 99),
+            }
+        })
+        .collect();
+    let wait_rows = waits
+        .into_iter()
+        .map(|(service_name, spans)| {
+            let request_count = spans.len() as u64;
+            let mut durations = spans
+                .iter()
+                .map(|span| span.duration_ns)
+                .collect::<Vec<_>>();
+            ClientWaitPeriodRow {
+                service_name,
+                period: period.into(),
+                request_count,
+                p95_ms: percentile_ms(&mut durations, 95),
+                p99_ms: percentile_ms(&mut durations, 99),
+            }
+        })
+        .collect();
+    Ok((endpoint_rows, wait_rows, capped))
+}
+
+async fn fetch_service_periods(
+    ctx: &ToolContext,
+    services: &[String],
+    window: &InvestigationWindow,
+) -> Result<Vec<ServicePeriodRow>> {
+    let seconds = duration_seconds(window);
+    let mut rows = Vec::new();
+    for (period, start, end) in [
+        ("incident", window.incident_start, window.incident_end),
+        ("baseline", window.baseline_start, window.baseline_end),
+    ] {
+        let response: GroupedTimeseriesResponse = ctx
+            .state
+            .query_api
+            .query_span_timeseries(
+                &ctx.tenant_id,
+                &json!({
+                    "time_range":{"from":start.to_rfc3339(),"to":end.to_rfc3339()},
+                    "filters":[
+                        {"field":"service_name","op":"IN","value":services},
+                        {"field":"kind","op":"=","value":SERVER_SPAN_KIND}
+                    ],
+                    "interval":"1m",
+                    "group_by":"service_name"
+                }),
+            )
+            .await?;
+        let mut grouped: HashMap<String, ServicePeriodRow> = HashMap::new();
+        for bucket in response.buckets {
+            let row = grouped
+                .entry(bucket.group_key.clone())
+                .or_insert(ServicePeriodRow {
+                    service_name: bucket.group_key,
+                    period: period.into(),
+                    request_count: 0,
+                    request_rate_per_second: 0.0,
+                    error_count: 0,
+                    error_rate_pct: 0.0,
+                    p50_ms: 0.0,
+                    p95_ms: 0.0,
+                    p99_ms: 0.0,
+                });
+            row.request_count = row.request_count.saturating_add(bucket.count);
+            row.error_count = row.error_count.saturating_add(bucket.error_count);
+            row.p50_ms = row.p50_ms.max(bucket.p50_ms);
+            row.p95_ms = row.p95_ms.max(bucket.p95_ms);
+            row.p99_ms = row.p99_ms.max(bucket.p99_ms);
+        }
+        for row in grouped.values_mut() {
+            row.request_rate_per_second = row.request_count as f64 / seconds;
+            row.error_rate_pct = if row.request_count == 0 {
+                0.0
+            } else {
+                row.error_count as f64 * 100.0 / row.request_count as f64
+            };
+        }
+        rows.extend(grouped.into_values());
+    }
+    Ok(rows)
+}
+
+#[cfg(test)]
 fn sql_timestamp(value: chrono::DateTime<chrono::Utc>) -> String {
     value.format("%Y-%m-%d %H:%M:%S.%f").to_string()
 }
 
+#[cfg(test)]
 fn sql_quote(value: &str) -> String {
     value.replace('\'', "''")
 }
@@ -164,6 +363,7 @@ fn service_list(args: &Value) -> Vec<String> {
     services
 }
 
+#[cfg(test)]
 fn service_filter(services: &[String]) -> String {
     services
         .iter()
@@ -172,6 +372,7 @@ fn service_filter(services: &[String]) -> String {
         .join(", ")
 }
 
+#[cfg(test)]
 fn period_predicate(window: &InvestigationWindow, period: &str, column: &str) -> String {
     let (start, end) = if period == "incident" {
         (window.incident_start, window.incident_end)
@@ -189,6 +390,7 @@ fn duration_seconds(window: &InvestigationWindow) -> f64 {
     (window.incident_duration().num_milliseconds() as f64 / 1_000.0).max(0.001)
 }
 
+#[cfg(test)]
 fn red_select(
     period: &str,
     window: &InvestigationWindow,
@@ -217,6 +419,7 @@ fn red_select(
 
 /// Exact-window service aggregate query. Quantiles are calculated before any
 /// result limiting and both incident/baseline predicates are half-open.
+#[cfg(test)]
 pub(crate) fn build_compare_service_sql(
     services: &[String],
     window: &InvestigationWindow,
@@ -234,6 +437,7 @@ pub(crate) fn build_compare_service_sql(
     format!("{incident} UNION ALL {baseline}")
 }
 
+#[cfg(test)]
 pub(crate) fn build_compare_endpoint_sql(
     services: &[String],
     window: &InvestigationWindow,
@@ -259,6 +463,7 @@ pub(crate) fn build_compare_endpoint_sql(
 /// Compare non-server client/producer/consumer spans separately from the
 /// service's own server-span RED. This is the dependency-wait view used to
 /// distinguish caller self-time from downstream waiting.
+#[cfg(test)]
 pub(crate) fn build_compare_client_wait_sql(
     services: &[String],
     window: &InvestigationWindow,
@@ -490,20 +695,31 @@ impl Tool for CompareServiceWindows {
             Ok(window) => window,
             Err(message) => return Ok(format!("Tool error: {message}")),
         };
-        let service_sql = build_compare_service_sql(&services, &window, &ctx.tenant_id);
-        let endpoint_sql = build_compare_endpoint_sql(&services, &window, &ctx.tenant_id);
-        let client_wait_sql = build_compare_client_wait_sql(&services, &window, &ctx.tenant_id);
-        let (service_result, endpoint_result, client_wait_result) = tokio::join!(
-            crate::state::tenant_query(&ctx.state.ch, &service_sql, &ctx.tenant_id)
-                .fetch_all::<ServicePeriodRow>(),
-            crate::state::tenant_query(&ctx.state.ch, &endpoint_sql, &ctx.tenant_id)
-                .fetch_all::<EndpointPeriodRow>(),
-            crate::state::tenant_query(&ctx.state.ch, &client_wait_sql, &ctx.tenant_id)
-                .fetch_all::<ClientWaitPeriodRow>()
+        let seconds = duration_seconds(&window);
+        let (service_rows, incident_details, baseline_details) = tokio::join!(
+            fetch_service_periods(ctx, &services, &window),
+            fetch_detail_periods(
+                ctx,
+                &services,
+                "incident",
+                window.incident_start,
+                window.incident_end,
+                seconds
+            ),
+            fetch_detail_periods(
+                ctx,
+                &services,
+                "baseline",
+                window.baseline_start,
+                window.baseline_end,
+                seconds
+            )
         );
-        let service_rows = service_result?;
-        let endpoint_rows = endpoint_result?;
-        let client_wait_rows = client_wait_result?;
+        let service_rows = service_rows?;
+        let (mut endpoint_rows, mut client_wait_rows, incident_capped) = incident_details?;
+        let (baseline_endpoint_rows, baseline_wait_rows, baseline_capped) = baseline_details?;
+        endpoint_rows.extend(baseline_endpoint_rows);
+        client_wait_rows.extend(baseline_wait_rows);
         let service_data = red_map(service_rows);
         let endpoint_data = endpoint_map(endpoint_rows);
         let client_wait_data = client_wait_map(client_wait_rows);
@@ -534,6 +750,12 @@ impl Tool for CompareServiceWindows {
 
         let mut comparisons = Vec::new();
         let mut warnings = Vec::new();
+        if incident_capped || baseline_capped {
+            warnings.push(
+                "endpoint and client-wait details are based on the newest 1,000 spans in a window"
+                    .into(),
+            );
+        }
         for (service, (incident, baseline)) in service_data {
             let missing = incident.is_none() || baseline.is_none();
             if missing {
@@ -671,6 +893,8 @@ struct DependencyStats {
 type DependencyKey = (String, String, String);
 type DependencyPeriodPair = (Option<DependencyStats>, Option<DependencyStats>);
 type DependencyMap = BTreeMap<DependencyKey, DependencyPeriodPair>;
+type DependencySpanPair<'a> = (&'a DependencySpan, &'a DependencySpan);
+type DependencySpanGroups<'a> = BTreeMap<DependencyKey, Vec<DependencySpanPair<'a>>>;
 
 #[derive(Debug, Serialize)]
 struct DependencyPayload {
@@ -678,6 +902,119 @@ struct DependencyPayload {
     warnings: Vec<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct DependencySpanResponse {
+    rows: Vec<DependencySpan>,
+}
+#[derive(Debug, Deserialize)]
+struct DependencySpan {
+    trace_id: String,
+    span_id: String,
+    parent_span_id: String,
+    service_name: String,
+    span_name: String,
+    kind: String,
+    status: String,
+    http_status_code: u16,
+    duration_ns: u64,
+}
+
+async fn fetch_dependency_period(
+    ctx: &ToolContext,
+    period: &str,
+    start: chrono::DateTime<chrono::Utc>,
+    end: chrono::DateTime<chrono::Utc>,
+    seconds: f64,
+) -> Result<Vec<DependencyPeriodRow>> {
+    let response: DependencySpanResponse = ctx
+        .state
+        .query_api
+        .query_spans(
+            &ctx.tenant_id,
+            &json!({
+                "time_range":{"from":start.to_rfc3339(),"to":end.to_rfc3339()},
+                "filters":[],"limit":1000,"offset":0
+            }),
+        )
+        .await?;
+    let parent_map = response
+        .rows
+        .iter()
+        .map(|span| ((span.trace_id.as_str(), span.span_id.as_str()), span))
+        .collect::<HashMap<_, _>>();
+    let mut groups: DependencySpanGroups<'_> = BTreeMap::new();
+    for child in &response.rows {
+        if child.kind != SERVER_SPAN_KIND {
+            continue;
+        }
+        let Some(parent) =
+            parent_map.get(&(child.trace_id.as_str(), child.parent_span_id.as_str()))
+        else {
+            continue;
+        };
+        if parent.service_name == child.service_name {
+            continue;
+        }
+        groups
+            .entry((
+                parent.service_name.clone(),
+                child.service_name.clone(),
+                child.span_name.clone(),
+            ))
+            .or_default()
+            .push((parent, child));
+    }
+    let mut rows = Vec::new();
+    for ((caller, callee, operation), values) in groups {
+        let mut durations = values
+            .iter()
+            .map(|(_, child)| child.duration_ns)
+            .collect::<Vec<_>>();
+        durations.sort_unstable();
+        let percentile = |p: usize| {
+            durations
+                .get((durations.len().saturating_sub(1) * p) / 100)
+                .copied()
+                .unwrap_or(0) as f64
+                / 1e6
+        };
+        let errors = values
+            .iter()
+            .filter(|(_, child)| {
+                matches!(child.status.as_str(), "STATUS_CODE_ERROR" | "ERROR")
+                    || child.http_status_code >= 500
+            })
+            .count() as u64;
+        let attributable = values
+            .iter()
+            .map(|(parent, child)| {
+                child.duration_ns as f64 / parent.duration_ns.max(1) as f64 * 100.0
+            })
+            .sum::<f64>()
+            / values.len() as f64;
+        let count = values.len() as u64;
+        rows.push(DependencyPeriodRow {
+            caller,
+            callee,
+            operation,
+            period: period.into(),
+            request_count: count,
+            request_rate_per_second: count as f64 / seconds,
+            error_count: errors,
+            error_rate_pct: if count == 0 {
+                0.0
+            } else {
+                errors as f64 * 100.0 / count as f64
+            },
+            child_p95_ms: percentile(95),
+            child_p99_ms: percentile(99),
+            caller_time_attributable_pct: attributable,
+        });
+    }
+    Ok(rows)
+}
+
+#[cfg(test)]
 fn build_dependency_period_sql(
     period: &str,
     window: &InvestigationWindow,
@@ -708,6 +1045,7 @@ fn build_dependency_period_sql(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn build_rank_dependencies_sql(window: &InvestigationWindow, tenant_id: &str) -> String {
     let incident = build_dependency_period_sql("incident", window, tenant_id);
     let baseline = build_dependency_period_sql("baseline", window, tenant_id);
@@ -790,10 +1128,25 @@ impl Tool for RankSlowDependencies {
             Ok(window) => window,
             Err(message) => return Ok(format!("Tool error: {message}")),
         };
-        let sql = build_rank_dependencies_sql(&window, &ctx.tenant_id);
-        let rows = crate::state::tenant_query(&ctx.state.ch, &sql, &ctx.tenant_id)
-            .fetch_all::<DependencyPeriodRow>()
-            .await?;
+        let seconds = duration_seconds(&window);
+        let (incident, baseline) = tokio::join!(
+            fetch_dependency_period(
+                ctx,
+                "incident",
+                window.incident_start,
+                window.incident_end,
+                seconds
+            ),
+            fetch_dependency_period(
+                ctx,
+                "baseline",
+                window.baseline_start,
+                window.baseline_end,
+                seconds
+            ),
+        );
+        let mut rows = incident?;
+        rows.extend(baseline?);
         let grouped = dependency_map(rows);
         if grouped.is_empty() {
             let warning = "no cross-service downstream server spans in either window".to_string();

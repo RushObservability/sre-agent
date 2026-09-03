@@ -1,6 +1,5 @@
 use crate::agent::tools::{Tool, ToolContext};
 use anyhow::Result;
-use clickhouse::Row;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -10,6 +9,7 @@ pub struct ListServices;
 /// (`tenant_id`) is escaped with the ClickHouse-standard doubled single
 /// quote (`''`); the model-supplied `minutes` is clamped here so a hostile
 /// value can never widen the scan window.
+#[cfg(test)]
 pub(crate) fn build_list_services_sql(minutes: u64, tenant_id: &str) -> String {
     // Clamp the model-supplied window to at most 24h so the LLM can't
     // request a months-long full scan.
@@ -37,6 +37,7 @@ pub(crate) fn build_list_services_sql(minutes: u64, tenant_id: &str) -> String {
 /// value (`tenant_id`, `service`) is escaped with the ClickHouse-standard
 /// doubled single quote (`''`); the model-supplied `minutes` is clamped here
 /// so a hostile value can never widen the self-join window.
+#[cfg(test)]
 pub(crate) fn build_service_dependencies_sql(
     service: &str,
     minutes: u64,
@@ -78,14 +79,21 @@ pub(crate) fn build_service_dependencies_sql(
     )
 }
 
-#[derive(Debug, Row, Deserialize)]
+#[derive(Debug, Deserialize)]
 struct ServiceRow {
     service_name: String,
+    #[serde(rename = "request_count")]
     total: u64,
+    #[serde(rename = "error_count")]
     errors: u64,
-    error_pct: f64,
     p50_ms: f64,
     p99_ms: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ServiceGraphResponse {
+    nodes: Vec<ServiceRow>,
+    edges: Vec<DepRow>,
 }
 
 #[async_trait::async_trait]
@@ -122,12 +130,12 @@ impl Tool for ListServices {
             .and_then(|v| v.as_u64())
             .unwrap_or(15)
             .clamp(1, 1440);
-        let query = build_list_services_sql(minutes, &ctx.tenant_id);
-
-        let rows: Vec<ServiceRow> =
-            crate::state::tenant_query(&ctx.state.ch, &query, &ctx.tenant_id)
-                .fetch_all()
-                .await?;
+        let rows = ctx
+            .state
+            .query_api
+            .service_graph::<ServiceGraphResponse>(&ctx.tenant_id, minutes)
+            .await?
+            .nodes;
 
         if rows.is_empty() {
             return Ok(format!("No service traffic in last {minutes}m."));
@@ -149,12 +157,7 @@ impl Tool for ListServices {
             };
             out.push_str(&format!(
                 "{:<25} {:>8} {:>8} {:>6.1}% {:>10.1} {:>10.1}\n",
-                r.service_name,
-                r.total,
-                r.errors,
-                r.error_pct.max(err_pct),
-                r.p50_ms,
-                r.p99_ms
+                r.service_name, r.total, r.errors, err_pct, r.p50_ms, r.p99_ms
             ));
         }
 
@@ -164,14 +167,17 @@ impl Tool for ListServices {
 
 pub struct ServiceDependencies;
 
-#[derive(Debug, Row, Deserialize)]
+#[derive(Debug, Deserialize)]
 struct DepRow {
+    #[serde(rename = "source")]
     caller: String,
+    #[serde(rename = "target")]
     callee: String,
+    #[serde(rename = "request_count")]
     call_count: u64,
+    #[serde(rename = "error_count")]
     errors: u64,
-    error_pct: f64,
-    p99_ms: f64,
+    avg_duration_ms: f64,
 }
 
 #[async_trait::async_trait]
@@ -213,11 +219,15 @@ impl Tool for ServiceDependencies {
             .and_then(|v| v.as_u64())
             .unwrap_or(30)
             .clamp(1, 1440);
-        let query = build_service_dependencies_sql(service, minutes, &ctx.tenant_id);
-
-        let rows: Vec<DepRow> = crate::state::tenant_query(&ctx.state.ch, &query, &ctx.tenant_id)
-            .fetch_all()
-            .await?;
+        let mut rows = ctx
+            .state
+            .query_api
+            .service_graph::<ServiceGraphResponse>(&ctx.tenant_id, minutes)
+            .await?
+            .edges;
+        if !service.is_empty() {
+            rows.retain(|row| row.caller == service || row.callee == service);
+        }
 
         if rows.is_empty() {
             return Ok(format!("No cross-service calls found in last {minutes}m."));
@@ -226,8 +236,17 @@ impl Tool for ServiceDependencies {
         let mut out = format!("Service dependencies (last {minutes}m):\n\n");
         for r in &rows {
             out.push_str(&format!(
-                "  {} → {} ({} calls, {} errors, {:.1}% error, p99={:.1}ms)\n",
-                r.caller, r.callee, r.call_count, r.errors, r.error_pct, r.p99_ms
+                "  {} → {} ({} calls, {} errors, {:.1}% error, avg={:.1}ms)\n",
+                r.caller,
+                r.callee,
+                r.call_count,
+                r.errors,
+                if r.call_count > 0 {
+                    r.errors as f64 * 100.0 / r.call_count as f64
+                } else {
+                    0.0
+                },
+                r.avg_duration_ms
             ));
         }
         Ok(out)

@@ -9,7 +9,6 @@ use crate::agent::tools::{Tool, ToolContext};
 use anyhow::{Result, bail};
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
-use std::time::Duration;
 
 const MAX_RESPONSE_BYTES: usize = 512 * 1024;
 
@@ -88,12 +87,6 @@ impl Tool for SearchKubernetesAccess {
         if !ctx.has_scope("kube_cluster") {
             bail!("kube_cluster scope is required for Kubernetes access history")
         }
-        let Some(base_url) = ctx.state.query_api_url.as_deref() else {
-            return Ok(unavailable(
-                "query-api is not configured for this SRE agent",
-            ));
-        };
-
         let from = required_timestamp(&args, "from")?;
         let to = required_timestamp(&args, "to")?;
         let from_time = DateTime::parse_from_rfc3339(&from)?.with_timezone(&Utc);
@@ -106,11 +99,11 @@ impl Tool for SearchKubernetesAccess {
         }
 
         let mut query = vec![
-            ("tenant_id", ctx.tenant_id.clone()),
-            ("from", from),
-            ("to", to),
+            ("tenant_id".to_string(), ctx.tenant_id.clone()),
+            ("from".to_string(), from),
+            ("to".to_string(), to),
             (
-                "limit",
+                "limit".to_string(),
                 args.get("limit")
                     .and_then(Value::as_u64)
                     .unwrap_or(25)
@@ -127,25 +120,18 @@ impl Tool for SearchKubernetesAccess {
             ("status", "status", 16),
         ] {
             if let Some(value) = optional_string(&args, argument, max_bytes)? {
-                query.push((parameter, value));
+                query.push((parameter.to_string(), value));
             }
         }
 
-        let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(3))
-            .timeout(Duration::from_secs(15))
-            .build()?;
-        let response = match client
-            .get(format!(
-                "{}/api/v1/internal/kubernetes-access-events",
-                base_url.trim_end_matches('/')
-            ))
-            .header("x-rush-internal-token", &ctx.state.internal_auth_token)
-            .query(&query)
-            .send()
+        let response = match ctx
+            .state
+            .query_api
+            .get_kubernetes_access(&ctx.tenant_id, &query, MAX_RESPONSE_BYTES)
             .await
         {
-            Ok(response) => response,
+            Ok(Some(value)) => value,
+            Ok(None) => return Ok(unavailable("Kubernetes access logging is not enabled")),
             Err(error) => {
                 tracing::warn!(%error, "Kubernetes access history request failed");
                 return Ok(unavailable(
@@ -154,37 +140,7 @@ impl Tool for SearchKubernetesAccess {
             }
         };
 
-        match response.status() {
-            reqwest::StatusCode::NOT_FOUND => {
-                return Ok(unavailable("Kubernetes access logging is not enabled"));
-            }
-            reqwest::StatusCode::FORBIDDEN => {
-                return Ok(unavailable("Kubernetes access logging is not licensed"));
-            }
-            reqwest::StatusCode::UNAUTHORIZED => {
-                return Ok(unavailable("the internal SRE credential was rejected"));
-            }
-            status if !status.is_success() => {
-                tracing::warn!(%status, "Kubernetes access history returned an error");
-                return Ok(unavailable(
-                    "Kubernetes access history is temporarily unavailable",
-                ));
-            }
-            _ => {}
-        }
-
-        if response
-            .content_length()
-            .is_some_and(|bytes| bytes > MAX_RESPONSE_BYTES as u64)
-        {
-            bail!("Kubernetes access history response exceeds its size limit")
-        }
-        let body = response.bytes().await?;
-        if body.len() > MAX_RESPONSE_BYTES {
-            bail!("Kubernetes access history response exceeds its size limit")
-        }
-        let value: Value = serde_json::from_slice(&body)?;
-        Ok(serde_json::to_string_pretty(&value)?)
+        Ok(serde_json::to_string_pretty(&response)?)
     }
 }
 

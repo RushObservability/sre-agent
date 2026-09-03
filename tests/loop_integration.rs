@@ -3,8 +3,8 @@
 //! compaction on the wire, parallel tool-call ordering, and SSE parser
 //! torture via hand-cut byte chunks.
 //!
-//! No live ClickHouse is needed: the ToolContext is built on
-//! `ConfigDb::new_disconnected_for_tests()` and fake tools never query it.
+//! No live query-api is needed: the ToolContext is built on
+//! a disconnected query-api client, and fake tools never call it.
 
 mod common;
 

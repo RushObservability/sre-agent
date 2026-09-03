@@ -19,7 +19,10 @@ Under the hood it's a ReAct loop over an OpenAI-compatible model with 25 built-i
 
 Investigations follow a five-phase playbook — orient, hypothesize, gather evidence, verify, conclude — and the agent keeps a small working memory (suspect services, confirmed facts, things ruled out) that survives transcript compaction. Duplicate tool calls come back as errors written to teach the model to self-correct. Parse retries are counted apart from real work, so a malformed response doesn't eat the investigation budget. A run of empty results forces a summary instead of more thrashing.
 
-It reads telemetry straight from ClickHouse, fetches user-authored skills from [query-api](https://github.com/RushObservability/query-api) over HTTP (one source of truth, no shared volume), and reaches Kubernetes and ArgoCD/Flux through the in-cluster ServiceAccount. Investigation sessions and follow-up turns are persisted in tenant-scoped ClickHouse configuration tables.
+It reads telemetry, configuration, custom skills, and investigation history
+through [query-api](https://github.com/RushObservability/query-api). The agent
+receives no database credentials. Kubernetes and ArgoCD/Flux access uses its
+in-cluster ServiceAccount.
 
 ## Read-only GitHub source access
 
@@ -81,11 +84,12 @@ agent's system rules.
 
 ## Running it
 
-Needs ClickHouse, a running query-api, and an OpenAI API key:
+Needs a running query-api and an OpenAI API key. The agent never connects to
+ClickHouse or receives database credentials.
 
 ```bash
-export CLICKHOUSE_URL=http://localhost:8123
-export QUERY_API_URL=http://localhost:8080   # where it fetches custom skills
+export QUERY_API_URL=http://localhost:8080
+export SRE_AGENT_INTERNAL_TOKEN=dev-local-agent-token
 export OPENAI_API_KEY=sk-...
 export OPENAI_BASE_URL=https://api.openai.com   # optional
 make run
@@ -103,7 +107,7 @@ make docker-push
 | `SRE_AGENT_MAX_LLM_CALLS` | `55` | fallback maximum total provider calls, including retries and final review; Settings takes precedence |
 | `SRE_AGENT_RUNTIME_METRICS_INTERVAL_SECS` | `15` | process/runtime metric sampling interval |
 | `SRE_AGENT_INTERNAL_TOKEN` | required | shared query-api-to-agent credential; never expose it to browsers |
-| `QUERY_API_URL` | unset | query-api base URL for fetching custom skills; local ClickHouse config is the fallback |
+| `QUERY_API_URL` | required | query-api base URL used for telemetry, configuration, and investigation state |
 | `OPENAI_BASE_URL` | `https://api.openai.com` | any OpenAI-compatible endpoint |
 | `OPENAI_API_KEY` | required | provider credential |
 | `sre_agent_model` | `gpt-4o` | set in SRE Agent settings; not read from the environment |
@@ -148,12 +152,12 @@ node, or namespace permissions.
 
 Events: `session_created` (for a new interactive session), `thinking_delta` (incremental reasoning), `tool_call`, `tool_result`, `summary` (final or preliminary report), `error`, and `done` (token usage + round count). Sessions can be continued with follow-up questions from the frontend.
 
-`GET /healthz` is a cheap liveness check. `GET /readyz` verifies ClickHouse and
+`GET /healthz` is a cheap liveness check. `GET /readyz` verifies query-api and
 LLM configuration and returns `503` until both are available. `GET /metrics`
 exports low-cardinality Prometheus metrics for investigation admission,
 investigation outcomes, report-kind outcomes, investigation work and report
 sizes, process/runtime health, SSE streams, LLM calls and token usage,
-query-api/ClickHouse dependencies, and tool calls; it uses the
+query-api requests and tool calls; it uses the
 same `x-rush-internal-token` header as the API.
 
 ## Part of Rush

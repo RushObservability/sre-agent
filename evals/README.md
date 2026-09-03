@@ -5,9 +5,9 @@ over labeled incident cases and scores **root-cause localization** plus a
 **reason match**. It lives in `src/bin/sre_evals.rs` (+ `src/bin/rca_convert.rs`)
 and is built as the `sre_evals` binary.
 
-> This is a manual evaluation tool. It needs a **live ClickHouse** (populated
-> with telemetry) and an **`OPENAI_API_KEY`** — it is deliberately *not* wired into
-> CI. Building it (`cargo build`) requires neither.
+> This is a manual evaluation tool. It needs a **live query-api** backed by
+> populated telemetry and an **`OPENAI_API_KEY`**. It is deliberately not wired
+> into CI. Building it (`cargo build`) requires neither.
 
 ---
 
@@ -19,7 +19,7 @@ For each case the harness:
    (`system_prompt` + `question_context`), appending the incident time/window so
    the agent's `around`-aware tools center correctly.
 2. Runs the real agent loop (`loop_runner::run_with_config_and_budget`) with the
-   full built-in tool registry against your ClickHouse.
+   full built-in tool registry against query-api.
 3. Captures the agent's **final report** text.
 4. Scores it:
    - **Localization (AC@k)** — extracts a *ranked* list of candidate root-cause
@@ -44,9 +44,8 @@ tool calls.
 # from the sre-agent crate root
 export OPENAI_API_KEY=sk-...       # required (agent + judge)
 export OPENAI_BASE_URL=https://... # optional, default https://api.openai.com
-export CLICKHOUSE_URL=http://localhost:8123
-export CLICKHOUSE_DATABASE=observability
-# export CLICKHOUSE_USER / CLICKHOUSE_PASSWORD / QUERY_API_URL as for the server
+export QUERY_API_URL=http://localhost:8080
+export SRE_AGENT_INTERNAL_TOKEN=dev-local-agent-token
 
 cargo run --bin sre_evals -- run --cases evals/cases.yaml --out evals/out
 cargo run --bin sre_evals -- run --limit 1            # smoke test a single case
@@ -131,7 +130,7 @@ the true root cause from the postmortem.
 
 What makes a good curated case:
 
-- **A real incident window with telemetry still in ClickHouse.** The agent can
+- **A real incident window with telemetry still queryable through query-api.** The agent can
   only find what's queryable; set `around`/`window` to the actual onset so the
   retention window covers it.
 - **A single, specific `root_cause_service`** that the postmortem confirms — not

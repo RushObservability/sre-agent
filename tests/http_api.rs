@@ -1,8 +1,6 @@
 //! HTTP-surface tests: drive the exact production router built by
 //! `sre_agent::http::router` with `tower::ServiceExt::oneshot` — no socket,
-//! no live ClickHouse. The AppState mirrors `tests/common::make_ctx`: a
-//! disconnected ConfigDb (unroutable port → queries fail fast instead of
-//! hanging) and default caches.
+//! no live query-api. The disconnected client fails requests immediately.
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
@@ -11,8 +9,8 @@ use std::sync::Arc;
 use tower::ServiceExt;
 
 use sre_agent::AppState;
-use sre_agent::config_db::ConfigDb;
 use sre_agent::http::router;
+use sre_agent::query_api::QueryApiClient;
 
 const INTERNAL_TOKEN: &str = "test-internal-token";
 
@@ -20,9 +18,7 @@ const INTERNAL_TOKEN: &str = "test-internal-token";
 /// pattern as tests/common::make_ctx (no live backends, fail-fast queries).
 fn test_router() -> axum::Router {
     let state = AppState {
-        ch: clickhouse::Client::default().with_url("http://127.0.0.1:1"),
-        config_db: Arc::new(ConfigDb::new_disconnected_for_tests()),
-        query_api_url: None,
+        query_api: Arc::new(QueryApiClient::new_disconnected_for_tests()),
         internal_auth_token: INTERNAL_TOKEN.to_string(),
         caches: Arc::new(Default::default()),
         metrics: Arc::new(sre_agent::metrics::AgentMetrics::new()),
@@ -61,7 +57,7 @@ async fn readyz_reports_unavailable_dependency_without_leaking_secrets() {
     let body = resp.into_body().collect().await.unwrap().to_bytes();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["status"], "not_ready");
-    assert_eq!(json["checks"]["clickhouse"], false);
+    assert_eq!(json["checks"]["query_api"], false);
     assert!(
         !body
             .windows(INTERNAL_TOKEN.len())
@@ -197,7 +193,7 @@ async fn investigate_without_llm_env_streams_not_configured_error() {
     );
 }
 
-/// Listing sessions against the disconnected ConfigDb must fail fast with a
+/// Listing sessions against the disconnected query-api client must fail fast with a
 /// clean 500 — not hang and not panic (verifies fail-fast error propagation
 /// through the handler's `map_err` chain).
 #[tokio::test]

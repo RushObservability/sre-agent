@@ -5,11 +5,11 @@
 
 pub mod agent;
 pub mod cancellation;
-pub mod config_db;
 pub mod http;
 pub mod metrics;
 pub mod models;
 pub mod process_metrics;
+pub mod query_api;
 pub mod repository;
 pub mod state;
 

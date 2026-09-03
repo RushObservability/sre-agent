@@ -154,8 +154,16 @@ async fn readyz(State(state): State<AppState>) -> Response {
     state
         .metrics
         .query_api_finished(query_api_started.elapsed(), query_api_ready);
-    let llm_ready = agent::loop_runner::LlmConfig::from_env().is_ok();
-    let ready = query_api_ready && llm_ready;
+    let llm_ready = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        state.query_api.llm_ready("default"),
+    )
+    .await
+    .is_ok_and(|result| result.unwrap_or(false));
+    // Provider configuration is tenant-specific and can be completed after
+    // deployment. Keep it visible as a diagnostic without making an otherwise
+    // healthy agent pod fail readiness for the special `default` tenant.
+    let ready = query_api_ready;
     state.metrics.set_ready(ready);
     let status = if ready {
         StatusCode::OK
@@ -168,7 +176,7 @@ async fn readyz(State(state): State<AppState>) -> Response {
             "status": if ready { "ready" } else { "not_ready" },
             "checks": {
                 "query_api": query_api_ready,
-                "llm": llm_ready,
+                "default_tenant_llm": llm_ready,
             }
         })),
     )
@@ -646,20 +654,23 @@ async fn investigate(
         }
     };
 
-    // Fail fast with a setup-oriented message when no LLM is configured —
+    // Fail fast with a setup-oriented message when no LLM is configured.
     // otherwise the user sees a bare provider-key error mid-stream. The
     // "LLM not configured:" prefix is a stable marker the UI styles as a
-    // setup card. Only env var NAMES are mentioned, never values.
-    if agent::loop_runner::LlmConfig::from_env().is_err() {
+    // setup card. No credential details are returned.
+    if !state
+        .query_api
+        .llm_ready(&req.tenant_id)
+        .await
+        .unwrap_or(false)
+    {
         state
             .metrics
             .investigation_failed(investigation_started.elapsed());
         let _ = tx
             .send(AgentEvent::Error {
-                message: "LLM not configured: the SRE agent needs an LLM to run investigations. \
-                          Set OPENAI_API_KEY on the sre-agent service (optionally OPENAI_BASE_URL for \
-                          an OpenAI-compatible provider; \
-                          the model is selectable in Settings → SRE Agent) and restart it. \
+                message: "LLM not configured: add a provider and at least one enabled model in \
+                          Settings → AI Agent. Provider credentials stay in query-api. \
                           Telemetry browsing in the rest of the app is unaffected."
                     .to_string(),
             })
@@ -688,104 +699,17 @@ async fn investigate(
     let task_cancellation = cancellation.clone();
     let task_metrics = state.metrics.clone();
 
-    // Resolve the LLM config under the admin model/thinking policy. The API key
-    // always comes from OPENAI_API_KEY and OPENAI_BASE_URL;
-    // only the model + thinking level are governed here. Two-tier governance:
-    //   - ADMIN defines the allowed models + per-model thinking levels
-    //     (`sre_agent_allowed_models` JSON) and a default model (`sre_agent_model`).
-    //   - USER picks a model + thinking level PER investigation (req.model /
-    //     req.reasoning_effort), validated against that policy. A hand-crafted
-    //     request with a disallowed model/level falls back to the default — the
-    //     client can't bypass the policy.
-    let mut llm = agent::loop_runner::LlmConfig::from_env().expect("LLM config checked above");
-
-    // Parse the allowed-models policy. Empty/missing/bad → no policy (preserve
-    // pre-governance behavior: honor the `sre_agent_model` default setting).
-    let allowed = state
-        .query_api
-        .get_setting(&req.tenant_id, "sre_agent_allowed_models")
-        .await
-        .ok()
-        .flatten()
-        .and_then(|raw| {
-            let raw = raw.trim();
-            if raw.is_empty() {
-                None
-            } else {
-                serde_json::from_str::<Vec<serde_json::Value>>(raw).ok()
-            }
-        })
-        .unwrap_or_default();
-
-    // Default model setting (admin's chosen default; may be empty → code default).
-    let default_model = state
-        .query_api
-        .get_setting(&req.tenant_id, "sre_agent_model")
-        .await
-        .ok()
-        .flatten()
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default();
-
-    if allowed.is_empty() {
-        // No policy configured: keep today's behavior — the `sre_agent_model`
-        // default setting overrides the code default when set; no thinking control.
-        if !default_model.is_empty() {
-            llm.model = default_model.clone();
-        }
-        llm.reasoning_effort = None;
-    } else {
-        // Build the allowed id set and the per-id allowed thinking levels.
-        let allowed_ids: Vec<String> = allowed
-            .iter()
-            .filter_map(|m| {
-                m.get("id")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.trim().to_string())
-            })
-            .filter(|s| !s.is_empty())
-            .collect();
-
-        // Resolve the model: a user pick if it's allowed; else the default if
-        // allowed; else the allowed list's first entry; else the env default.
-        let req_model = req.model.trim().to_string();
-        let resolved_model = if !req_model.is_empty()
-            && allowed_ids.iter().any(|id| id == &req_model)
-        {
-            Some(req_model)
-        } else if !default_model.is_empty() && allowed_ids.iter().any(|id| id == &default_model) {
-            Some(default_model)
-        } else {
-            allowed_ids.first().cloned()
-        };
-        if let Some(model) = resolved_model {
-            llm.model = model;
-        }
-
-        // Resolve the thinking level: honored only when the resolved model is a
-        // reasoning model AND the requested level is in THAT model's allowed list.
-        llm.reasoning_effort = None;
-        let req_effort = req.reasoning_effort.trim();
-        if !req_effort.is_empty() && agent::loop_runner::is_reasoning_model(&llm.model) {
-            let model_levels: Vec<String> = allowed
-                .iter()
-                .find(|m| {
-                    m.get("id").and_then(|v| v.as_str()).map(|s| s.trim())
-                        == Some(llm.model.as_str())
-                })
-                .and_then(|m| m.get("reasoning").and_then(|v| v.as_array()))
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|l| l.as_str())
-                        .map(|s| s.trim().to_string())
-                        .collect()
-                })
-                .unwrap_or_default();
-            if model_levels.iter().any(|l| l == req_effort) {
-                llm.reasoning_effort = Some(req_effort.to_string());
-            }
-        }
+    // The browser selects a Rush model ID and effort. query-api validates both,
+    // resolves the upstream model, and applies the matching provider secret.
+    let mut llm = agent::loop_runner::LlmConfig::from_env()
+        .expect("query-api transport is configured at process startup");
+    if !req.model.trim().is_empty() {
+        llm.model = req.model.trim().to_string();
     }
+    llm.reasoning_effort = match req.reasoning_effort.trim() {
+        "minimal" | "low" | "medium" | "high" => Some(req.reasoning_effort.trim().to_string()),
+        _ => None,
+    };
 
     tokio::spawn(async move {
         let _permit = permit;

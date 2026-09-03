@@ -121,6 +121,16 @@ impl QueryApiClient {
         Ok(())
     }
 
+    pub async fn llm_ready(&self, tenant_id: &str) -> Result<bool> {
+        let response: Value = self
+            .send_json(self.request(Method::GET, tenant_id, "api/v1/internal/sre/llm/ready")?)
+            .await?;
+        Ok(response
+            .get("configured")
+            .and_then(Value::as_bool)
+            .unwrap_or(false))
+    }
+
     pub async fn query_spans<T: DeserializeOwned>(
         &self,
         tenant_id: &str,

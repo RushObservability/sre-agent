@@ -84,14 +84,13 @@ agent's system rules.
 
 ## Running it
 
-Needs a running query-api and an OpenAI API key. The agent never connects to
-ClickHouse or receives database credentials.
+Needs a running query-api. Provider connections and API keys are configured in
+**Settings → AI Agent → Providers**. The agent never connects to ClickHouse or
+receives database or LLM credentials.
 
 ```bash
 export QUERY_API_URL=http://localhost:8080
 export SRE_AGENT_INTERNAL_TOKEN=dev-local-agent-token
-export OPENAI_API_KEY=sk-...
-export OPENAI_BASE_URL=https://api.openai.com   # optional
 make run
 
 make docker        # build image
@@ -108,21 +107,23 @@ make docker-push
 | `SRE_AGENT_RUNTIME_METRICS_INTERVAL_SECS` | `15` | process/runtime metric sampling interval |
 | `SRE_AGENT_INTERNAL_TOKEN` | required | shared query-api-to-agent credential; never expose it to browsers |
 | `QUERY_API_URL` | required | query-api base URL used for telemetry, configuration, and investigation state |
-| `OPENAI_BASE_URL` | `https://api.openai.com` | any OpenAI-compatible endpoint |
-| `OPENAI_API_KEY` | required | provider credential |
-| `sre_agent_model` | `gpt-4o` | set in SRE Agent settings; not read from the environment |
 | `ARGOCD_NAMESPACE` | `argocd` | where ArgoCD Application CRDs live |
 
 The same agent settings can be managed at runtime in the frontend under
 **Settings → AI Agent**:
 
 - **Tenant access** enables the agent for all enabled tenants or an explicit list.
-- **Models** defines the allowlist, default model, and reasoning levels available to users.
+- **Providers** stores encrypted provider credentials and routing policy in query-api.
+- **Models** defines the named models, default model, and reasoning levels available to users.
 - **Investigation limits** changes the tool-step and LLM-call budgets for new investigations.
 - **Custom skills** creates, edits, enables/disables, and deletes user-authored playbooks.
 
 Runtime settings are stored by query-api and take effect for new investigations
 (budget changes may remain cached for up to 30 seconds).
+
+The standalone `sre_evals` harness still accepts `OPENAI_API_KEY` and optional
+`OPENAI_BASE_URL` so it can use an independent judge. Those variables are not
+read by the production server.
 
 ### Kubernetes access boundaries
 

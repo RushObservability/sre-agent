@@ -401,3 +401,99 @@ async fn concurrent_tool_batch_cannot_bypass_actual_call_budget() {
             .any(|event| matches!(event, AgentEvent::Done { tool_calls: 1, .. }))
     );
 }
+
+#[tokio::test]
+async fn finishing_allowance_opens_only_after_a_forced_report_fails_the_gate() {
+    let mut scripts = vec![
+        Script::ToolCall {
+            name: "search_logs".to_string(),
+            args: json!({"service": "api-1"}),
+            call_id: "call_1".to_string(),
+        },
+        Script::ToolCall {
+            name: "query_metrics".to_string(),
+            args: json!({"service": "api-1"}),
+            call_id: "call_2".to_string(),
+        },
+        Script::ToolCall {
+            name: "search_logs".to_string(),
+            args: json!({"service": "api-2"}),
+            call_id: "call_3".to_string(),
+        },
+        Script::ToolCall {
+            name: "query_metrics".to_string(),
+            args: json!({"service": "api-2"}),
+            call_id: "call_4".to_string(),
+        },
+        Script::Final("## Root Cause\nEvidence is still incomplete.".to_string()),
+        Script::ToolCall {
+            name: "search_logs".to_string(),
+            args: json!({"service": "api-3"}),
+            call_id: "call_5".to_string(),
+        },
+        Script::ToolCall {
+            name: "query_metrics".to_string(),
+            args: json!({"service": "api-3"}),
+            call_id: "call_6".to_string(),
+        },
+    ];
+    scripts.extend(
+        (0..3).map(|_| Script::Final("## Root Cause\nEvidence is still incomplete.".to_string())),
+    );
+    let server = start_mock(scripts).await;
+    let registry = make_registry(vec![
+        ("search_logs", "Found matching error logs.".to_string()),
+        (
+            "query_metrics",
+            "Latency increased from 10ms to 80ms.".to_string(),
+        ),
+    ]);
+    let ctx = make_ctx().await;
+    let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
+    let llm = LlmConfig {
+        base_url: server.base_url.clone(),
+        api_key: "sk-test".to_string(),
+        model: "gpt-4o".to_string(),
+        reasoning_effort: None,
+    };
+    let budget = LoopBudget {
+        max_tool_calls: 4,
+        max_tool_steps: 4,
+        max_llm_calls: 6,
+    };
+
+    let result = run_with_config_and_budget(
+        initial_messages("Investigate api"),
+        &registry,
+        &ctx,
+        &tx,
+        llm,
+        None,
+        "sess-finishing-allowance",
+        budget,
+    )
+    .await
+    .unwrap();
+    drop(tx);
+    let events = collect_events(&mut rx).await;
+    let tool_calls = events
+        .iter()
+        .filter(|event| matches!(event, AgentEvent::ToolCall { .. }))
+        .count();
+
+    assert_eq!(tool_calls, 6, "only two finishing tool calls are allowed");
+    assert!(server.calls() > budget.max_llm_calls as usize);
+    assert!(server.calls() <= (budget.max_llm_calls + 3) as usize);
+    assert_eq!(result.1, ReportKind::Preliminary);
+
+    let requests = server.recorded_requests();
+    let overage_request = &requests[5];
+    assert_eq!(
+        count_messages_containing(overage_request, "system", "finish phase"),
+        1
+    );
+    assert_eq!(
+        count_messages_containing(overage_request, "system", "Do not start a new branch"),
+        1
+    );
+}

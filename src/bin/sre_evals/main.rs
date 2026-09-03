@@ -376,7 +376,8 @@ async fn run_command(args: &[String]) -> Result<()> {
 
     // ── Construct shared state once (same env-driven wiring as main.rs) ──
     let state = build_app_state().await.context("building AppState")?;
-    let llm = LlmConfig::from_env().context("building LlmConfig (OPENAI_API_KEY required)")?;
+    let llm = LlmConfig::from_eval_env()
+        .context("building evaluation LlmConfig (OPENAI_API_KEY required)")?;
 
     let run_id = std::env::var("SRE_EVALS_RUN_ID")
         .ok()

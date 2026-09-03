@@ -12,8 +12,8 @@ use super::stream::{AgentEvent, ReportKind};
 use super::tools::{ToolContext, ToolRegistry};
 use crate::cancellation::CancellationToken;
 
-/// Default maximum real tool calls. The model should never hear about this
-/// number — it exists purely as a backstop against runaway loops.
+/// Default target for real tool calls. The loop shares remaining capacity with
+/// the model so it can converge before the bounded hard stop.
 /// Operators can override per deployment via the `sre_agent_max_tool_steps`
 /// setting (see `LoopBudget`).
 const DEFAULT_MAX_TOOL_STEPS: u32 = 40;
@@ -68,11 +68,164 @@ impl LoopBudget {
     }
 
     /// Minimum tool steps the root-cause gate demands before accepting a
-    /// final answer — adapts downward when the operator sets a small budget.
+    /// final answer. Deep budgets require more investigation before the gate
+    /// accepts a conclusion, while small budgets retain enough room to report.
     fn min_depth(&self) -> u32 {
-        MIN_INVESTIGATION_DEPTH
-            .min(self.max_tool_steps.saturating_sub(1))
-            .max(1)
+        let target = match self.depth_profile() {
+            InvestigationDepth::Quick | InvestigationDepth::Standard => MIN_INVESTIGATION_DEPTH,
+            InvestigationDepth::Deep => 6,
+            InvestigationDepth::Exhaustive => 8,
+        };
+        target.min(self.max_tool_steps.saturating_sub(1)).max(1)
+    }
+
+    fn depth_profile(&self) -> InvestigationDepth {
+        let effective = self
+            .max_tool_calls
+            .min(self.max_llm_calls.saturating_sub(2));
+        match effective {
+            0..=12 => InvestigationDepth::Quick,
+            13..=40 => InvestigationDepth::Standard,
+            41..=100 => InvestigationDepth::Deep,
+            _ => InvestigationDepth::Exhaustive,
+        }
+    }
+
+    fn verification_reserve(&self) -> u32 {
+        match self.depth_profile() {
+            InvestigationDepth::Quick => 2,
+            InvestigationDepth::Standard => 4,
+            InvestigationDepth::Deep => 8,
+            InvestigationDepth::Exhaustive => 12,
+        }
+        .min(self.max_tool_calls.saturating_sub(1))
+    }
+
+    fn verification_start(&self) -> u32 {
+        self.max_tool_calls
+            .saturating_sub(self.verification_reserve())
+    }
+
+    fn convergence_start(&self) -> u32 {
+        let target = match self.depth_profile() {
+            InvestigationDepth::Quick => self.max_tool_calls / 2,
+            InvestigationDepth::Standard => self.max_tool_calls.saturating_mul(3) / 5,
+            InvestigationDepth::Deep => self.max_tool_calls.saturating_mul(7) / 10,
+            InvestigationDepth::Exhaustive => self.max_tool_calls.saturating_mul(3) / 4,
+        };
+        target.min(self.verification_start()).max(1)
+    }
+
+    fn hard_tool_call_limit(&self) -> u32 {
+        self.max_tool_calls
+            .saturating_add(FINISHING_TOOL_CALL_ALLOWANCE)
+    }
+
+    fn hard_tool_step_limit(&self) -> u32 {
+        self.max_tool_steps
+            .saturating_add(FINISHING_TOOL_CALL_ALLOWANCE)
+    }
+
+    fn hard_llm_call_limit(&self) -> u32 {
+        self.max_llm_calls
+            .saturating_add(FINISHING_LLM_CALL_ALLOWANCE)
+    }
+
+    fn phase(
+        &self,
+        tool_calls: u32,
+        llm_calls: u32,
+        finishing_overage: bool,
+    ) -> InvestigationPhase {
+        if finishing_overage || tool_calls >= self.max_tool_calls || llm_calls >= self.max_llm_calls
+        {
+            InvestigationPhase::Finish
+        } else if tool_calls >= self.verification_start() {
+            InvestigationPhase::Verify
+        } else if tool_calls >= self.convergence_start() {
+            InvestigationPhase::Converge
+        } else {
+            InvestigationPhase::Explore
+        }
+    }
+
+    fn guidance(&self, tool_calls: u32, llm_calls: u32, finishing_overage: bool) -> String {
+        let phase = self.phase(tool_calls, llm_calls, finishing_overage);
+        let profile = self.depth_profile();
+        let soft_tools_left = self.max_tool_calls.saturating_sub(tool_calls);
+        let soft_llm_left = self.max_llm_calls.saturating_sub(llm_calls);
+        let phase_instruction = match phase {
+            InvestigationPhase::Explore => format!(
+                "Test up to {} plausible hypotheses with high-information queries. Prefer calls that can distinguish several hypotheses at once.",
+                profile.hypothesis_limit()
+            ),
+            InvestigationPhase::Converge => {
+                "Stop broad discovery. Rank the remaining hypotheses and use each call to eliminate an alternative or strengthen the leading cause.".to_string()
+            }
+            InvestigationPhase::Verify => {
+                "Do not open a new investigation branch. Use the reserved calls for an independent confirmation, a contradiction check, or the missing baseline, then report.".to_string()
+            }
+            InvestigationPhase::Finish => format!(
+                "The configured budget is spent. You may use at most {FINISHING_TOOL_CALL_ALLOWANCE} extra tool calls and {FINISHING_LLM_CALL_ALLOWANCE} extra LLM calls only to close a specific evidence gap and produce the report. Do not start a new branch."
+            ),
+        };
+        format!(
+            "Investigation budget: {} profile, {} phase. Configured limit: {} tool calls and {} LLM calls. Remaining before the soft limit: {} tool calls and {} LLM calls. Aim to finish within that limit; unused calls are not a goal. {}",
+            profile.as_str(),
+            phase.as_str(),
+            self.max_tool_calls,
+            self.max_llm_calls,
+            soft_tools_left,
+            soft_llm_left,
+            phase_instruction,
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InvestigationDepth {
+    Quick,
+    Standard,
+    Deep,
+    Exhaustive,
+}
+
+impl InvestigationDepth {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Quick => "quick",
+            Self::Standard => "standard",
+            Self::Deep => "deep",
+            Self::Exhaustive => "exhaustive",
+        }
+    }
+
+    fn hypothesis_limit(self) -> u32 {
+        match self {
+            Self::Quick => 2,
+            Self::Standard => 3,
+            Self::Deep => 4,
+            Self::Exhaustive => 5,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InvestigationPhase {
+    Explore,
+    Converge,
+    Verify,
+    Finish,
+}
+
+impl InvestigationPhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Explore => "explore",
+            Self::Converge => "converge",
+            Self::Verify => "verify",
+            Self::Finish => "finish",
+        }
     }
 }
 
@@ -92,9 +245,11 @@ const MIN_SIGNAL_TYPES: usize = 2;
 /// infinite loop, and the report is surfaced as Preliminary.
 const MAX_GATE_REJECTIONS: u32 = 3;
 
-/// Keep two actual tool-call slots available for a refutation check and final
-/// verification after the exploratory portion of a run.
-const RESERVED_VERIFICATION_CALLS: u32 = 2;
+/// A configured budget is a target rather than a cliff. These small hard-cap
+/// allowances are available only after a report attempt exposes a specific
+/// evidence gap or the self-review needs one last check.
+const FINISHING_TOOL_CALL_ALLOWANCE: u32 = 2;
+const FINISHING_LLM_CALL_ALLOWANCE: u32 = 3;
 
 #[derive(Debug, Default)]
 struct ToolTelemetry {
@@ -785,8 +940,9 @@ struct StreamOptions {
     include_usage: bool,
 }
 
-/// Configuration for the LLM client used by the agent loop.
-/// Decoupled from env vars so tests can point at a mock server.
+/// Configuration for the LLM transport used by the agent loop. Production
+/// points this at query-api; tests can still point at a mock Chat Completions
+/// server.
 #[derive(Debug, Clone, Default)]
 pub struct LlmConfig {
     pub base_url: String,
@@ -806,11 +962,31 @@ pub fn is_reasoning_model(model: &str) -> bool {
 }
 
 impl LlmConfig {
-    /// Construct the provider connection from environment variables. The model is
-    /// intentionally not read from the environment; app settings choose it.
-    /// - `OPENAI_API_KEY` (required)
-    /// - `OPENAI_BASE_URL` (default: https://api.openai.com)
+    /// Construct the internal query-api LLM connection. Provider credentials
+    /// are configured in Rush and never enter the sre-agent process.
     pub fn from_env() -> Result<Self> {
+        let api_key = std::env::var("SRE_AGENT_INTERNAL_TOKEN")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("SRE_AGENT_INTERNAL_TOKEN is not set"))?;
+        let query_api = std::env::var("QUERY_API_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("QUERY_API_URL is not set"))?;
+        Ok(Self {
+            base_url: format!(
+                "{}/api/v1/internal/sre/llm",
+                query_api.trim_end_matches('/')
+            ),
+            api_key,
+            model: String::new(),
+            reasoning_effort: None,
+        })
+    }
+
+    /// Direct provider connection used only by the standalone evaluation
+    /// harness. The production server always uses `from_env()` and query-api.
+    pub fn from_eval_env() -> Result<Self> {
         let api_key = std::env::var("OPENAI_API_KEY")
             .ok()
             .filter(|value| !value.trim().is_empty())
@@ -822,13 +998,6 @@ impl LlmConfig {
             model: DEFAULT_MODEL.to_string(),
             reasoning_effort: None,
         })
-    }
-
-    /// Resolve the configured OpenAI API key.
-    pub fn api_key_from_env() -> Option<String> {
-        std::env::var("OPENAI_API_KEY")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
     }
 }
 
@@ -972,15 +1141,18 @@ async fn run_inner(
     let base_url = llm.base_url;
     let api_key = llm.api_key;
     let model = llm.model;
-    // Only thinking models accept reasoning_effort; others 400 on it.
-    let reasoning_effort: Option<String> = if is_reasoning_model(&model) {
-        llm.reasoning_effort
-    } else {
-        None
-    };
+    // query-api validates this against the selected model's stored
+    // capabilities before translating it for the upstream provider.
+    let reasoning_effort = llm.reasoning_effort;
 
     let client = llm_client();
-    let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
+    let base_url = base_url.trim_end_matches('/');
+    let internal_transport = base_url.ends_with("/api/v1/internal/sre/llm");
+    let url = if internal_transport {
+        format!("{base_url}/chat")
+    } else {
+        format!("{base_url}/v1/chat/completions")
+    };
 
     // Tool definitions are immutable for the whole run — build them once
     // instead of re-serializing every tool's JSON schema each round.
@@ -1019,19 +1191,19 @@ async fn run_inner(
     let mut tool_calls_dispatched = 0u32;
     let mut attempts = 0u32;
     let mut force_summary = false;
-    let mut reserve_mode = false;
+    let mut finishing_overage = false;
     let mut gate_rejection_count = 0u32;
     let mut telemetry = ToolTelemetry::default();
     let min_depth = budget.min_depth();
+    let hard_tool_steps = budget.hard_tool_step_limit();
+    let hard_tool_calls = budget.hard_tool_call_limit();
+    let hard_llm_calls = budget.hard_llm_call_limit();
     // One self-critique cycle per run: when a conclusion passes the gate for
     // the first time, the agent is asked to challenge it (and may run more
     // tools) before the report is accepted.
     let mut self_review_done = false;
 
-    while tool_steps < budget.max_tool_steps
-        && tool_calls_dispatched < budget.max_tool_calls
-        && attempts < budget.max_llm_calls
-    {
+    while attempts < hard_llm_calls && (finishing_overage || attempts < budget.max_llm_calls) {
         // Client disconnected (SSE receiver dropped) — every send would be
         // discarded and each further round only burns LLM tokens. Stop now
         // and hand back the memory gathered so far so the caller persists it.
@@ -1057,6 +1229,21 @@ async fn run_inner(
         // round is pure prompt-token waste (O(n²) growth over a long run).
         compact_old_tool_results(&mut messages, KEEP_RECENT_TOOL_ROUNDS);
 
+        let phase = budget.phase(
+            tool_calls_dispatched,
+            attempts.saturating_sub(1),
+            finishing_overage,
+        );
+        messages.push(serde_json::json!({
+            "role": "system",
+            "content": budget.guidance(
+                tool_calls_dispatched,
+                attempts.saturating_sub(1),
+                finishing_overage,
+            ),
+        }));
+        let mut transient_messages = 1usize;
+
         // Inject working memory as a TRANSIENT system message if we have facts
         // to share. This is a fresh view each iteration — it's pushed onto the
         // live transcript only for the duration of the request and popped
@@ -1070,20 +1257,20 @@ async fn run_inner(
                 "role": "system",
                 "content": memory.to_prompt_block(),
             }));
+            transient_messages += 1;
         }
 
-        // Final round, dead-end, or the exploration phase reaching its
-        // reserved verification capacity: force a report-shaped response.
-        let reserve_threshold = budget
-            .max_tool_calls
-            .saturating_sub(RESERVED_VERIFICATION_CALLS);
-        if !self_review_done && !force_summary && tool_calls_dispatched >= reserve_threshold {
-            reserve_mode = true;
-        }
-        let force_final = tool_steps + 1 >= budget.max_tool_steps
+        // The configured values are soft limits. Force a report as they are
+        // reached. If its causal gate identifies a specific missing check,
+        // the finishing allowance can reopen tools for a bounded final pass.
+        let soft_limit_reached = tool_steps >= budget.max_tool_steps
             || tool_calls_dispatched >= budget.max_tool_calls
-            || force_summary
-            || reserve_mode;
+            || attempts >= budget.max_llm_calls;
+        let hard_limit_reached = tool_steps >= hard_tool_steps
+            || tool_calls_dispatched >= hard_tool_calls
+            || attempts >= hard_llm_calls;
+        let force_final =
+            force_summary || hard_limit_reached || (soft_limit_reached && !finishing_overage);
 
         let llm_started = Instant::now();
         ctx.state.metrics.llm_started();
@@ -1118,18 +1305,26 @@ async fn run_inner(
                         &cancellation,
                     ));
                 }
-                result = client
+                result = {
+                    let request = client
                     .post(&url)
-                    .header("Authorization", format!("Bearer {api_key}"))
                     .header("Content-Type", "application/json")
-                    .json(&body)
-                    .send() => result
+                    .json(&body);
+                    let request = if internal_transport {
+                        request
+                            .header("x-rush-internal-token", &api_key)
+                            .header("x-rush-tenant", &ctx.tenant_id)
+                    } else {
+                        request.bearer_auth(&api_key)
+                    };
+                    request.send()
+                } => result
             }
         };
 
-        // Remove the transient memory message BEFORE any error propagation or
-        // transcript appends, so it can never leak into the durable transcript.
-        if injected_memory {
+        // Remove transient budget and memory messages before error propagation
+        // or transcript appends, so neither enters the durable transcript.
+        for _ in 0..transient_messages {
             messages.pop();
         }
         let resp = match resp {
@@ -1163,16 +1358,14 @@ async fn run_inner(
                 "LLM returned {status}: {}",
                 truncate_at_char_boundary(&err_body, 500)
             );
-            let _ = tx
-                .send(AgentEvent::Error {
-                    message: msg.clone(),
-                })
-                .await;
+            // The HTTP task owns terminal error events. Returning the failure here
+            // lets it emit exactly one message instead of showing the same error
+            // once from the loop and again from the task wrapper.
             return Err(anyhow::anyhow!(msg));
         }
 
         let parsed = parse_streaming_response(resp, tx, cancellation.clone()).await;
-        let (content, mut tool_calls, usage) = match parsed {
+        let (content, mut tool_calls, usage, responses_reasoning) = match parsed {
             Ok(value) => {
                 ctx.state.metrics.llm_finished(llm_started.elapsed(), false);
                 value
@@ -1224,6 +1417,15 @@ async fn run_inner(
             if gate_rejection_count < MAX_GATE_REJECTIONS {
                 if let Some(gap_msg) = root_cause_gate(&memory, &content, tool_steps, min_depth) {
                     gate_rejection_count += 1;
+                    if force_final
+                        && memory.escalation_level < 3
+                        && attempts < hard_llm_calls
+                        && tool_calls_dispatched < hard_tool_calls
+                        && tool_steps < hard_tool_steps
+                    {
+                        finishing_overage = true;
+                        force_summary = false;
+                    }
                     messages.push(serde_json::json!({
                         "role": "assistant",
                         "content": content.clone(),
@@ -1245,12 +1447,14 @@ async fn run_inner(
             let is_question = content.trim_start().starts_with("[QUESTION]");
             if !self_review_done
                 && !is_question
-                && (!force_final || reserve_mode)
                 && memory.escalation_level < 2
-                && attempts + 2 <= budget.max_llm_calls
+                && attempts + 2 <= hard_llm_calls
+                && (!force_final || tool_calls_dispatched < hard_tool_calls)
             {
                 self_review_done = true;
-                reserve_mode = false;
+                if force_final {
+                    finishing_overage = true;
+                }
                 force_summary = false;
                 messages.push(serde_json::json!({
                     "role": "assistant",
@@ -1318,22 +1522,30 @@ async fn run_inner(
             ));
         }
 
-        // Enforce the actual tool-call budget before dispatching. A single
-        // model response may contain several concurrent calls, so a batch
-        // cannot bypass the cap merely by being concurrent.
-        let reserved = if self_review_done {
-            0
+        // Enforce the active tool-call limit before dispatching. Exploration
+        // and convergence cannot consume the verification reserve in one
+        // concurrent batch. Finishing mode can use only its small hard-cap
+        // allowance.
+        let active_tool_limit = if finishing_overage {
+            hard_tool_calls
         } else {
-            RESERVED_VERIFICATION_CALLS
+            budget.max_tool_calls
         };
-        let remaining = budget
-            .max_tool_calls
-            .saturating_sub(tool_calls_dispatched.saturating_add(reserved));
+        let mut remaining = active_tool_limit.saturating_sub(tool_calls_dispatched);
+        if matches!(
+            phase,
+            InvestigationPhase::Explore | InvestigationPhase::Converge
+        ) {
+            remaining = remaining.min(
+                budget
+                    .verification_start()
+                    .saturating_sub(tool_calls_dispatched),
+            );
+        }
         if remaining == 0 {
-            reserve_mode = true;
             messages.push(serde_json::json!({
                 "role": "system",
-                "content": "The exploratory tool budget is exhausted. Use the reserved capacity only for a targeted refutation or final verification, then produce the required report.",
+                "content": "The current investigation phase cannot spend another tool call. Move to verification or produce the report.",
             }));
             continue;
         }
@@ -1369,6 +1581,9 @@ async fn run_inner(
         });
         if !content.is_empty() {
             assistant_msg["content"] = Value::String(content);
+        }
+        if !responses_reasoning.is_empty() {
+            assistant_msg["_rush_responses_reasoning"] = Value::Array(responses_reasoning);
         }
         messages.push(assistant_msg);
 
@@ -1678,6 +1893,7 @@ struct StreamAccum {
     tool_calls: Vec<ToolCallAccum>,
     prompt_tokens: u64,
     completion_tokens: u64,
+    responses_reasoning: Vec<Value>,
 }
 
 /// Process one complete SSE line. Forwards content deltas over `tx` as they
@@ -1723,6 +1939,18 @@ async fn process_sse_line(
             Some(d) => d,
             None => continue,
         };
+
+        if let Some(items) = delta
+            .get("_rush_responses_reasoning")
+            .and_then(Value::as_array)
+        {
+            accum.responses_reasoning.extend(
+                items
+                    .iter()
+                    .filter(|item| item.get("type").and_then(Value::as_str) == Some("reasoning"))
+                    .cloned(),
+            );
+        }
 
         if let Some(text) = delta.get("content").and_then(|v| v.as_str())
             && !text.is_empty()
@@ -1770,12 +1998,12 @@ async fn process_sse_line(
 /// Consumes the body chunk-by-chunk via `bytes_stream()` so content deltas
 /// reach the SSE channel in real time, rather than buffering the entire
 /// generation (10–60s) before emitting anything.
-/// Returns (content_text, tool_calls, (prompt_tokens, completion_tokens)).
+/// Returns content, tool calls, usage, and opaque Responses reasoning items.
 async fn parse_streaming_response(
     resp: reqwest::Response,
     tx: &mpsc::Sender<AgentEvent>,
     cancellation: CancellationToken,
-) -> Result<(String, Vec<ToolCallAccum>, (u64, u64))> {
+) -> Result<(String, Vec<ToolCallAccum>, (u64, u64), Vec<Value>)> {
     use futures_util::StreamExt;
 
     /// Defensive cap on the partial-line accumulation buffer. No legitimate
@@ -1830,6 +2058,7 @@ async fn parse_streaming_response(
         accum.content,
         accum.tool_calls,
         (accum.prompt_tokens, accum.completion_tokens),
+        accum.responses_reasoning,
     ))
 }
 
@@ -2231,10 +2460,19 @@ mod tests {
 
     #[test]
     fn budget_min_depth_adapts_to_small_step_budgets() {
-        // Default budget → full MIN_INVESTIGATION_DEPTH.
+        // Default budget uses the standard profile.
         assert_eq!(LoopBudget::default().min_depth(), MIN_INVESTIGATION_DEPTH);
         // Smallest legal budget (4 steps) → depth shrinks below the constant.
         assert_eq!(LoopBudget::from_overrides(Some(1), None).min_depth(), 3);
+        assert_eq!(
+            LoopBudget::from_overrides(Some(80), Some(90)).min_depth(),
+            6,
+            "deep budgets require more evidence before accepting a conclusion"
+        );
+        assert_eq!(
+            LoopBudget::from_overrides(Some(150), Some(175)).min_depth(),
+            8
+        );
         // Pathological direct construction still bottoms out at 1.
         let b = LoopBudget {
             max_tool_calls: 1,
@@ -2242,6 +2480,37 @@ mod tests {
             max_llm_calls: 3,
         };
         assert_eq!(b.min_depth(), 1);
+    }
+
+    #[test]
+    fn budget_profiles_change_phase_and_verification_capacity() {
+        let quick = LoopBudget::from_overrides(Some(10), Some(12));
+        assert_eq!(quick.depth_profile(), InvestigationDepth::Quick);
+        assert_eq!(quick.convergence_start(), 5);
+        assert_eq!(quick.verification_start(), 8);
+        assert_eq!(quick.phase(0, 0, false), InvestigationPhase::Explore);
+        assert_eq!(quick.phase(5, 5, false), InvestigationPhase::Converge);
+        assert_eq!(quick.phase(8, 8, false), InvestigationPhase::Verify);
+
+        let deep = LoopBudget::from_overrides(Some(80), Some(90));
+        assert_eq!(deep.depth_profile(), InvestigationDepth::Deep);
+        assert_eq!(deep.convergence_start(), 56);
+        assert_eq!(deep.verification_start(), 72);
+        assert_eq!(deep.depth_profile().hypothesis_limit(), 4);
+    }
+
+    #[test]
+    fn finishing_allowance_is_small_and_phase_guidance_is_explicit() {
+        let budget = LoopBudget::from_overrides(Some(10), Some(12));
+        assert_eq!(budget.hard_tool_call_limit(), 12);
+        assert_eq!(budget.hard_tool_step_limit(), 12);
+        assert_eq!(budget.hard_llm_call_limit(), 15);
+        assert_eq!(budget.phase(10, 12, true), InvestigationPhase::Finish);
+
+        let guidance = budget.guidance(10, 12, true);
+        assert!(guidance.contains("quick profile, finish phase"));
+        assert!(guidance.contains("at most 2 extra tool calls and 3 extra LLM calls"));
+        assert!(guidance.contains("Do not start a new branch"));
     }
 
     // ── strip_question_prefix ────────────────────────────────────────────
@@ -2361,6 +2630,17 @@ mod tests {
         .await;
         assert_eq!(accum.prompt_tokens, 123);
         assert_eq!(accum.completion_tokens, 45);
+    }
+
+    #[tokio::test]
+    async fn sse_preserves_responses_reasoning_for_the_next_tool_round() {
+        let (accum, _events, _done) = run_lines(&[
+            r#"data: {"choices":[{"delta":{"_rush_responses_reasoning":[{"type":"reasoning","id":"rs_1","encrypted_content":"opaque"}],"tool_calls":[{"index":0,"id":"call_1","function":{"name":"search_logs","arguments":"{}"}}]}}]}"#,
+        ])
+        .await;
+        assert_eq!(accum.responses_reasoning.len(), 1);
+        assert_eq!(accum.responses_reasoning[0]["id"], "rs_1");
+        assert_eq!(accum.tool_calls[0].id, "call_1");
     }
 
     #[tokio::test]

@@ -134,23 +134,11 @@ async fn investigate_with_empty_fields_returns_400() {
     );
 }
 
-/// With no LLM configured, the investigate stream must open (200 SSE) and
-/// its first frames must carry the setup-oriented "LLM not configured" error
-/// instead of starting a doomed investigation.
-///
-/// Env vars are process-global; this test only READS OPENAI_API_KEY and skips
-/// itself when one is set (e.g. a dev machine), to avoid mutating env state
-/// and racing other tests.
+/// When query-api cannot confirm a configured tenant model, the investigate
+/// stream must open (200 SSE) and carry a setup-oriented error instead of
+/// starting a doomed investigation.
 #[tokio::test]
-async fn investigate_without_llm_env_streams_not_configured_error() {
-    if std::env::var("OPENAI_API_KEY").is_ok() {
-        eprintln!(
-            "OPENAI_API_KEY is set in this environment — skipping the \
-             LLM-not-configured assertion to avoid flaking"
-        );
-        return;
-    }
-
+async fn investigate_without_tenant_llm_streams_not_configured_error() {
     // Legacy follow-up shape (prior_messages + question, no session_id):
     // skips session creation against the disconnected DB so the request
     // reaches the LLM-config check.

@@ -7,14 +7,14 @@
 use axum::{
     Json, Router,
     body::{Body, Bytes},
-    extract::{Path, Query, State},
+    extract::State,
     http::{HeaderMap, StatusCode, header},
     middleware::Next,
     response::{IntoResponse, Response},
-    routing::{delete, get, post},
+    routing::{get, post},
 };
 use serde::Deserialize;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tower_http::trace::TraceLayer;
 
@@ -38,10 +38,6 @@ pub fn router(state: AppState) -> Router {
     // cluster directly.
     let protected = Router::new()
         .route("/api/v1/investigate", post(investigate))
-        // Session management
-        .route("/api/v1/sessions", get(list_sessions))
-        .route("/api/v1/sessions/{id}", get(get_session))
-        .route("/api/v1/sessions/{id}", delete(delete_session))
         // Templates
         .route(
             "/api/v1/investigation-templates",
@@ -242,6 +238,62 @@ fn sse_body(
         },
     );
     Body::from_stream(stream)
+}
+
+const MAX_SAVED_ACTIVITY_BYTES: usize = 900_000;
+const MAX_SAVED_TOOL_RESULT_CHARS: usize = 128_000;
+
+#[derive(Default)]
+struct SavedActivityLog {
+    events: Vec<serde_json::Value>,
+    bytes: usize,
+    truncated: bool,
+}
+
+impl SavedActivityLog {
+    fn push(&mut self, event: &AgentEvent) {
+        let value = match event {
+            AgentEvent::ToolCall { name, args } => serde_json::json!({
+                "type": "tool_call",
+                "name": name,
+                "args": args,
+            }),
+            AgentEvent::ToolResult { name, data, .. } => serde_json::json!({
+                "type": "tool_result",
+                "name": name,
+                "data": truncate_saved_tool_result(data),
+            }),
+            _ => return,
+        };
+
+        let event_bytes = serde_json::to_vec(&value).map_or(MAX_SAVED_ACTIVITY_BYTES, |v| v.len());
+        if self.bytes.saturating_add(event_bytes) > MAX_SAVED_ACTIVITY_BYTES {
+            self.truncated = true;
+            return;
+        }
+
+        self.bytes += event_bytes;
+        self.events.push(value);
+    }
+
+    fn to_json(&self) -> String {
+        let mut events = self.events.clone();
+        if self.truncated {
+            events.push(serde_json::json!({
+                "type": "tool_result",
+                "name": "saved_activity",
+                "data": "Additional tool activity was omitted because the saved log reached its size limit.",
+            }));
+        }
+        serde_json::to_string(&events).unwrap_or_else(|_| "[]".to_string())
+    }
+}
+
+fn truncate_saved_tool_result(data: &str) -> String {
+    match data.char_indices().nth(MAX_SAVED_TOOL_RESULT_CHARS) {
+        Some((index, _)) => format!("{}\n[truncated in saved session]", &data[..index]),
+        None => data.to_string(),
+    }
 }
 
 // ── Investigate handler (session-aware) ──
@@ -711,13 +763,30 @@ async fn investigate(
         _ => None,
     };
 
+    // Capture the bounded tool trail while forwarding the same events to the
+    // browser. The final report remains in the turn content column.
+    let (agent_tx, mut agent_rx) = mpsc::channel::<AgentEvent>(64);
+    let saved_activity = Arc::new(Mutex::new(SavedActivityLog::default()));
+    let activity_for_forwarder = saved_activity.clone();
+    let client_tx = tx.clone();
+    let activity_forwarder = tokio::spawn(async move {
+        while let Some(event) = agent_rx.recv().await {
+            if let Ok(mut activity) = activity_for_forwarder.lock() {
+                activity.push(&event);
+            }
+            if client_tx.send(event).await.is_err() {
+                break;
+            }
+        }
+    });
+
     tokio::spawn(async move {
         let _permit = permit;
         let result = agent::loop_runner::run_with_config_and_budget_cancelable(
             messages,
             &registry,
             &tool_ctx,
-            &tx,
+            &agent_tx,
             llm,
             restored_mem,
             &session_id_for_task,
@@ -728,68 +797,74 @@ async fn investigate(
         let was_cancelled = task_cancellation.is_cancelled();
         let succeeded = result.is_ok();
 
-        match result {
-            Ok((
-                summary_text,
-                report_kind,
-                final_memory,
-                total_prompt,
-                total_completion,
-                llm_model_used,
-            )) => {
-                // Persist assistant turn and updated working memory
-                if session_mode_for_task {
-                    let turn_index = query_api
-                        .count_turns(&tenant_id_for_task, &session_id_for_task)
-                        .await
-                        .unwrap_or(0);
-                    let turn_id = uuid::Uuid::new_v4().to_string();
-                    let kind_str = match report_kind {
-                        agent::stream::ReportKind::Final => "final",
-                        agent::stream::ReportKind::Preliminary => "preliminary",
-                        agent::stream::ReportKind::Question => "question",
-                    };
-                    let _ = query_api
-                        .add_turn(
-                            &tenant_id_for_task,
-                            &turn_id,
-                            &session_id_for_task,
-                            turn_index,
-                            "assistant",
-                            &summary_text,
-                            "[]", // tool_calls summary omitted for now
-                            kind_str,
-                        )
-                        .await;
+        if let Err(error) = &result {
+            let _ = agent_tx
+                .send(AgentEvent::Error {
+                    message: error.to_string(),
+                })
+                .await;
+        }
+        drop(agent_tx);
+        let _ = activity_forwarder.await;
+        let saved_activity_json = saved_activity
+            .lock()
+            .map(|activity| activity.to_json())
+            .unwrap_or_else(|_| "[]".to_string());
 
-                    // Persist memory + accumulated tokens (+ status for final
-                    // reports) in one read + one versioned insert instead of
-                    // three read-modify-write cycles.
-                    let mem_json =
-                        serde_json::to_string(&final_memory).unwrap_or_else(|_| "{}".to_string());
-                    let status = if report_kind == agent::stream::ReportKind::Final {
-                        Some("completed")
-                    } else {
-                        None
-                    };
-                    let _ = query_api
-                        .update_session_after_turn(
-                            &tenant_id_for_task,
-                            &session_id_for_task,
-                            &mem_json,
-                            total_prompt,
-                            total_completion,
-                            &llm_model_used,
-                            status,
-                        )
-                        .await;
-                }
-            }
-            Err(e) => {
-                let _ = tx
-                    .send(AgentEvent::Error {
-                        message: e.to_string(),
-                    })
+        if let Ok((
+            summary_text,
+            report_kind,
+            final_memory,
+            total_prompt,
+            total_completion,
+            llm_model_used,
+        )) = result
+        {
+            // Persist assistant turn and updated working memory
+            if session_mode_for_task {
+                let turn_index = query_api
+                    .count_turns(&tenant_id_for_task, &session_id_for_task)
+                    .await
+                    .unwrap_or(0);
+                let turn_id = uuid::Uuid::new_v4().to_string();
+                let kind_str = match report_kind {
+                    agent::stream::ReportKind::Final => "final",
+                    agent::stream::ReportKind::Preliminary => "preliminary",
+                    agent::stream::ReportKind::Question => "question",
+                };
+                let _ = query_api
+                    .add_turn(
+                        &tenant_id_for_task,
+                        &turn_id,
+                        &session_id_for_task,
+                        turn_index,
+                        "assistant",
+                        &summary_text,
+                        &saved_activity_json,
+                        kind_str,
+                    )
+                    .await;
+
+                // Persist memory + accumulated tokens (+ status for final
+                // reports) in one read + one versioned insert instead of
+                // three read-modify-write cycles.
+                let mem_json =
+                    serde_json::to_string(&final_memory).unwrap_or_else(|_| "{}".to_string());
+                let status = if report_kind == agent::stream::ReportKind::Final {
+                    Some("completed")
+                } else {
+                    None
+                };
+                let _ = query_api
+                    .update_session_after_turn(
+                        &tenant_id_for_task,
+                        &session_id_for_task,
+                        &mem_json,
+                        total_prompt,
+                        total_completion,
+                        &llm_model_used,
+                        status,
+                    )
                     .await;
             }
         }
@@ -814,106 +889,56 @@ async fn investigate(
         .unwrap())
 }
 
-// ── Session API endpoints ──
-
-#[derive(Debug, Deserialize)]
-struct ListSessionsQuery {
-    #[serde(default = "default_tenant")]
-    tenant_id: String,
-    #[serde(default = "default_session_limit")]
-    limit: i64,
-}
-
-fn default_session_limit() -> i64 {
-    50
-}
-
-async fn list_sessions(
-    State(state): State<AppState>,
-    Query(params): Query<ListSessionsQuery>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let sessions = state
-        .query_api
-        .list_sessions(&params.tenant_id, params.limit)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    // Return sessions without working_memory to reduce payload
-    let slim: Vec<serde_json::Value> = sessions
-        .iter()
-        .map(|s| {
-            serde_json::json!({
-                "id": s.id,
-                "tenant_id": s.tenant_id,
-                "title": s.title,
-                "status": s.status,
-                "template_id": s.template_id,
-                "created_by": s.created_by,
-                "created_at": s.created_at,
-                "updated_at": s.updated_at,
-                "prompt_tokens": s.prompt_tokens,
-                "completion_tokens": s.completion_tokens,
-                "llm_model": s.llm_model,
-            })
-        })
-        .collect();
-
-    Ok(Json(serde_json::json!({ "sessions": slim })))
-}
-
-async fn get_session(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    Query(params): Query<ListSessionsQuery>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let session = state
-        .query_api
-        .get_session(&params.tenant_id, &id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, "session not found".to_string()))?;
-
-    let turns = state
-        .query_api
-        .get_turns(&params.tenant_id, &id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    Ok(Json(serde_json::json!({
-        "session": {
-            "id": session.id,
-            "tenant_id": session.tenant_id,
-            "title": session.title,
-            "status": session.status,
-            "template_id": session.template_id,
-            "created_by": session.created_by,
-            "created_at": session.created_at,
-            "updated_at": session.updated_at,
-            "prompt_tokens": session.prompt_tokens,
-            "completion_tokens": session.completion_tokens,
-            "llm_model": session.llm_model,
-        },
-        "turns": turns,
-    })))
-}
-
-async fn delete_session(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    Query(params): Query<ListSessionsQuery>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    // Soft-delete: archive instead of hard delete
-    state
-        .query_api
-        .update_session_status(&params.tenant_id, &id, "archived")
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    Ok(Json(serde_json::json!({"ok": true})))
-}
-
 // ── Templates endpoint ──
 
 async fn list_investigation_templates() -> Json<serde_json::Value> {
     let templates = templates::built_in_templates();
     Json(serde_json::json!({ "templates": templates }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::contracts::ToolResultEnvelope;
+
+    #[test]
+    fn saved_activity_keeps_tool_calls_and_results_in_order() {
+        let mut activity = SavedActivityLog::default();
+        activity.push(&AgentEvent::ThinkingDelta {
+            text: "private reasoning".to_string(),
+        });
+        activity.push(&AgentEvent::ToolCall {
+            name: "search_logs".to_string(),
+            args: serde_json::json!({"service": "checkout"}),
+        });
+        activity.push(&AgentEvent::ToolResult {
+            name: "search_logs".to_string(),
+            data: "three errors".to_string(),
+            provenance: Box::new(ToolResultEnvelope::from_legacy(
+                "search_logs",
+                &serde_json::json!({}),
+                "three errors",
+                None,
+            )),
+        });
+
+        let stored: Vec<serde_json::Value> = serde_json::from_str(&activity.to_json()).unwrap();
+        assert_eq!(stored.len(), 2);
+        assert_eq!(stored[0]["type"], "tool_call");
+        assert_eq!(stored[1]["type"], "tool_result");
+        assert_eq!(stored[1]["data"], "three errors");
+    }
+
+    #[test]
+    fn saved_activity_truncates_large_tool_results_on_char_boundaries() {
+        let data = "é".repeat(MAX_SAVED_TOOL_RESULT_CHARS + 1);
+        let saved = truncate_saved_tool_result(&data);
+        let prefix = saved
+            .strip_suffix("\n[truncated in saved session]")
+            .unwrap();
+
+        assert!(saved.ends_with("[truncated in saved session]"));
+        assert!(saved.is_char_boundary(saved.len()));
+        assert_eq!(prefix.chars().count(), MAX_SAVED_TOOL_RESULT_CHARS);
+    }
 }

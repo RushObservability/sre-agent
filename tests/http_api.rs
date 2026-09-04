@@ -181,26 +181,26 @@ async fn investigate_without_tenant_llm_streams_not_configured_error() {
     );
 }
 
-/// Listing sessions against the disconnected query-api client must fail fast with a
-/// clean 500 — not hang and not panic (verifies fail-fast error propagation
-/// through the handler's `map_err` chain).
 #[tokio::test]
-async fn list_sessions_disconnected_db_returns_500_fast() {
+async fn public_session_routes_are_not_exposed_by_the_agent() {
     let app = test_router();
-    let resp = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        app.oneshot(
-            Request::get("/api/v1/sessions")
-                .header("x-rush-internal-token", INTERNAL_TOKEN)
-                .body(Body::empty())
-                .unwrap(),
-        ),
-    )
-    .await
-    .expect("disconnected DB must fail fast, not hang")
-    .unwrap();
+    let requests = [
+        Request::get("/api/v1/sessions"),
+        Request::get("/api/v1/sessions/session-1"),
+        Request::delete("/api/v1/sessions/session-1"),
+    ];
 
-    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
-    let body = resp.into_body().collect().await.unwrap().to_bytes();
-    assert!(!body.is_empty(), "500 carries an error message body");
+    for request in requests {
+        let response = app
+            .clone()
+            .oneshot(
+                request
+                    .header("x-rush-internal-token", INTERNAL_TOKEN)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
 }

@@ -165,7 +165,9 @@ impl QueryApiClient {
             .context("profile query request failed")?;
         match response.status() {
             StatusCode::NOT_FOUND => return Ok(ProfileRead::Unavailable),
-            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => return Ok(ProfileRead::AccessDenied),
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+                return Ok(ProfileRead::AccessDenied);
+            }
             StatusCode::UNPROCESSABLE_ENTITY => return Ok(ProfileRead::TooBroad),
             status if !status.is_success() => bail!("profile query failed with HTTP {status}"),
             _ => {}

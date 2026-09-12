@@ -1077,10 +1077,14 @@ fn clip_structured_tool_result(result: &str, limit: usize) -> String {
             let largest = candidates
                 .into_iter()
                 .filter(|(period, key, _)| {
-                    value["data"][period][key].as_array().is_some_and(|a| a.len() > 1)
+                    value["data"][period][key]
+                        .as_array()
+                        .is_some_and(|a| a.len() > 1)
                 })
                 .max_by_key(|(period, key, _)| value["data"][period][key].to_string().len());
-            let Some((period, key, omitted)) = largest else { break; };
+            let Some((period, key, omitted)) = largest else {
+                break;
+            };
             value["data"][period][key].as_array_mut().unwrap().pop();
             let count = value["data"][period][omitted].as_u64().unwrap_or(0);
             value["data"][period][omitted] = serde_json::json!(count + 1);

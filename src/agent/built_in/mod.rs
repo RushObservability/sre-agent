@@ -10,6 +10,7 @@ mod metrics;
 mod mysql;
 mod past_incidents;
 mod postgres;
+mod profiles;
 mod repository_tools;
 mod service_analysis;
 mod services;
@@ -28,6 +29,7 @@ pub fn register_all(registry: &mut ToolRegistry) {
         Arc::new(metrics::QueryMetrics),
         Arc::new(services::ListServices),
         Arc::new(services::ServiceDependencies),
+        Arc::new(profiles::InspectProfiles),
         Arc::new(service_analysis::CompareServiceWindows),
         Arc::new(service_analysis::RankSlowDependencies),
         Arc::new(advanced_analysis::AnalyzeTraceCriticalPath),

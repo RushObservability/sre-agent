@@ -175,6 +175,7 @@ impl ResultStatus {
 #[serde(rename_all = "snake_case")]
 pub enum SourceFamily {
     Traces,
+    Profiles,
     Logs,
     #[serde(rename = "otel_metrics")]
     OTelMetrics,
@@ -430,6 +431,7 @@ pub fn require_window_from_args(args: &serde_json::Value) -> Result<Investigatio
 
 fn source_family_for_tool(tool_name: &str) -> SourceFamily {
     match tool_name {
+        "inspect_profiles" => SourceFamily::Profiles,
         "search_logs" => SourceFamily::Logs,
         "get_argocd_app"
         | "get_flux_resource"
@@ -465,6 +467,7 @@ fn source_tables_for_tool(tool_name: &str) -> Vec<String> {
         return vec!["config_kubernetes_access_events".into()];
     }
     match source_family_for_tool(tool_name) {
+        SourceFamily::Profiles => vec!["profile_samples".into()],
         SourceFamily::Logs => vec!["logs".into()],
         SourceFamily::Traces => vec!["spans".into()],
         SourceFamily::Kubernetes => vec!["kubernetes_api".into()],

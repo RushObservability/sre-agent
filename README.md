@@ -11,7 +11,7 @@
 
 Give sre-agent an alert or a plain-English question and it forms a hypothesis and goes looking — across traces, logs, metrics, Kubernetes, ArgoCD, and deploy history — until it can name a likely cause. It streams its reasoning as it works, so you watch the investigation rather than wait for a verdict.
 
-Under the hood it's a ReAct loop over an OpenAI-compatible model with 25 built-in tools. The interesting problems here aren't calling the LLM; they're knowing when to stop, what to keep in a small context window, and how to keep the model from chasing its own tail.
+Under the hood it's a ReAct loop over an OpenAI-compatible model with built-in investigation tools. The interesting problems here aren't calling the LLM; they're knowing when to stop, what to keep in a small context window, and how to keep the model from chasing its own tail.
 
 > Not a standalone product. sre-agent is one service in a [Rush](https://github.com/RushObservability) deployment and expects the rest to be running.
 
@@ -62,6 +62,7 @@ query-api's tamper-evident audit log without tokens or source contents.
 | `list_services` / `service_dependencies` | health snapshot; call graph |
 | `compare_service_windows` / `rank_slow_dependencies` | incident-vs-baseline service comparison; slow downstream ranking |
 | `analyze_trace_critical_path` | identify spans dominating a trace's duration |
+| `inspect_profiles` | check CPU profiles for a suspect app; compare function hotspots and call paths across incident and baseline windows |
 | `get_resource_saturation` / `list_metric_catalog` | resource pressure; available metric names and labels |
 | `detect_service_silence` | distinguish missing traffic from a healthy low-volume service |
 | `inspect_postgresql` | correlate an app's PostgreSQL spans with slow-query, lock, advisor, replication, recovery, and planning evidence from the existing read-only PostgreSQL collector |
@@ -81,6 +82,27 @@ frontend. They are stored by query-api, loaded fresh for the next investigation,
 and merged with the built-ins. The agent only receives enabled skills. Custom
 skill bodies are treated as untrusted advisory content and never override the
 agent's system rules.
+
+## Profiling evidence
+
+For latency, CPU pressure, and deploy investigations, the agent is instructed to
+check profiling for the suspect apps when the investigation includes `profiles`
+or `all` scope. It uses the investigation's tenant and exact time windows, and
+returns up to 15 functions and five call paths per window. It tries `cpu` first,
+then `sampled_cpu` if there are no CPU samples; it never combines the two types.
+
+The app must already be [sending profiles to Rush](https://rushobservability.com/docs/profiling).
+Update and restart both query-api and sre-agent for this tool: query-api must
+allow the agent's internal credential to read `GET /api/v1/profiles`. No separate
+integration or profiling license is required. For example, ask:
+"Investigate articles latency over the last hour and check its CPU profiles."
+
+Self CPU belongs to the leaf function; total CPU includes its callees, counting
+recursive functions once per stack. The agent compares CPU seconds and function
+shares, not request durations. Captured CPU divided by the whole window is an
+average across the selected processes and can be affected by collection gaps.
+Missing profiles or a missing baseline are reported as evidence gaps. The agent
+continues with traces, logs, and metrics rather than calling the app healthy.
 
 ## Running it
 

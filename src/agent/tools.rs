@@ -275,5 +275,6 @@ mod tests {
         assert!(names.contains(&"get_flux_resource".to_string()));
         assert!(names.contains(&"inspect_postgresql".to_string()));
         assert!(names.contains(&"inspect_mysql".to_string()));
+        assert!(names.contains(&"inspect_profiles".to_string()));
     }
 }

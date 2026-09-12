@@ -1033,13 +1033,13 @@ pub fn clip_tool_result(tool_name: &str, result: &str) -> String {
         "kube_events" => 2500,
         "search_kubernetes_access" => 8000,
         "load_skill" => 6000, // skills are intentional content
-        "compare_service_windows" | "rank_slow_dependencies" => 12_000,
+        "compare_service_windows" | "rank_slow_dependencies" | "inspect_profiles" => 12_000,
         _ => 2000,
     };
 
     if matches!(
         tool_name,
-        "compare_service_windows" | "rank_slow_dependencies"
+        "compare_service_windows" | "rank_slow_dependencies" | "inspect_profiles"
     ) {
         return clip_structured_tool_result(result, limit);
     }
@@ -1065,6 +1065,32 @@ fn clip_structured_tool_result(result: &str, limit: usize) -> String {
     let Ok(mut value) = serde_json::from_str::<serde_json::Value>(result) else {
         return clip_tool_result("unknown", result);
     };
+    // Retain at least one CPU hotspot/path per window and full provenance.
+    if value["source_family"] == "profiles" {
+        while value.to_string().len() > limit {
+            let candidates = [
+                ("incident", "top_functions", "omitted_functions"),
+                ("baseline", "top_functions", "omitted_functions"),
+                ("incident", "top_call_paths", "omitted_call_paths"),
+                ("baseline", "top_call_paths", "omitted_call_paths"),
+            ];
+            let largest = candidates
+                .into_iter()
+                .filter(|(period, key, _)| {
+                    value["data"][period][key]
+                        .as_array()
+                        .is_some_and(|a| a.len() > 1)
+                })
+                .max_by_key(|(period, key, _)| value["data"][period][key].to_string().len());
+            let Some((period, key, omitted)) = largest else {
+                break;
+            };
+            value["data"][period][key].as_array_mut().unwrap().pop();
+            let count = value["data"][period][omitted].as_u64().unwrap_or(0);
+            value["data"][period][omitted] = serde_json::json!(count + 1);
+            value["data"]["truncated"] = serde_json::json!(true);
+        }
+    }
     if let Some(data) = value
         .get_mut("data")
         .and_then(|value| value.as_object_mut())

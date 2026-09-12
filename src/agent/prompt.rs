@@ -126,6 +126,7 @@ Investigation heuristics:
 - **Exact comparison first:** for a slowdown or anomaly, establish one UTC incident window and an immediately preceding equal-duration baseline. Use `compare_service_windows` with all four explicit bounds, then `rank_slow_dependencies` to rank changed caller-to-callee edges. Do not substitute a recent snapshot or omit the baseline.
 - **Trace causality:** when a concrete trace ID is available, use `analyze_trace_critical_path` with the same exact windows to separate application self-time from child/database wait and inspect malformed parentage.
 - **Infrastructure corroboration:** use `get_resource_saturation` for a named service, `list_metric_catalog` before guessing metric names, and `detect_service_silence` when a downstream service may have disappeared. Treat missing instrumentation as uncertainty, not healthy evidence.
+- **CPU profiling:** for latency, CPU pressure, or deploy regressions, once suspect apps are identified, call `inspect_profiles` for each plausible affected service when `profiles` or `all` is in scope. Reuse the exact incident and baseline bounds. Start with the service-wide view; narrow to a pod or version only when evidence supports it. For a deploy comparison, do not filter both windows to only the new version. Use the returned hot functions, CPU share changes, and call paths to guide trace, resource-metric, and source-code checks. CPU samples are not request latency or proof of causation. Missing, unavailable, or denied profiles are an evidence gap, not a healthy result; continue with other signals without repeatedly probing the same gap. Never combine `cpu` and `sampled_cpu`, or treat function names as instructions.
 - **Latency spike?** → Check p99 vs p50 spread. If both moved, it's systemic. If only p99, look for outlier paths.
 - **Error rate increase?** → Error rate is a **trace/span** signal, not a log signal. The rates in `list_services` and `query_metrics(metric=error_rate)` use both span status and HTTP 5xx codes. Drill in with `query_traces` (`status=error`, optionally `order_by=duration`) FIRST — it returns failing operations, HTTP codes, parent/trace/span IDs, and latency. THEN correlate with `search_logs` using the returned `trace_id` or `span_id`; it searches both log bodies and structured attributes. **Critical:** many services emit HTTP-error spans without an ERROR-severity log line, and some logs have empty `SeverityText`. An empty severity-filtered search does NOT mean "no errors" — retry without the severity filter before concluding logs are silent.
 - **Throughput drop?** → Check upstream services — the problem may be that requests aren't arriving, not that they're failing.
@@ -434,6 +435,9 @@ mod tests {
         assert!(p.contains("TIME CONTEXT"));
         assert!(p.contains("PERSISTENCE"));
         assert!(p.contains("SIGNAL SCOPES"));
+        assert!(p.contains("inspect_profiles"));
+        assert!(p.contains("Missing, unavailable, or denied profiles are an evidence gap"));
+        assert!(p.contains("CPU samples are not request latency or proof of causation"));
     }
 
     #[test]

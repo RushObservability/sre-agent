@@ -119,6 +119,13 @@ make docker        # build image
 make docker-push
 ```
 
+The container uses Chainguard's `glibc-dynamic` runtime, pinned to a
+multi-architecture digest for amd64 and arm64. It runs as UID/GID `65532`,
+includes CA certificates, and has no shell or package manager. Any mounted
+repository-cache directory must be writable by that UID/GID. Dependabot tracks
+runtime digest updates, and releases still fail on fixable high or critical
+vulnerabilities reported by Trivy.
+
 | Variable | Default | |
 |---|---|---|
 | `SRE_AGENT_PORT` | `8081` | listen port |

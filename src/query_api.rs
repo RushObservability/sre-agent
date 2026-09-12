@@ -15,6 +15,13 @@ pub struct QueryApiClient {
     http: reqwest::Client,
 }
 
+pub enum ProfileRead<T> {
+    Data(T),
+    Unavailable,
+    AccessDenied,
+    TooBroad,
+}
+
 impl QueryApiClient {
     pub fn new(base_url: &str, internal_token: String) -> Result<Self> {
         if internal_token.trim().is_empty() {
@@ -141,6 +148,38 @@ impl QueryApiClient {
                 .json(body),
         )
         .await
+    }
+
+    /// Read only the fixed profile query endpoint using the investigation tenant.
+    /// Error bodies are deliberately excluded from model-visible diagnostics.
+    pub async fn query_profiles<T: DeserializeOwned>(
+        &self,
+        tenant_id: &str,
+        params: &[(&str, String)],
+    ) -> Result<ProfileRead<T>> {
+        let mut response = self
+            .request(Method::GET, tenant_id, "api/v1/profiles")?
+            .query(params)
+            .send()
+            .await
+            .context("profile query request failed")?;
+        match response.status() {
+            StatusCode::NOT_FOUND => return Ok(ProfileRead::Unavailable),
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => return Ok(ProfileRead::AccessDenied),
+            StatusCode::UNPROCESSABLE_ENTITY => return Ok(ProfileRead::TooBroad),
+            status if !status.is_success() => bail!("profile query failed with HTTP {status}"),
+            _ => {}
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            if body.len() + chunk.len() > 4 * 1024 * 1024 {
+                bail!("profile response exceeds the 4 MiB tool budget; narrow the window or pod");
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(ProfileRead::Data(
+            serde_json::from_slice(&body).context("invalid profile response")?,
+        ))
     }
 
     pub async fn query_span_timeseries<T: DeserializeOwned>(

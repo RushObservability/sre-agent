@@ -72,6 +72,7 @@ pub fn all_skills() -> HashMap<&'static str, Skill> {
 - [ ] Are downstream services also slow? Use `service_dependencies` + check their latency.
 - [ ] Is there a change in request volume? More traffic = higher latency under load.
 - [ ] Any errors accompanying the latency? Retries cause latency spikes.
+- [ ] If profiling is in scope, use `inspect_profiles` for each suspect app with the investigation's exact incident/baseline windows. Compare hot functions and CPU shares, then corroborate with traces and resource metrics. Missing profiles are an evidence gap; CPU time is not request latency.
 
 ## Root Cause Patterns
 
@@ -121,6 +122,7 @@ Use `list_deploys` with a 6-hour window. Create a mental timeline of deploys vs 
 
 ### Step 2: Compare before/after metrics
 Query error_rate and p99_latency for the service with a window that spans 15 minutes before and after the deploy timestamp. Look for a step change.
+If profiling is in scope, call `inspect_profiles` for the deployed app using the same exact, equal-duration incident and baseline bounds as the investigation. Look for changed function CPU shares and call paths. Leave the version filter unset so the pre-deploy baseline remains visible. Do not infer a regression from a missing baseline or equate CPU samples with request duration.
 
 ### Step 3: Identify new errors
 Search logs for ERROR in the service AFTER the deploy timestamp. Look for error messages or stack traces that didn't appear before.

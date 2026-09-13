@@ -130,14 +130,36 @@ jobs:
           provenance: mode=max
           sbom: true
 
-      - name: Scan immutable image for fixable high and critical vulnerabilities
+      - name: Report fixable high and critical vulnerabilities (advisory)
+        id: vulnerability-scan
+        continue-on-error: true
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
-          format: table
+          scanners: vuln
+          format: json
+          output: vulnerability-report.json
           severity: HIGH,CRITICAL
           ignore-unfixed: true
+          # Keep a failed scan step visible, but do not block the release job.
           exit-code: "1"
+
+      - name: Summarize vulnerability report
+        if: ${{ always() && steps.push.outcome == 'success' }}
+        env:
+          SCAN_OUTCOME: ${{ steps.vulnerability-scan.outcome }}
+        run: python3 scripts/security-report.py vulnerability-report.json
+
+      - name: Retain vulnerability report
+        if: ${{ always() && steps.push.outcome == 'success' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sre-agent-${{ steps.version.outputs.tag }}-security-report
+          path: |
+            vulnerability-report.json
+            vulnerability-summary.md
+          if-no-files-found: error
+          retention-days: 90
 
       - name: Verify runtime image uses a non-root account
         env:
@@ -214,9 +236,13 @@ jobs:
           release_args=(
             "$RELEASE_TAG"
             "$SBOM_PATH"
+            vulnerability-summary.md
             --title "$RELEASE_TAG"
             --generate-notes
           )
+          if [[ -f vulnerability-report.json ]]; then
+            release_args+=(vulnerability-report.json)
+          fi
           if [[ -n "$PREVIOUS_TAG" ]]; then
             release_args+=(--notes-start-tag "$PREVIOUS_TAG")
           fi

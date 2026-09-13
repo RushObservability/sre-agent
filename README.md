@@ -123,8 +123,13 @@ The container uses Chainguard's `glibc-dynamic` runtime, pinned to a
 multi-architecture digest for amd64 and arm64. It runs as UID/GID `65532`,
 includes CA certificates, and has no shell or package manager. Any mounted
 repository-cache directory must be writable by that UID/GID. Dependabot tracks
-runtime digest updates, and releases still fail on fixable high or critical
-vulnerabilities reported by Trivy.
+runtime digest updates. Trivy findings are advisory: fixable high/critical
+vulnerabilities leave a failed scan step and a warning in the release job, but
+do not block publication. The job summary distinguishes findings from scanner
+errors or missing reports. JSON findings and a Markdown summary are retained
+for 90 days as workflow artifacts and attached to the GitHub release alongside
+the SPDX SBOM. SBOM generation, attestations, tests, and the non-root check
+remain required; pull-request dependency checks are unchanged.
 
 | Variable | Default | |
 |---|---|---|

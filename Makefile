@@ -71,8 +71,8 @@ lint:                 ## Run clippy lints
 
 ## Release
 
-release:              ## Open a version-bump PR: make release VERSION=0.1.2
-	@VERSION="$(VERSION)" DRY_RUN="$(DRY_RUN)" ./scripts/release.sh
+release:              ## Open a version-bump PR; VERSION=x.y.z overrides the automatic patch bump
+	@VERSION="$(if $(filter command line,$(origin VERSION)),$(VERSION),)" DRY_RUN="$(DRY_RUN)" ./scripts/release.sh
 
 ## Docker
 

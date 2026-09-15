@@ -594,6 +594,8 @@ pub(crate) fn build_resource_saturation_sql(
              WHERE tenant_id = '{tenant}'{service_filter} \
                AND {time} AND {predicate} \
              GROUP BY MetricName",
+            table = table,
+            kind = kind,
             tenant = sql_quote(tenant_id),
             time = time_predicate(window, period, "TimeUnix"),
             predicate = resource_metric_predicate(),
@@ -858,6 +860,8 @@ pub(crate) fn build_metric_catalog_sql(
              GROUP BY MetricName \
              ORDER BY series_count DESC \
              LIMIT {limit}",
+            table = table,
+            kind = kind,
             tenant = sql_quote(tenant_id),
             time = time_predicate(window, "incident", "TimeUnix"),
             limit = MAX_METRIC_ROWS,
@@ -1323,6 +1327,14 @@ mod tests {
     #[test]
     fn resource_query_covers_incident_and_baseline_and_known_saturation_families() {
         let sql = build_resource_saturation_sql("api", &window(), "tenant-a");
+        for fragment in [
+            "FROM metrics_gauge",
+            "FROM metrics_sum",
+            "'gauge' AS metric_type",
+            "'sum' AS metric_type",
+        ] {
+            assert_eq!(sql.matches(fragment).count(), 2);
+        }
         assert!(sql.matches("tenant_id = 'tenant-a'").count() == 4, "{sql}");
         assert!(sql.contains("ServiceName = 'api'"), "{sql}");
         assert!(
@@ -1336,6 +1348,14 @@ mod tests {
     #[test]
     fn metric_catalog_exposes_label_names_without_label_values() {
         let sql = build_metric_catalog_sql(&window(), "tenant-a", "http_");
+        for fragment in [
+            "FROM metrics_gauge",
+            "FROM metrics_sum",
+            "'gauge' AS metric_type",
+            "'sum' AS metric_type",
+        ] {
+            assert_eq!(sql.matches(fragment).count(), 1);
+        }
         assert!(sql.contains("mapKeys(Attributes)"), "{sql}");
         assert!(sql.contains("groupUniqArray"), "{sql}");
         assert!(sql.contains("MetricName LIKE 'http_%'"), "{sql}");

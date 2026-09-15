@@ -249,6 +249,8 @@ fn build_database_calls_sql(
          GROUP BY system, target, database, operation \
          ORDER BY total_ms DESC \
          LIMIT {limit}",
+        time_predicate = time_predicate,
+        limit = limit,
         database_predicate = database_span_predicate(),
     )
 }
@@ -863,7 +865,11 @@ mod tests {
         assert!(sql.contains("service_name = 'payments'"));
         assert!(sql.contains("tenant_id = 'tenant'"));
         assert!(sql.contains("db.system"));
+        assert!(sql.contains("AND timestamp >= now()"));
         assert!(sql.contains("LIMIT 20"));
+        let bounded = build_database_calls_sql("payments", "timestamp < now()", "tenant", 7);
+        assert!(bounded.contains("AND timestamp < now()"));
+        assert!(bounded.ends_with("LIMIT 7"));
     }
 
     #[test]

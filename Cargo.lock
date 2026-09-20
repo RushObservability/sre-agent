@@ -2426,6 +2426,7 @@ dependencies = [
  "k8s-openapi",
  "kube",
  "libc",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",

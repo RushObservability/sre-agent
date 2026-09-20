@@ -3,6 +3,7 @@ pub mod contracts;
 pub mod loop_runner;
 pub mod memory;
 pub mod prompt;
+pub mod redact;
 pub mod skill_store;
 pub mod skills;
 pub mod stream;

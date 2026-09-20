@@ -43,6 +43,7 @@ impl QueryApiClient {
             base_url.set_path(&format!("{}/", base_url.path()));
         }
         let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(35))
             .build()

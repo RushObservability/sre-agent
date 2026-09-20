@@ -3,6 +3,7 @@ mod anomalies;
 mod argocd_tool;
 mod deploys;
 mod flux_tool;
+mod gitops_policy;
 mod kube_tool;
 mod kubernetes_access;
 mod logs;

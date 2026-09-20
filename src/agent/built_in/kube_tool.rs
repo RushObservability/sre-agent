@@ -34,7 +34,7 @@ fn parse_namespace_policy(raw: Option<&str>) -> Option<HashMap<String, HashSet<S
     Some(policy)
 }
 
-fn namespace_allowed_for(raw: Option<&str>, tenant_id: &str, namespace: &str) -> bool {
+pub(super) fn namespace_allowed_for(raw: Option<&str>, tenant_id: &str, namespace: &str) -> bool {
     let Some(policy) = parse_namespace_policy(raw) else {
         return false;
     };

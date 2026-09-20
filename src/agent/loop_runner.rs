@@ -863,6 +863,7 @@ fn llm_client() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     CLIENT.get_or_init(|| {
         reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(std::time::Duration::from_secs(10))
             .timeout(std::time::Duration::from_secs(300))
             .build()
@@ -1569,7 +1570,7 @@ async fn run_inner(
                     "type": "function",
                     "function": {
                         "name": tc.name,
-                        "arguments": tc.arguments,
+                        "arguments": super::redact::text(&tc.arguments),
                     }
                 })
             })
@@ -1605,7 +1606,7 @@ async fn run_inner(
 
             let sig = CallSignature {
                 tool: tc.name.clone(),
-                args_normalized: normalize_args(&args),
+                args_normalized: normalize_args(&super::redact::value(&args)),
             };
             let plan = if memory.is_repeat_call(&sig) {
                 Planned::PrecomputedError(format!(
@@ -1629,7 +1630,7 @@ async fn run_inner(
             let _ = tx
                 .send(AgentEvent::ToolCall {
                     name: tc.name.clone(),
-                    args: args.clone(),
+                    args: super::redact::value(args),
                 })
                 .await;
         }
@@ -1659,8 +1660,16 @@ async fn run_inner(
                         let tool_guard = metrics.tool_call();
                         let (real_work, result, error) =
                             match registry.execute(&tc.name, args.clone(), ctx).await {
-                                Ok(data) => (true, clip_tool_result(&tc.name, &data), false),
-                                Err(e) => (false, format!("Tool error: {e}"), true),
+                                Ok(data) => (
+                                    true,
+                                    clip_tool_result(&tc.name, &super::redact::text(&data)),
+                                    false,
+                                ),
+                                Err(e) => (
+                                    false,
+                                    super::redact::text(&format!("Tool error: {e}")),
+                                    true,
+                                ),
                             };
                         let duration = started.elapsed();
                         tool_guard.finish(error);
@@ -1698,6 +1707,8 @@ async fn run_inner(
         // transcript push.
         let mut any_real_work = false;
         for ((tc, (args, plan)), outcome) in tool_calls.iter().zip(&planned).zip(outcomes) {
+            let safe_args = super::redact::value(args);
+            let args = &safe_args;
             let real_work = outcome.real_work;
             let result = outcome.result;
             if real_work {
@@ -1894,6 +1905,22 @@ struct StreamAccum {
     prompt_tokens: u64,
     completion_tokens: u64,
     responses_reasoning: Vec<Value>,
+    bytes_received: usize,
+    reasoning_bytes: usize,
+}
+
+const MAX_SSE_LINE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_RESPONSE_TOOL_CALLS: usize = 64;
+const MAX_TOOL_ARGUMENT_BYTES: usize = 256 * 1024;
+const MAX_CONTENT_BYTES: usize = 1024 * 1024;
+
+fn check_stream_size(size: usize, limit: usize) -> Result<()> {
+    anyhow::ensure!(
+        size <= limit,
+        "LLM stream exceeded its size limit ({size} > {limit})"
+    );
+    Ok(())
 }
 
 /// Process one complete SSE line. Forwards content deltas over `tx` as they
@@ -1903,19 +1930,22 @@ async fn process_sse_line(
     line: &str,
     accum: &mut StreamAccum,
     tx: &mpsc::Sender<AgentEvent>,
-) -> bool {
+) -> Result<bool> {
+    check_stream_size(line.len(), MAX_SSE_LINE_BYTES)?;
+    accum.bytes_received = accum.bytes_received.saturating_add(line.len());
+    check_stream_size(accum.bytes_received, MAX_RESPONSE_BYTES)?;
     let line = line.trim();
     if !line.starts_with("data: ") {
-        return false;
+        return Ok(false);
     }
     let data = &line[6..];
     if data == "[DONE]" {
-        return true;
+        return Ok(true);
     }
 
     let chunk: Value = match serde_json::from_str(data) {
         Ok(v) => v,
-        Err(_) => return false,
+        Err(_) => return Ok(false),
     };
 
     if let Some(usage) = chunk.get("usage") {
@@ -1931,7 +1961,7 @@ async fn process_sse_line(
 
     let choices = match chunk.get("choices").and_then(|c| c.as_array()) {
         Some(c) => c,
-        None => return false,
+        None => return Ok(false),
     };
 
     for choice in choices {
@@ -1944,17 +1974,25 @@ async fn process_sse_line(
             .get("_rush_responses_reasoning")
             .and_then(Value::as_array)
         {
-            accum.responses_reasoning.extend(
-                items
-                    .iter()
-                    .filter(|item| item.get("type").and_then(Value::as_str) == Some("reasoning"))
-                    .cloned(),
-            );
+            for item in items
+                .iter()
+                .filter(|item| item.get("type").and_then(Value::as_str) == Some("reasoning"))
+            {
+                check_stream_size(accum.responses_reasoning.len() + 1, 128)?;
+                accum.reasoning_bytes =
+                    accum.reasoning_bytes.saturating_add(item.to_string().len());
+                check_stream_size(accum.reasoning_bytes, MAX_CONTENT_BYTES)?;
+                accum.responses_reasoning.push(item.clone());
+            }
         }
 
         if let Some(text) = delta.get("content").and_then(|v| v.as_str())
             && !text.is_empty()
         {
+            check_stream_size(
+                accum.content.len().saturating_add(text.len()),
+                MAX_CONTENT_BYTES,
+            )?;
             accum.content.push_str(text);
             let _ = tx
                 .send(AgentEvent::ThinkingDelta {
@@ -1965,7 +2003,15 @@ async fn process_sse_line(
 
         if let Some(tcs) = delta.get("tool_calls").and_then(|v| v.as_array()) {
             for tc in tcs {
-                let idx = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let idx = tc
+                    .get("index")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| anyhow::anyhow!("LLM tool call has an invalid index"))?;
+                anyhow::ensure!(
+                    idx < MAX_RESPONSE_TOOL_CALLS as u64,
+                    "LLM tool call index exceeds limit"
+                );
+                let idx = idx as usize;
 
                 while accum.tool_calls.len() <= idx {
                     accum.tool_calls.push(ToolCallAccum {
@@ -1976,13 +2022,22 @@ async fn process_sse_line(
                 }
 
                 if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
+                    check_stream_size(id.len(), 256)?;
                     accum.tool_calls[idx].id = id.to_string();
                 }
                 if let Some(func) = tc.get("function") {
                     if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
+                        check_stream_size(name.len(), 128)?;
                         accum.tool_calls[idx].name = name.to_string();
                     }
                     if let Some(args) = func.get("arguments").and_then(|v| v.as_str()) {
+                        check_stream_size(
+                            accum.tool_calls[idx]
+                                .arguments
+                                .len()
+                                .saturating_add(args.len()),
+                            MAX_TOOL_ARGUMENT_BYTES,
+                        )?;
                         accum.tool_calls[idx].arguments.push_str(args);
                     }
                 }
@@ -1990,7 +2045,7 @@ async fn process_sse_line(
         }
     }
 
-    false
+    Ok(false)
 }
 
 /// Parse an OpenAI-compatible streaming response incrementally.
@@ -2006,11 +2061,6 @@ async fn parse_streaming_response(
 ) -> Result<(String, Vec<ToolCallAccum>, (u64, u64), Vec<Value>)> {
     use futures_util::StreamExt;
 
-    /// Defensive cap on the partial-line accumulation buffer. No legitimate
-    /// SSE line approaches this; if exceeded, the upstream is misbehaving and
-    /// we fail rather than buffer without bound.
-    const MAX_LINE_BUFFER: usize = 4 * 1024 * 1024; // 4 MiB
-
     let mut accum = StreamAccum::default();
     let mut buf: Vec<u8> = Vec::new();
     let mut stream = resp.bytes_stream();
@@ -2023,27 +2073,19 @@ async fn parse_streaming_response(
         chunk = stream.next() => chunk
     } {
         let chunk = chunk?;
-        buf.extend_from_slice(&chunk);
-
-        // Process every complete line currently in the buffer. A cursor scan
-        // with a single drain at the end avoids shifting the whole remaining
-        // buffer to the front once per line.
-        let mut cursor = 0usize;
-        while let Some(rel) = buf[cursor..].iter().position(|&b| b == b'\n') {
-            let end = cursor + rel;
-            let line = String::from_utf8_lossy(&buf[cursor..=end]);
-            if process_sse_line(&line, &mut accum, tx).await {
+        // Check fragments before copying, including newline-terminated lines.
+        for fragment in chunk.split_inclusive(|&byte| byte == b'\n') {
+            check_stream_size(buf.len().saturating_add(fragment.len()), MAX_SSE_LINE_BYTES)?;
+            buf.extend_from_slice(fragment);
+            if fragment.last() != Some(&b'\n') {
+                continue;
+            }
+            let line = String::from_utf8_lossy(&buf);
+            if process_sse_line(&line, &mut accum, tx).await? {
                 done = true;
                 break 'recv; // [DONE] — anything after it is ignored
             }
-            cursor = end + 1;
-        }
-        buf.drain(..cursor);
-
-        if buf.len() > MAX_LINE_BUFFER {
-            return Err(anyhow::anyhow!(
-                "LLM stream sent a line larger than {MAX_LINE_BUFFER} bytes — aborting"
-            ));
+            buf.clear();
         }
     }
 
@@ -2051,7 +2093,7 @@ async fn parse_streaming_response(
     // `.lines()` behavior over the fully-buffered body).
     if !done && !buf.is_empty() {
         let line = String::from_utf8_lossy(&buf);
-        let _ = process_sse_line(&line, &mut accum, tx).await;
+        let _ = process_sse_line(&line, &mut accum, tx).await?;
     }
 
     Ok((
@@ -2068,6 +2110,65 @@ mod tests {
     use crate::agent::contracts::{InvestigationWindow, WindowSelectionReason};
     use chrono::{TimeZone, Utc};
     use serde_json::json;
+
+    #[tokio::test]
+    async fn stream_rejects_sparse_and_invalid_indexes_before_allocating() {
+        let (tx, _rx) = mpsc::channel(4);
+        for index in [
+            json!(64),
+            json!(u64::MAX),
+            json!(-1),
+            json!(1.5),
+            Value::Null,
+        ] {
+            let mut accum = StreamAccum::default();
+            let line = format!(
+                "data: {}",
+                json!({"choices":[{"delta":{"tool_calls":[{"index":index}]}}]})
+            );
+            assert!(process_sse_line(&line, &mut accum, &tx).await.is_err());
+            assert!(accum.tool_calls.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_bounds_fragmented_arguments_content_and_reasoning() {
+        let (tx, _rx) = mpsc::channel(16);
+        for delta in [
+            json!({"tool_calls":[{"index":0,"function":{"arguments":"a".repeat(MAX_TOOL_ARGUMENT_BYTES / 2 + 1)}}]}),
+            json!({"content":"a".repeat(MAX_CONTENT_BYTES / 2 + 1)}),
+            json!({"_rush_responses_reasoning":[{"type":"reasoning","encrypted_content":"a".repeat(MAX_CONTENT_BYTES / 2 + 1)}]}),
+        ] {
+            let mut accum = StreamAccum::default();
+            let line = format!("data: {}", json!({"choices":[{"delta":delta}]}));
+            assert!(!process_sse_line(&line, &mut accum, &tx).await.unwrap());
+            assert!(process_sse_line(&line, &mut accum, &tx).await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_bounds_total_bytes_complete_lines_and_reasoning_count() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut accum = StreamAccum::default();
+        let oversized = format!("{}\n", " ".repeat(MAX_SSE_LINE_BYTES));
+        assert!(process_sse_line(&oversized, &mut accum, &tx).await.is_err());
+        let comment = format!(": {}", "x".repeat(MAX_SSE_LINE_BYTES - 2));
+        for _ in 0..2 {
+            assert!(!process_sse_line(&comment, &mut accum, &tx).await.unwrap());
+        }
+        assert!(
+            process_sse_line(": overflow", &mut accum, &tx)
+                .await
+                .is_err()
+        );
+        let line = format!(
+            "data: {}",
+            json!({"choices":[{"delta":{"_rush_responses_reasoning":vec![json!({"type":"reasoning"});129]}}]})
+        );
+        let mut accum = StreamAccum::default();
+        assert!(process_sse_line(&line, &mut accum, &tx).await.is_err());
+        assert_eq!(accum.responses_reasoning.len(), 128);
+    }
 
     /// Build one investigation round: assistant tool-call message + tool result.
     fn round(n: usize) -> Vec<Value> {
@@ -2567,7 +2668,7 @@ mod tests {
         let mut accum = StreamAccum::default();
         let mut done = false;
         for line in lines {
-            if process_sse_line(line, &mut accum, &tx).await {
+            if process_sse_line(line, &mut accum, &tx).await.unwrap() {
                 done = true;
             }
         }

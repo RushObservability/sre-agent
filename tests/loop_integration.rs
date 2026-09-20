@@ -692,7 +692,7 @@ async fn sse_oversized_line_errors_gracefully() {
 
     let err = result.expect_err("oversized line must error, not hang or panic");
     assert!(
-        err.to_string().contains("larger than"),
+        err.to_string().contains("size limit"),
         "error names the line-size cap: {err}"
     );
     assert_eq!(server.calls(), 1, "the run aborts on the first response");

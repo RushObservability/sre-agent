@@ -137,10 +137,47 @@ fn relative_display(root: &Path, path: &Path) -> String {
 }
 
 fn is_hidden_repository_metadata(entry: &walkdir::DirEntry) -> bool {
-    entry.file_name() == ".git"
+    sensitive_path(entry.path())
+}
+
+fn sensitive_path(path: &Path) -> bool {
+    path.components().any(|component| {
+        let name = component.as_os_str().to_string_lossy().to_ascii_lowercase();
+        matches!(
+            name.as_str(),
+            ".git"
+                | ".ssh"
+                | ".aws"
+                | ".kube"
+                | ".gnupg"
+                | ".npmrc"
+                | ".netrc"
+                | ".pypirc"
+                | "credentials"
+                | "credentials.json"
+                | "secrets"
+                | "id_rsa"
+                | "id_ed25519"
+                | "id_ecdsa"
+                | "kubeconfig"
+        ) || name == ".env"
+            || name.starts_with(".env.")
+            || [".pem", ".key", ".p12", ".pfx", ".keystore", ".jks"]
+                .iter()
+                .any(|ext| name.ends_with(ext))
+    })
+}
+
+fn require_safe_path(path: &Path) -> Result<()> {
+    anyhow::ensure!(
+        !sensitive_path(path),
+        "credential files are not available to repository tools"
+    );
+    Ok(())
 }
 
 fn read_text_file(path: &Path, max_bytes: u64) -> Result<String> {
+    require_safe_path(path)?;
     let metadata = std::fs::metadata(path)?;
     if !metadata.is_file() {
         bail!("path is not a regular file")
@@ -152,7 +189,9 @@ fn read_text_file(path: &Path, max_bytes: u64) -> Result<String> {
     if bytes.contains(&0) {
         bail!("binary files are not available to the code-reading tools")
     }
-    String::from_utf8(bytes).context("file is not valid UTF-8 text")
+    let text = String::from_utf8(bytes).context("file is not valid UTF-8 text")?;
+    // Redact before selecting lines so a partial PEM block cannot escape.
+    Ok(crate::agent::redact::text(&text))
 }
 
 /// Audit sensitive source reads through query-api's tamper-evident audit log.
@@ -190,6 +229,7 @@ impl ListRepositoryFiles {
             .clamp(1, 12) as usize;
         let (link, root, revision) = linked_snapshot(ctx, service).await?;
         let start = resolve_under(&root, requested_path)?;
+        require_safe_path(&start)?;
         if !start.is_dir() {
             bail!("requested path is not a directory")
         }
@@ -274,6 +314,7 @@ impl SearchRepository {
         let limit = requested_limit.clamp(1, MAX_SEARCH_RESULTS);
         let (link, root, revision) = linked_snapshot(ctx, service).await?;
         let start = resolve_under(&root, requested_path)?;
+        require_safe_path(&start)?;
         if !start.is_dir() {
             bail!("requested path is not a directory")
         }
@@ -436,6 +477,31 @@ impl Tool for ReadRepositoryFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repository_tools_exclude_secret_paths() {
+        for path in [
+            ".env",
+            "app/.env.production",
+            "certs/private.key",
+            "tls/key.pem",
+            ".aws/credentials",
+            ".kube/config",
+            ".ssh/id_rsa",
+            "config/.netrc",
+            "secrets/passwords",
+        ] {
+            assert!(require_safe_path(Path::new(path)).is_err(), "{path}");
+            assert!(
+                read_text_file(Path::new(path), MAX_SEARCH_FILE_BYTES)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("credential files")
+            );
+        }
+        assert!(require_safe_path(Path::new("src/auth.rs")).is_ok());
+        assert!(require_safe_path(Path::new("config/settings.yaml")).is_ok());
+    }
 
     fn link() -> ServiceLink {
         ServiceLink {

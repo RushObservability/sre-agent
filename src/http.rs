@@ -102,8 +102,7 @@ struct InvestigateRequest {
     question: String,
     #[serde(default)]
     additional_context: String,
-    /// Legacy field: kept for backwards compat with older frontends that
-    /// send the full prior conversation. Ignored when `session_id` is set.
+    /// Rejected when nonempty. Follow-ups must use server-owned session history.
     #[serde(default)]
     prior_messages: Vec<serde_json::Value>,
     /// Tenant ID forwarded to query-api for server-side data isolation.
@@ -256,12 +255,12 @@ impl SavedActivityLog {
             AgentEvent::ToolCall { name, args } => serde_json::json!({
                 "type": "tool_call",
                 "name": name,
-                "args": args,
+                "args": agent::redact::value(args),
             }),
             AgentEvent::ToolResult { name, data, .. } => serde_json::json!({
                 "type": "tool_result",
                 "name": name,
-                "data": truncate_saved_tool_result(data),
+                "data": truncate_saved_tool_result(&agent::redact::text(data)),
             }),
             _ => return,
         };
@@ -302,13 +301,14 @@ async fn investigate(
     State(state): State<AppState>,
     Json(req): Json<InvestigateRequest>,
 ) -> Result<Response, (StatusCode, String)> {
-    let is_legacy_follow_up = !req.prior_messages.is_empty() && req.session_id.is_empty();
+    if !req.prior_messages.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "prior_messages is not supported; use session_id to continue an investigation".into(),
+        ));
+    }
 
-    if req.event_id.is_empty()
-        && req.question.is_empty()
-        && !is_legacy_follow_up
-        && req.session_id.is_empty()
-    {
+    if req.event_id.is_empty() && req.question.is_empty() && req.session_id.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
             "provide event_id, question, or session_id".to_string(),
@@ -360,13 +360,10 @@ async fn investigate(
         req.session_id.clone()
     };
 
-    // Determine if we are in session mode (enables question-asking).
-    let session_mode = !is_legacy_follow_up;
-
     // Load or create session state and working memory.
     let mut restored_memory: Option<WorkingMemory> = None;
 
-    if is_new_session && session_mode {
+    if is_new_session {
         // Create session in DB
         let auto_title = if !req.question.is_empty() {
             // Use first 100 chars of question as title
@@ -387,7 +384,7 @@ async fn investigate(
             )
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    } else if !is_new_session && session_mode {
+    } else {
         // Load session from DB and verify tenant
         let session = state
             .query_api
@@ -475,8 +472,8 @@ async fn investigate(
         restored_memory = Some(memory);
     }
 
-    // Save user turn to DB (session mode only).
-    if session_mode {
+    // Every investigation persists its user turn before the model runs.
+    {
         let turn_index = state
             .query_api
             .count_turns(&req.tenant_id, &session_id)
@@ -500,15 +497,7 @@ async fn investigate(
     }
 
     // Build the message list for the LLM.
-    let messages: Vec<serde_json::Value> = if is_legacy_follow_up {
-        // Legacy path: client sends prior_messages
-        let mut msgs = req.prior_messages.clone();
-        msgs.push(serde_json::json!({
-            "role": "user",
-            "content": user_content,
-        }));
-        msgs
-    } else {
+    let messages: Vec<serde_json::Value> = {
         // Session-based path: reconstruct from DB
         let template = if !req.template_id.is_empty() {
             templates::get_template(&req.template_id)
@@ -536,9 +525,8 @@ async fn investigate(
             ));
         }
 
-        // In session mode, allow the agent to ask clarifying questions
-        if !is_new_session || session_mode {
-            system_content.push_str(
+        // Allow clarifying questions within the persisted session.
+        system_content.push_str(
                 "\n\n## SESSION MODE\n\
                  When investigating within a multi-turn session, you MAY ask the user a clarifying \
                  question if you encounter genuine ambiguity that would significantly change your \
@@ -547,8 +535,7 @@ async fn investigate(
                  Do NOT ask for confirmation of routine actions. Do NOT ask permission to use tools. \
                  Only ask when two or more investigation paths are roughly equally promising and \
                  the user's preference would save significant time.",
-            );
-        }
+        );
 
         // NOTE: restored working memory is intentionally NOT spliced into this
         // system message. Mutating message[0] every turn invalidates the LLM
@@ -660,7 +647,7 @@ async fn investigate(
 
     // Send SessionCreated event for new sessions so frontend gets the ID
     let session_id_clone = session_id.clone();
-    if is_new_session && session_mode {
+    if is_new_session {
         let _ = tx
             .send(AgentEvent::SessionCreated {
                 session_id: session_id_clone.clone(),
@@ -745,7 +732,6 @@ async fn investigate(
     let query_api = state.query_api.clone();
     let tenant_id_for_task = req.tenant_id.clone();
     let session_id_for_task = session_id.clone();
-    let session_mode_for_task = session_mode;
     let restored_mem = restored_memory;
     let cancellation = CancellationToken::new();
     let task_cancellation = cancellation.clone();
@@ -821,52 +807,50 @@ async fn investigate(
         )) = result
         {
             // Persist assistant turn and updated working memory
-            if session_mode_for_task {
-                let turn_index = query_api
-                    .count_turns(&tenant_id_for_task, &session_id_for_task)
-                    .await
-                    .unwrap_or(0);
-                let turn_id = uuid::Uuid::new_v4().to_string();
-                let kind_str = match report_kind {
-                    agent::stream::ReportKind::Final => "final",
-                    agent::stream::ReportKind::Preliminary => "preliminary",
-                    agent::stream::ReportKind::Question => "question",
-                };
-                let _ = query_api
-                    .add_turn(
-                        &tenant_id_for_task,
-                        &turn_id,
-                        &session_id_for_task,
-                        turn_index,
-                        "assistant",
-                        &summary_text,
-                        &saved_activity_json,
-                        kind_str,
-                    )
-                    .await;
+            let turn_index = query_api
+                .count_turns(&tenant_id_for_task, &session_id_for_task)
+                .await
+                .unwrap_or(0);
+            let turn_id = uuid::Uuid::new_v4().to_string();
+            let kind_str = match report_kind {
+                agent::stream::ReportKind::Final => "final",
+                agent::stream::ReportKind::Preliminary => "preliminary",
+                agent::stream::ReportKind::Question => "question",
+            };
+            let _ = query_api
+                .add_turn(
+                    &tenant_id_for_task,
+                    &turn_id,
+                    &session_id_for_task,
+                    turn_index,
+                    "assistant",
+                    &summary_text,
+                    &saved_activity_json,
+                    kind_str,
+                )
+                .await;
 
-                // Persist memory + accumulated tokens (+ status for final
-                // reports) in one read + one versioned insert instead of
-                // three read-modify-write cycles.
-                let mem_json =
-                    serde_json::to_string(&final_memory).unwrap_or_else(|_| "{}".to_string());
-                let status = if report_kind == agent::stream::ReportKind::Final {
-                    Some("completed")
-                } else {
-                    None
-                };
-                let _ = query_api
-                    .update_session_after_turn(
-                        &tenant_id_for_task,
-                        &session_id_for_task,
-                        &mem_json,
-                        total_prompt,
-                        total_completion,
-                        &llm_model_used,
-                        status,
-                    )
-                    .await;
-            }
+            // Persist memory + accumulated tokens (+ status for final
+            // reports) in one read + one versioned insert instead of
+            // three read-modify-write cycles.
+            let mem_json =
+                serde_json::to_string(&final_memory).unwrap_or_else(|_| "{}".to_string());
+            let status = if report_kind == agent::stream::ReportKind::Final {
+                Some("completed")
+            } else {
+                None
+            };
+            let _ = query_api
+                .update_session_after_turn(
+                    &tenant_id_for_task,
+                    &session_id_for_task,
+                    &mem_json,
+                    total_prompt,
+                    total_completion,
+                    &llm_model_used,
+                    status,
+                )
+                .await;
         }
         if was_cancelled {
             task_metrics.investigation_cancelled(investigation_started.elapsed());
@@ -900,6 +884,27 @@ async fn list_investigation_templates() -> Json<serde_json::Value> {
 mod tests {
     use super::*;
     use crate::agent::contracts::ToolResultEnvelope;
+
+    #[test]
+    fn saved_activity_redacts_credentials_before_persistence() {
+        let mut activity = SavedActivityLog::default();
+        activity.push(&AgentEvent::ToolCall {
+            name: "search_logs".into(),
+            args: serde_json::json!({"filter":"password=dummy-argument"}),
+        });
+        activity.push(&AgentEvent::ToolResult {
+            name: "search_logs".into(),
+            data: "Authorization: Bearer dummy-result".into(),
+            provenance: Box::new(ToolResultEnvelope::from_legacy(
+                "search_logs",
+                &serde_json::json!({}),
+                "",
+                None,
+            )),
+        });
+        assert!(!activity.to_json().contains("dummy-"));
+        assert!(activity.to_json().contains("redacted"));
+    }
 
     #[test]
     fn saved_activity_keeps_tool_calls_and_results_in_order() {

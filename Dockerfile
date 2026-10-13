@@ -1,5 +1,5 @@
 # 1.88+ required: the agent uses `let`-chains (if let … && …), stabilized in Rust 1.88.
-FROM rust:1.98-slim AS builder
+FROM rust:1.99-slim AS builder
 
 RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
 

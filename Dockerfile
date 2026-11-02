@@ -11,7 +11,7 @@ RUN cargo build --locked --release --bin sre-agent
 
 # Minimal glibc runtime with CA certificates, without a shell or package manager.
 # Pin the multi-architecture index; Dependabot tracks updates to the latest tag.
-FROM cgr.dev/chainguard/glibc-dynamic:latest@sha256:5380a8b913d0900cf44180e2205bf3ebf0e0b00a32a0f2fa4ab16cb06d7f9cdf
+FROM cgr.dev/chainguard/glibc-dynamic:latest@sha256:709673274b417a48f56374da8a7633ef7b2f5b27e34612ce98a335737318cc94
 
 COPY --from=builder /app/target/release/sre-agent /usr/local/bin/sre-agent
 

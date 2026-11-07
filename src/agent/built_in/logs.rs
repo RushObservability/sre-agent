@@ -5,6 +5,24 @@ use serde_json::{Value, json};
 
 pub struct SearchLogs;
 
+/// Message template matching query-api's `LOG_BODY_TEMPLATE`: UUIDs, then
+/// runs of digits, collapse so variants of one message group together.
+fn message_template(body: &str) -> String {
+    static PATTERNS: std::sync::OnceLock<[regex::Regex; 2]> = std::sync::OnceLock::new();
+    let [uuid, digits] = PATTERNS.get_or_init(|| {
+        [
+            regex::Regex::new(
+                "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+            )
+            .expect("valid uuid pattern"),
+            regex::Regex::new("[0-9]+").expect("valid digits pattern"),
+        ]
+    });
+    let without_uuids = uuid.replace_all(body, "UUID");
+    let template = digits.replace_all(&without_uuids, "N");
+    crate::agent::memory::truncate_at_char_boundary(&template, 120).to_string()
+}
+
 #[cfg(test)]
 /// Legacy SQL-shape regression fixture. Every interpolated string value is
 /// escaped with the ClickHouse-standard doubled single quote (`''`); the
@@ -251,9 +269,7 @@ impl Tool for SearchLogs {
         let mut pattern_counts: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
         for r in &rows {
-            // Use first 120 chars as pattern key
-            let key = crate::agent::memory::truncate_at_char_boundary(&r.body, 120);
-            *pattern_counts.entry(key.to_string()).or_default() += 1;
+            *pattern_counts.entry(message_template(&r.body)).or_default() += 1;
         }
 
         let total = rows.len();
@@ -274,13 +290,12 @@ impl Tool for SearchLogs {
             }
         }
 
-        // Show individual entries (deduplicated to unique messages)
+        // Show one example entry per message template
         out.push_str("\nRecent entries:\n");
         let mut seen = std::collections::HashSet::new();
         let mut shown = 0;
         for r in &rows {
-            let key = crate::agent::memory::truncate_at_char_boundary(&r.body, 120);
-            if seen.insert(key.to_string()) {
+            if seen.insert(message_template(&r.body)) {
                 out.push_str(&format!(
                     "  [{ts}] [{sev}] {svc}: {body}{correlation}{attrs}\n",
                     ts = crate::query_api::format_nanos_timestamp(r.timestamp),
@@ -324,7 +339,23 @@ impl Tool for SearchLogs {
 
 #[cfg(test)]
 mod tests {
-    use super::build_search_logs_sql;
+    use super::{build_search_logs_sql, message_template};
+
+    #[test]
+    fn message_variants_share_a_template() {
+        assert_eq!(
+            message_template("order 42 failed for 0f8fad5b-d9cb-469f-a165-70867728950e"),
+            message_template("order 1337 failed for 7c9e6679-7425-40de-944b-e07fc1f90ae7"),
+        );
+        assert_eq!(
+            message_template("retry 3 of 5 after 250ms"),
+            "retry N of N after Nms"
+        );
+        assert_ne!(
+            message_template("connection refused"),
+            message_template("connection reset")
+        );
+    }
 
     #[test]
     fn service_filter_present_when_set_absent_when_empty() {

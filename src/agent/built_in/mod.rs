@@ -4,6 +4,7 @@ mod argocd_tool;
 mod deploys;
 mod flux_tool;
 mod gitops_policy;
+mod insights;
 mod kube_tool;
 mod kubernetes_access;
 mod logs;
@@ -39,6 +40,7 @@ pub fn register_all(registry: &mut ToolRegistry) {
         Arc::new(advanced_analysis::DetectServiceSilence),
         Arc::new(deploys::ListDeploys),
         Arc::new(anomalies::GetAnomalyContext),
+        Arc::new(insights::GetInsights),
         Arc::new(past_incidents::SearchPastIncidents),
         Arc::new(postgres::InspectPostgresql),
         Arc::new(mysql::InspectMysql),

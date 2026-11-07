@@ -432,7 +432,7 @@ pub fn require_window_from_args(args: &serde_json::Value) -> Result<Investigatio
 fn source_family_for_tool(tool_name: &str) -> SourceFamily {
     match tool_name {
         "inspect_profiles" => SourceFamily::Profiles,
-        "search_logs" => SourceFamily::Logs,
+        "search_logs" | "get_insights" => SourceFamily::Logs,
         "get_argocd_app"
         | "get_flux_resource"
         | "kube_describe"

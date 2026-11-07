@@ -144,11 +144,32 @@ impl QueryApiClient {
         tenant_id: &str,
         body: &Value,
     ) -> Result<T> {
-        self.send_json(
-            self.request(Method::POST, tenant_id, "api/v1/query")?
-                .json(body),
-        )
-        .await
+        self.query(tenant_id, "/api/v1/query", body).await
+    }
+
+    async fn query<T: DeserializeOwned>(
+        &self,
+        tenant_id: &str,
+        path: &str,
+        body: &Value,
+    ) -> Result<T> {
+        let request = crate::query_contract::adapt(path, body).context("invalid query request")?;
+        self.execute_query(tenant_id, request).await
+    }
+
+    async fn execute_query<T: DeserializeOwned>(
+        &self,
+        tenant_id: &str,
+        request: Value,
+    ) -> Result<T> {
+        let envelope: Value = self
+            .send_json(
+                self.request(Method::POST, tenant_id, crate::query_contract::ENDPOINT)?
+                    .json(&request),
+            )
+            .await?;
+        crate::query_contract::decode(&serde_json::to_vec(&envelope)?, &request)
+            .context("query-api query contract mismatch")
     }
 
     /// Read only the fixed profile query endpoint using the investigation tenant.
@@ -190,11 +211,8 @@ impl QueryApiClient {
         tenant_id: &str,
         body: &Value,
     ) -> Result<T> {
-        self.send_json(
-            self.request(Method::POST, tenant_id, "api/v1/query/timeseries")?
-                .json(body),
-        )
-        .await
+        self.query(tenant_id, "/api/v1/query/timeseries", body)
+            .await
     }
 
     pub async fn query_logs<T: DeserializeOwned>(
@@ -202,11 +220,7 @@ impl QueryApiClient {
         tenant_id: &str,
         body: &Value,
     ) -> Result<T> {
-        self.send_json(
-            self.request(Method::POST, tenant_id, "api/v1/logs")?
-                .json(body),
-        )
-        .await
+        self.query(tenant_id, "/api/v1/logs", body).await
     }
 
     pub async fn get_trace<T: DeserializeOwned>(
@@ -260,14 +274,15 @@ impl QueryApiClient {
         if query.len() > 4096 || start > end {
             bail!("invalid PromQL range query");
         }
-        let mut url = self.url("prom/api/v1/query_range")?;
-        url.query_pairs_mut()
-            .append_pair("query", query)
-            .append_pair("start", &start.to_string())
-            .append_pair("end", &end.to_string())
-            .append_pair("step", &step.clamp(1, 3600).to_string());
-        self.send_json(self.request(Method::GET, tenant_id, url.as_str())?)
-            .await
+        let params = [
+            ("query", query.into()),
+            ("start", start.to_string()),
+            ("end", end.to_string()),
+            ("step", step.clamp(1, 3600).to_string()),
+        ];
+        let request = crate::query_contract::prom_request("/prom/api/v1/query_range", &params)
+            .context("invalid metric query")?;
+        self.execute_query(tenant_id, request).await
     }
 
     pub async fn prom_label_values(
@@ -711,6 +726,61 @@ mod tests {
         assert!(QueryApiClient::new("file:///tmp/query-api", "token".into()).is_err());
         assert!(QueryApiClient::new("http://user:pass@localhost:8080", "token".into()).is_err());
         assert!(QueryApiClient::new("http://localhost:8080", "token".into()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn telemetry_operations_use_the_versioned_contract_and_investigation_tenant() {
+        use axum::{Json, Router, http::HeaderMap, routing::post};
+        use std::sync::{Arc, Mutex};
+        let received = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let captured = received.clone();
+        let app = Router::new().route("/api/v1/query/execute", post(move |headers: HeaderMap, Json(body): Json<Value>| {
+            let captured = captured.clone();
+            async move {
+                assert_eq!(headers["x-rush-tenant"], "customer-a");
+                assert_eq!(headers["x-rush-internal-token"], "shared-secret");
+                assert_eq!(body["version"], "v1");
+                assert!(body.get("tenant_id").is_none());
+                captured.lock().unwrap().push(body.clone());
+                Json(json!({"version":"v1","signal":body["signal"],"operation":body["operation"],"data":{"rows":[]}}))
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client =
+            QueryApiClient::new(&format!("http://{address}"), "shared-secret".into()).unwrap();
+        let body = json!({"time_range":{"from":"2026-01-01T00:00:00Z","to":"2026-01-01T01:00:00Z"},
+            "filters":[{"field":"service_name","op":"=","value":"payments"}],"search":"timeout"});
+        assert_eq!(
+            client
+                .query_logs::<Value>("customer-a", &body)
+                .await
+                .unwrap(),
+            json!({"rows":[]})
+        );
+        client
+            .query_spans::<Value>("customer-a", &body)
+            .await
+            .unwrap();
+        client
+            .query_span_timeseries::<Value>("customer-a", &body)
+            .await
+            .unwrap();
+        client
+            .prom_query_range::<Value>("customer-a", "up", 1767225600, 1767229200, 15)
+            .await
+            .unwrap();
+        assert!(client.query_logs::<Value>("_audit", &body).await.is_err());
+        let requests = received.lock().unwrap();
+        assert_eq!(requests.len(), 4);
+        assert_eq!(requests[0]["filters"], body["filters"]);
+        assert_eq!(requests[1]["signal"], "spans");
+        assert_eq!(requests[2]["operation"], "timeseries");
+        assert_eq!(requests[3]["options"], json!({"query":"up","step":"15"}));
+        server.abort();
     }
 
     #[test]

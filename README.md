@@ -58,6 +58,7 @@ query-api's tamper-evident audit log without tokens or source contents.
 |---|---|
 | `query_traces` / `get_trace` | search spans; pull a full trace by ID |
 | `search_logs` | logs by severity and text |
+| `get_insights` | quick overview: anomalies in the window, repeated WARN/ERROR log patterns, health score |
 | `query_metrics` | request rate, error rate, p50/p99 |
 | `list_services` / `service_dependencies` | health snapshot; call graph |
 | `compare_service_windows` / `rank_slow_dependencies` | incident-vs-baseline service comparison; slow downstream ranking |

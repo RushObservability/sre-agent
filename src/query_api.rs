@@ -353,6 +353,20 @@ impl QueryApiClient {
         )
         .await
     }
+    /// Pass `minutes` for "now", or `from`/`to` for an earlier window.
+    pub async fn get_insights<T: DeserializeOwned>(
+        &self,
+        tenant_id: &str,
+        minutes: Option<u64>,
+        from: Option<&str>,
+        to: Option<&str>,
+    ) -> Result<T> {
+        self.context(
+            tenant_id,
+            json!({"operation":"get_insights","minutes":minutes,"from":from,"to":to}),
+        )
+        .await
+    }
     pub async fn get_setting(&self, tenant_id: &str, key: &str) -> Result<Option<String>> {
         self.context(tenant_id, json!({"operation":"get_setting","key":key}))
             .await

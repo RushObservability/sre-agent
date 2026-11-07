@@ -10,6 +10,7 @@ pub mod metrics;
 pub mod models;
 pub mod process_metrics;
 pub mod query_api;
+mod query_contract;
 pub mod repository;
 pub mod state;
 

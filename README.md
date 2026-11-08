@@ -107,9 +107,10 @@ continues with traces, logs, and metrics rather than calling the app healthy.
 
 ## Running it
 
-Needs a running query-api. Provider connections and API keys are configured in
-**Settings → AI Agent → Providers**. The agent never connects to ClickHouse or
-receives database or LLM credentials.
+Needs a running query-api v0.1.11 or later, since every telemetry query goes
+through its versioned endpoint, `/api/v1/query/execute`. Provider connections
+and API keys are configured in **Settings → AI Agent → Providers**. The agent
+never connects to ClickHouse or receives database or LLM credentials.
 
 ```bash
 export QUERY_API_URL=http://localhost:8080

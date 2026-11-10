@@ -47,6 +47,7 @@ pub fn register_all(registry: &mut ToolRegistry) {
         Arc::new(repository_tools::ListRepositoryFiles),
         Arc::new(repository_tools::SearchRepository),
         Arc::new(repository_tools::ReadRepositoryFile),
+        Arc::new(repository_tools::ListChanges),
         Arc::new(skills_tool::LoadSkill),
         Arc::new(argocd_tool::GetArgocdApp),
         Arc::new(flux_tool::GetFluxResource),

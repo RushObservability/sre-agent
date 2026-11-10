@@ -107,7 +107,7 @@ pub fn all_skills() -> HashMap<&'static str, Skill> {
 ## Quick Assessment
 1. **List recent deploys** — Use `list_deploys` for the affected service and nearby services.
 2. **Timeline match** — Does the anomaly start within minutes of a deploy? Strong correlation = high confidence.
-3. **Version comparison** — Note the version/commit before and after. The diff is your suspect.
+3. **Version comparison** — Note the version/commit before and after. The diff is your suspect: when code scope is available, `list_changes` with the incident start as `around` lists the PRs, commits, and changed files between the two deploys.
 
 ## Diagnostic Checklist
 - [ ] Which service was deployed? Was it the affected service or an upstream/downstream?

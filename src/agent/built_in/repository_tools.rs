@@ -1,6 +1,7 @@
 use crate::agent::tools::{Tool, ToolContext};
+use crate::models::anomaly::DeployMarker;
 use crate::models::service_link::ServiceLink;
-use crate::repository::{ensure_snapshot, resolve_under};
+use crate::repository::{Comparison, compare_revisions, ensure_snapshot, resolve_under};
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -23,6 +24,11 @@ struct RevisionInfo {
 pub struct ListRepositoryFiles;
 pub struct SearchRepository;
 pub struct ReadRepositoryFile;
+pub struct ListChanges;
+
+const MAX_CHANGE_PULLS: usize = 60;
+const MAX_CHANGE_COMMITS: usize = 40;
+const MAX_PATCH_LINES: usize = 60;
 
 fn require_code_scope(ctx: &ToolContext) -> Result<()> {
     if !ctx.has_scope("code") {
@@ -474,6 +480,255 @@ impl Tool for ReadRepositoryFile {
     }
 }
 
+/// The deploy running at the requested time (the newest marker, since markers
+/// arrive newest first and already end at that time) and the newest earlier
+/// deploy in the same environment with a different commit.
+fn select_deploys(markers: &[DeployMarker]) -> Result<(&DeployMarker, &DeployMarker)> {
+    let Some(head) = markers.first() else {
+        bail!("no deploys are recorded for this service at or before that time")
+    };
+    let head_sha = head.commit_sha.trim();
+    if head_sha.is_empty() {
+        bail!(
+            "the deploy running then ({} at {}) has no commit SHA; send commit_sha with the deploy event to compare deploys",
+            head.version,
+            head.deployed_at
+        )
+    }
+    let base = markers[1..]
+        .iter()
+        .find(|marker| {
+            let sha = marker.commit_sha.trim();
+            marker.environment == head.environment && !sha.is_empty() && sha != head_sha
+        })
+        .context("no earlier deploy with a different commit SHA to compare against")?;
+    Ok((head, base))
+}
+
+/// PR number and title from a merge commit ("Merge pull request #12 from ...")
+/// or a squash merge ("Title (#12)"). Rebase merges carry no PR reference.
+fn pull_request(message: &str) -> Option<(u64, String)> {
+    let mut lines = message.lines();
+    let first = lines.next()?.trim();
+    if let Some(rest) = first.strip_prefix("Merge pull request #") {
+        let number = rest.split_whitespace().next()?.parse().ok()?;
+        let title = lines
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .unwrap_or("");
+        return Some((number, title.to_string()));
+    }
+    let open = first.rfind("(#")?;
+    let number = first[open + 2..].strip_suffix(')')?.parse().ok()?;
+    Some((number, first[..open].trim_end().to_string()))
+}
+
+fn short_sha(sha: &str) -> &str {
+    sha.get(..12).unwrap_or(sha)
+}
+
+fn describe_deploy(marker: &DeployMarker) -> String {
+    let mut text = format!(
+        "{} (version {}, deployed {}",
+        short_sha(marker.commit_sha.trim()),
+        if marker.version.is_empty() {
+            "unknown"
+        } else {
+            marker.version.as_str()
+        },
+        marker.deployed_at
+    );
+    if !marker.deployed_by.is_empty() {
+        text.push_str(&format!(" by {}", marker.deployed_by));
+    }
+    if !marker.environment.is_empty() {
+        text.push_str(&format!(", {}", marker.environment));
+    }
+    text.push(')');
+    text
+}
+
+fn format_changes(
+    link: &ServiceLink,
+    head: &DeployMarker,
+    base: &DeployMarker,
+    comparison: &Comparison,
+) -> String {
+    let mut out = format!(
+        "Repository: {}\nSuspect deploy: {}\nPrevious deploy: {}\nGitHub: {}, {} commit(s) between them\n",
+        link.github_repo,
+        describe_deploy(head),
+        describe_deploy(base),
+        comparison.status,
+        comparison.total_commits
+    );
+    if comparison.status == "behind" || comparison.status == "diverged" {
+        out.push_str("Note: the suspect deploy is not ahead of the previous one, so it may be a rollback or a deploy from another branch.\n");
+    }
+
+    let mut pulls = Vec::new();
+    let mut others = Vec::new();
+    for commit in &comparison.commits {
+        let author = commit.commit.author.as_ref();
+        let who = commit
+            .author
+            .as_ref()
+            .map(|user| user.login.as_str())
+            .or(author.map(|a| a.name.as_str()))
+            .unwrap_or("unknown");
+        let when = author.map(|a| a.date.as_str()).unwrap_or("");
+        let message = crate::agent::redact::text(&commit.commit.message);
+        match pull_request(&message) {
+            Some((number, title)) => pulls.push(format!(
+                "- #{number} {title} (merged {when} by {who}, commit {})",
+                short_sha(&commit.sha)
+            )),
+            None => others.push(format!(
+                "- {} {when} {who}: {}",
+                short_sha(&commit.sha),
+                message.lines().next().unwrap_or("").trim()
+            )),
+        }
+    }
+    // GitHub lists commits oldest first; the newest are the likelier suspects.
+    pulls.reverse();
+    others.reverse();
+    if !pulls.is_empty() {
+        let shown = pulls.len().min(MAX_CHANGE_PULLS);
+        out.push_str(&format!("\nPull requests ({shown} of {}):\n", pulls.len()));
+        out.push_str(&pulls[..shown].join("\n"));
+        out.push('\n');
+    }
+    if !others.is_empty() {
+        let shown = others.len().min(MAX_CHANGE_COMMITS);
+        out.push_str(&format!("\nOther commits ({shown} of {}):\n", others.len()));
+        out.push_str(&others[..shown].join("\n"));
+        out.push('\n');
+    }
+
+    let root = link.root_path.trim().trim_matches('/');
+    let files: Vec<_> = comparison
+        .files
+        .iter()
+        .filter(|file| root.is_empty() || file.filename.starts_with(&format!("{root}/")))
+        .collect();
+    // Headroom for the closing "more files" line.
+    let budget = MAX_TOOL_OUTPUT - 64;
+    let outside_root = comparison.files.len() - files.len();
+    out.push_str(&format!("\nChanged files ({}", files.len()));
+    if outside_root > 0 {
+        out.push_str(&format!(", {outside_root} outside {root}/ omitted"));
+    }
+    out.push_str("):\n");
+    for (index, file) in files.iter().enumerate() {
+        let entry = format!(
+            "- {} {} (+{} -{})\n",
+            file.status, file.filename, file.additions, file.deletions
+        );
+        if out.len() + entry.len() > budget {
+            out.push_str(&format!("[{} more files not shown]\n", files.len() - index));
+            break;
+        }
+        out.push_str(&entry);
+        if require_safe_path(Path::new(&file.filename)).is_err() {
+            out.push_str("  (diff withheld: credential file)\n");
+            continue;
+        }
+        let Some(patch) = &file.patch else { continue };
+        let patch = crate::agent::redact::text(patch);
+        let lines: Vec<_> = patch.lines().collect();
+        let mut diff = lines[..lines.len().min(MAX_PATCH_LINES)].join("\n");
+        if lines.len() > MAX_PATCH_LINES {
+            diff.push_str(&format!(
+                "\n[{} more diff lines]",
+                lines.len() - MAX_PATCH_LINES
+            ));
+        }
+        let block = format!("```diff\n{diff}\n```\n");
+        // Past the budget, keep listing file names without their diffs.
+        if out.len() + block.len() <= budget {
+            out.push_str(&block);
+        }
+    }
+    out
+}
+
+impl ListChanges {
+    async fn run(&self, args: Value, ctx: &ToolContext) -> Result<String> {
+        require_code_scope(ctx)?;
+        let service = required_string(&args, "service_name")?;
+        let around = args
+            .get("around")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| {
+                chrono::DateTime::parse_from_rfc3339(value)
+                    .map(|time| {
+                        time.with_timezone(&chrono::Utc)
+                            .format("%Y-%m-%dT%H:%M:%SZ")
+                            .to_string()
+                    })
+                    .context("around must be an ISO 8601 timestamp")
+            })
+            .transpose()?;
+        let link = ctx
+            .state
+            .query_api
+            .get_service_link(&ctx.tenant_id, service)
+            .await?
+            .with_context(|| {
+                format!("no repository is linked to service {service:?} in this tenant")
+            })?;
+        let markers = ctx
+            .state
+            .query_api
+            .list_deploy_markers(&ctx.tenant_id, Some(service), None, around.as_deref())
+            .await
+            .context("failed to list deploys")?;
+        let (head, base) = select_deploys(&markers)?;
+        let (base_sha, head_sha) = (base.commit_sha.trim(), head.commit_sha.trim());
+        let comparison = compare_revisions(
+            &ctx.tenant_id,
+            &link.github_repo,
+            link.github_installation_id,
+            link.github_repository_id,
+            base_sha,
+            head_sha,
+        )
+        .await?;
+        audit_access(ctx, &link, "compare", &format!("{base_sha}...{head_sha}"));
+        Ok(format_changes(&link, head, base, &comparison))
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for ListChanges {
+    fn name(&self) -> &str {
+        "list_changes"
+    }
+    fn description(&self) -> &str {
+        "List what a deploy changed: the pull requests, commits, and changed files with diffs between the service's deploy running at a given time and the deploy before it, from the GitHub repository linked to the service. Use it when an incident lines up with a deploy."
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "service_name": { "type": "string" },
+                "around": {
+                    "type": "string",
+                    "description": "ISO 8601 time, usually the incident start. Compares the deploy running then with the one before it. Defaults to the latest deploy."
+                }
+            },
+            "required": ["service_name"],
+            "additionalProperties": false
+        })
+    }
+    async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String> {
+        self.run(args, ctx).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -546,5 +801,145 @@ mod tests {
         assert!(header.contains("verified_revision"));
         assert!(header.contains("abc123"));
         assert!(header.contains("api@sha256:deadbeef"));
+    }
+
+    fn marker(sha: &str, environment: &str, deployed_at: &str) -> DeployMarker {
+        DeployMarker {
+            id: deployed_at.into(),
+            service_name: "api".into(),
+            version: format!("v-{sha}"),
+            commit_sha: sha.into(),
+            description: String::new(),
+            environment: environment.into(),
+            deployed_by: "ci".into(),
+            deployed_at: deployed_at.into(),
+        }
+    }
+
+    #[test]
+    fn deploy_selection_compares_the_running_deploy_with_the_previous_commit_in_its_environment() {
+        let markers = vec![
+            marker("cccccccc", "prod", "2026-11-08 10:00:00"),
+            marker("cccccccc", "prod", "2026-11-08 09:30:00"), // redeploy of the same commit
+            marker("dddddddd", "staging", "2026-11-08 09:00:00"),
+            marker("", "prod", "2026-11-08 08:30:00"),
+            marker("bbbbbbbb", "prod", "2026-11-08 08:00:00"),
+        ];
+        let (head, base) = select_deploys(&markers).unwrap();
+        assert_eq!(head.commit_sha, "cccccccc");
+        assert_eq!(base.commit_sha, "bbbbbbbb");
+
+        assert!(
+            select_deploys(&[])
+                .unwrap_err()
+                .to_string()
+                .contains("no deploys")
+        );
+        assert!(
+            select_deploys(&[
+                marker("", "prod", "now"),
+                marker("bbbbbbbb", "prod", "then")
+            ])
+            .unwrap_err()
+            .to_string()
+            .contains("no commit SHA")
+        );
+        assert!(
+            select_deploys(&[marker("cccccccc", "prod", "now")])
+                .unwrap_err()
+                .to_string()
+                .contains("no earlier deploy")
+        );
+    }
+
+    #[test]
+    fn pull_requests_are_read_from_merge_and_squash_commit_messages() {
+        assert_eq!(
+            pull_request("Merge pull request #412 from acme/fix-retry\n\nFix retry timeout"),
+            Some((412, "Fix retry timeout".into()))
+        );
+        assert_eq!(
+            pull_request("Fix retry timeout (#413)\n\n* body"),
+            Some((413, "Fix retry timeout".into()))
+        );
+        assert_eq!(pull_request("Bump tokio"), None);
+        assert_eq!(pull_request("Explain (#notes)"), None);
+    }
+
+    fn comparison(status: &str, files: Value) -> Comparison {
+        serde_json::from_value(json!({
+            "status": status,
+            "total_commits": 3,
+            "commits": [
+                {"sha": "1111111111111111", "commit": {"message": "Merge pull request #10 from acme/a\n\nAdd cache", "author": {"name": "Bo", "date": "2026-11-08T08:10:00Z"}}, "author": {"login": "bo"}},
+                {"sha": "2222222222222222", "commit": {"message": "Raise retry timeout (#11)", "author": {"name": "Al", "date": "2026-11-08T09:10:00Z"}}, "author": null},
+                {"sha": "3333333333333333", "commit": {"message": "Tidy logging\n\nlonger body", "author": {"name": "Cy", "date": "2026-11-08T09:20:00Z"}}, "author": null}
+            ],
+            "files": files
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn changes_list_newest_pull_requests_first_and_withhold_credential_diffs() {
+        let text = format_changes(
+            &link(),
+            &marker("3333333333333333", "prod", "2026-11-08 10:00:00"),
+            &marker("0000000000000000", "prod", "2026-11-08 08:00:00"),
+            &comparison(
+                "ahead",
+                json!([
+                    {"filename": "src/client.rs", "status": "modified", "additions": 1, "deletions": 1, "patch": "@@ -1 +1 @@\n-timeout = 5\n+timeout = 30"},
+                    {"filename": "config/.env.production", "status": "modified", "additions": 1, "deletions": 0, "patch": "+TOKEN=abc"}
+                ]),
+            ),
+        );
+        let newest = text.find("#11 Raise retry timeout").unwrap();
+        let older = text.find("#10 Add cache").unwrap();
+        assert!(newest < older, "{text}");
+        assert!(text.contains("by bo"));
+        assert!(text.contains("333333333333 2026-11-08T09:20:00Z Cy: Tidy logging"));
+        assert!(text.contains("+timeout = 30"));
+        assert!(text.contains("diff withheld: credential file"));
+        assert!(!text.contains("TOKEN=abc"));
+        assert!(!text.contains("rollback"));
+    }
+
+    #[test]
+    fn changes_respect_the_service_root_and_flag_rollbacks() {
+        let mut monorepo = link();
+        monorepo.root_path = "services/api/".into();
+        let text = format_changes(
+            &monorepo,
+            &marker("1111111", "prod", "now"),
+            &marker("2222222", "prod", "then"),
+            &comparison(
+                "behind",
+                json!([
+                    {"filename": "services/api/main.go", "status": "modified", "additions": 1, "deletions": 0},
+                    {"filename": "services/web/main.go", "status": "modified", "additions": 1, "deletions": 0}
+                ]),
+            ),
+        );
+        assert!(text.contains("services/api/main.go"));
+        assert!(!text.contains("services/web/main.go"));
+        assert!(text.contains("1 outside services/api/ omitted"));
+        assert!(text.contains("may be a rollback"));
+    }
+
+    #[test]
+    fn changes_stay_within_the_tool_output_budget() {
+        let patch = format!("@@ -1 +1 @@\n{}", "+line\n".repeat(50));
+        let files: Vec<_> = (0..300)
+            .map(|i| json!({"filename": format!("src/f{i}.rs"), "status": "modified", "additions": 50, "deletions": 0, "patch": patch}))
+            .collect();
+        let text = format_changes(
+            &link(),
+            &marker("1111111", "prod", "now"),
+            &marker("2222222", "prod", "then"),
+            &comparison("ahead", Value::Array(files)),
+        );
+        assert!(text.len() <= MAX_TOOL_OUTPUT, "{}", text.len());
+        assert!(text.contains("more files not shown"));
     }
 }

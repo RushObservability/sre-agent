@@ -49,6 +49,10 @@ including cached access. The agent mints a short-lived installation token
 scoped by stable repository ID and `contents: read`, downloads a bounded
 tar snapshot, rejects links/special files/path traversal, and exposes only
 `list_repository_files`, `search_repository`, and `read_repository_file`.
+`list_changes` uses the same token to call GitHub's compare endpoint between the
+commit SHAs of two deploy markers, so deploy events need `commit_sha`. PR
+numbers and titles come from merge and squash commit messages, which needs no
+extra GitHub permission; rebase merges show as plain commits.
 Repository code is never executed. Successful source reads are sent to
 query-api's tamper-evident audit log without tokens or source contents.
 
@@ -72,6 +76,7 @@ query-api's tamper-evident audit log without tokens or source contents.
 | `kube_describe` / `kube_events` | describe resources in the caller's mapped namespaces; namespace events |
 | `search_kubernetes_access` | correlate a suspected operator action with tenant-scoped Kubernetes access metadata when the paid add-on is enabled |
 | `list_repository_files` / `search_repository` / `read_repository_file` | bounded, read-only access to operator-approved GitHub repositories |
+| `list_changes` | PRs, commits, and changed files (with bounded diffs) between the deploy running at a given time and the previous deploy |
 | `load_skill` | load an investigation playbook |
 
 The built-in skills are `error_rate_spike`, `latency_degradation`,

@@ -77,7 +77,7 @@ Follow "Statistics Before Samples" — always start with aggregate data, then dr
 Understand the scope before diving in.
 - What service(s) are affected?
 - What metric is anomalous? (error rate, latency, throughput)
-- When did it start? Check for deploy correlation first — `list_deploys` is cheap.
+- When did it start? Check for deploy correlation first — `list_deploys` is cheap. When a deploy lines up and code scope is available, call `list_changes` with the incident start as `around` to see the PRs, commits, and diffs it shipped.
 - Use `list_services` to get a system-wide health snapshot.
 - Call `search_past_incidents` with the affected service/symptom — prior resolved investigations are strong **priors** for likely root causes. Treat them as leads to verify with fresh evidence, NOT as facts; the current incident may differ.
 

@@ -1,4 +1,5 @@
-//! Read-only GitHub source snapshots for code-assisted investigations.
+//! Read-only GitHub source snapshots and commit comparisons for code-assisted
+//! investigations.
 //!
 //! This module deliberately does not invoke `git` or a shell. It downloads a
 //! GitHub archive using a short-lived App installation token, rejects links and
@@ -20,6 +21,7 @@ use tar::Archive;
 use tokio::sync::Mutex;
 
 const MAX_ARCHIVE_BYTES: usize = 50 * 1024 * 1024;
+const MAX_COMPARE_BYTES: usize = 10 * 1024 * 1024;
 const MAX_EXPANDED_BYTES: u64 = 250 * 1024 * 1024;
 const MAX_FILE_BYTES: u64 = 5 * 1024 * 1024;
 const MAX_FILES: usize = 25_000;
@@ -310,22 +312,148 @@ async fn download_archive(
         .await?
         .error_for_status()
         .context("GitHub repository archive download failed")?;
+    read_limited(response, MAX_ARCHIVE_BYTES, "repository archive").await
+}
+
+async fn read_limited(response: reqwest::Response, limit: usize, what: &str) -> Result<Vec<u8>> {
     if response
         .content_length()
-        .is_some_and(|size| size > MAX_ARCHIVE_BYTES as u64)
+        .is_some_and(|size| size > limit as u64)
     {
-        bail!("repository archive is larger than the configured limit")
+        bail!("{what} is larger than the configured limit")
     }
     let mut bytes = Vec::new();
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
-        if bytes.len().saturating_add(chunk.len()) > MAX_ARCHIVE_BYTES {
-            bail!("repository archive is larger than the configured limit")
+        if bytes.len().saturating_add(chunk.len()) > limit {
+            bail!("{what} is larger than the configured limit")
         }
         bytes.extend_from_slice(&chunk);
     }
     Ok(bytes)
+}
+
+/// What changed between two commits, from GitHub's compare endpoint. GitHub
+/// returns at most 250 commits and 300 files on the first page.
+#[derive(Debug, Deserialize)]
+pub struct Comparison {
+    /// ahead, behind, diverged, or identical: head relative to base.
+    pub status: String,
+    #[serde(default)]
+    pub total_commits: u64,
+    #[serde(default)]
+    pub commits: Vec<ComparedCommit>,
+    #[serde(default)]
+    pub files: Vec<ChangedFile>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ComparedCommit {
+    pub sha: String,
+    pub commit: CommitDetail,
+    /// The GitHub account, when the commit email maps to one.
+    pub author: Option<GitHubUser>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CommitDetail {
+    pub message: String,
+    pub author: Option<CommitAuthor>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CommitAuthor {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub date: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GitHubUser {
+    pub login: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ChangedFile {
+    pub filename: String,
+    pub status: String,
+    #[serde(default)]
+    pub additions: u64,
+    #[serde(default)]
+    pub deletions: u64,
+    /// Absent for binary files and very large diffs.
+    pub patch: Option<String>,
+}
+
+fn is_commit_sha(value: &str) -> bool {
+    (7..=40).contains(&value.len()) && value.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+async fn fetch_comparison(
+    client: &reqwest::Client,
+    api_base: &str,
+    token: &str,
+    owner: &str,
+    repository: &str,
+    base: &str,
+    head: &str,
+) -> Result<Comparison> {
+    let mut url = reqwest::Url::parse(api_base)?;
+    url.path_segments_mut()
+        .map_err(|_| anyhow::anyhow!("invalid GitHub API URL"))?
+        .extend([
+            "repos",
+            owner,
+            repository,
+            "compare",
+            &format!("{base}...{head}"),
+        ]);
+    url.query_pairs_mut().append_pair("per_page", "100");
+    let response = client
+        .get(url)
+        .bearer_auth(token)
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .header("User-Agent", "rush-sre-agent")
+        .send()
+        .await?
+        .error_for_status()
+        .context("GitHub commit comparison failed")?;
+    let body = read_limited(response, MAX_COMPARE_BYTES, "commit comparison").await?;
+    serde_json::from_slice(&body).context("unexpected GitHub commit comparison response")
+}
+
+/// Compare two commits of an approved repository with the same tenant grant
+/// and `contents: read` token the snapshots use.
+pub async fn compare_revisions(
+    tenant_id: &str,
+    repository: &str,
+    installation_id: u64,
+    repository_id: u64,
+    base: &str,
+    head: &str,
+) -> Result<Comparison> {
+    let config = GitHubAppConfig::from_env()?;
+    let canonical_repository = authorize_repository(
+        &config.repository_policy,
+        tenant_id,
+        repository,
+        installation_id,
+        repository_id,
+    )?;
+    if !is_commit_sha(base) || !is_commit_sha(head) {
+        bail!("deploy commit SHAs must be 7 to 40 hex characters to compare them")
+    }
+    let (owner, name) = parse_repository(&canonical_repository)?;
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::limited(3))
+        .build()?;
+    let token = installation_token(&client, &config, installation_id, repository_id).await?;
+    fetch_comparison(&client, &config.api_base, &token, &owner, &name, base, head).await
 }
 
 pub async fn ensure_snapshot(
@@ -496,6 +624,62 @@ mod tests {
                 "permissions": { "contents": "read" }
             })
         );
+    }
+
+    #[test]
+    fn commit_sha_check_accepts_only_hex_shas() {
+        assert!(is_commit_sha("abc1234"));
+        assert!(is_commit_sha(&"a".repeat(40)));
+        assert!(!is_commit_sha("abc123"));
+        assert!(!is_commit_sha(&"a".repeat(41)));
+        assert!(!is_commit_sha("main"));
+        assert!(!is_commit_sha("v1.2.3"));
+        assert!(!is_commit_sha("abc1234/../x"));
+    }
+
+    #[tokio::test]
+    async fn comparison_requests_the_three_dot_range_with_the_installation_token() {
+        use axum::{Router, extract::Path as UrlPath, http::HeaderMap, routing::get};
+        let app = Router::new().route(
+            "/repos/{owner}/{repo}/compare/{range}",
+            get(
+                |UrlPath((owner, repo, range)): UrlPath<(String, String, String)>,
+                 headers: HeaderMap| async move {
+                    assert_eq!((owner.as_str(), repo.as_str()), ("acme", "api"));
+                    assert_eq!(range, "1111111...2222222");
+                    assert_eq!(headers["authorization"], "Bearer installation-token");
+                    axum::Json(serde_json::json!({
+                        "status": "ahead",
+                        "total_commits": 1,
+                        "commits": [{
+                            "sha": "2222222",
+                            "commit": {"message": "Fix retry timeout (#412)", "author": {"name": "Alice", "date": "2026-11-08T10:00:00Z"}},
+                            "author": null
+                        }],
+                        "files": [{"filename": "src/client.rs", "status": "modified", "additions": 2, "deletions": 1, "patch": "@@ -1 +1 @@\n-a\n+b"}]
+                    }))
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let comparison = fetch_comparison(
+            &reqwest::Client::new(),
+            &format!("http://{address}"),
+            "installation-token",
+            "acme",
+            "api",
+            "1111111",
+            "2222222",
+        )
+        .await
+        .unwrap();
+        assert_eq!(comparison.status, "ahead");
+        assert_eq!(comparison.total_commits, 1);
+        assert!(comparison.commits[0].author.is_none());
+        assert_eq!(comparison.files[0].filename, "src/client.rs");
     }
 
     #[test]

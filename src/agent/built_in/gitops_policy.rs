@@ -1,5 +1,5 @@
 use super::kube_tool::namespace_allowed_for;
-use crate::agent::tools::ToolContext;
+use crate::agent::tools::{ToolContext, scope_allows};
 use anyhow::{Result, bail};
 use kube::api::DynamicObject;
 use serde_json::Value;
@@ -37,17 +37,14 @@ impl GitOpsPolicy {
             bail!("GitOps controller is not enabled");
         };
         validate_namespace(controller_namespace)?;
-        if !scopes
-            .iter()
-            .any(|scope| scope == "all" || scope == "kubernetes")
-        {
+        if !scope_allows(scopes, "kubernetes") {
             bail!("Kubernetes scope is required for GitOps reads");
         }
         Ok(Self {
             controller_namespace: controller_namespace.to_string(),
             tenant_id: tenant_id.to_string(),
             namespaces: namespaces.map(str::to_string),
-            cluster_reads: cluster_reads && scopes.iter().any(|scope| scope == "kube_cluster"),
+            cluster_reads: cluster_reads && scope_allows(scopes, "kube_cluster"),
         })
     }
 
@@ -249,7 +246,15 @@ mod tests {
                 .is_err()
             );
         }
-        for scopes in [vec![], vec!["logs".into()], vec!["kube_cluster".into()]] {
+        let telemetry_only = ["logs", "traces", "metrics", "profiles"]
+            .map(String::from)
+            .to_vec();
+        for scopes in [
+            vec![],
+            vec!["logs".into()],
+            vec!["kube_cluster".into()],
+            telemetry_only,
+        ] {
             assert!(
                 GitOpsPolicy::new("tenant-a", &scopes, Some("argocd"), Some(NAMESPACES), true)
                     .is_err()

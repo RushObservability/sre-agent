@@ -23,15 +23,17 @@ pub struct ToolContext {
 impl ToolContext {
     /// Returns true if the caller has access to the given signal type.
     /// The "all" scope grants access to telemetry and namespaced
-    /// infrastructure tools. Source code and cluster-wide Kubernetes reads are
-    /// intentionally separate: they always require an explicit scope so adding
-    /// a new tool cannot widen existing callers.
+    /// infrastructure (`kubernetes`) tools. Source code and cluster-wide
+    /// Kubernetes reads are intentionally separate: they always require an
+    /// explicit scope so adding a new tool cannot widen existing callers.
+    /// API keys are sent the telemetry signals by name (no "all"), so they
+    /// never reach `kubernetes`, `code`, or `kube_cluster`.
     pub fn has_scope(&self, signal: &str) -> bool {
         scope_allows(&self.scopes, signal)
     }
 }
 
-fn scope_allows(scopes: &[String], signal: &str) -> bool {
+pub(crate) fn scope_allows(scopes: &[String], signal: &str) -> bool {
     if matches!(signal, "code" | "kube_cluster") {
         scopes.iter().any(|scope| scope == signal)
     } else {
@@ -171,6 +173,22 @@ mod tests {
             "code"
         ));
         assert!(scope_allows(&["all".to_string()], "logs"));
+    }
+
+    #[test]
+    fn telemetry_only_scopes_exclude_kubernetes_code_and_cluster() {
+        let telemetry: Vec<String> = ["logs", "traces", "metrics", "profiles"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        for signal in ["logs", "traces", "metrics", "profiles"] {
+            assert!(scope_allows(&telemetry, signal), "{signal}");
+        }
+        for signal in ["kubernetes", "code", "kube_cluster"] {
+            assert!(!scope_allows(&telemetry, signal), "{signal}");
+        }
+        assert!(scope_allows(&["all".to_string()], "kubernetes"));
+        assert!(scope_allows(&["kubernetes".to_string()], "kubernetes"));
     }
 
     #[test]

@@ -5,6 +5,8 @@
 //! difficult to accidentally add tenant IDs, session IDs, queries, or arbitrary
 //! user/tool input as label values.
 
+pub mod loop_health;
+
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -35,6 +37,7 @@ impl Histogram {
 
 #[derive(Default)]
 pub struct AgentMetrics {
+    loop_health: loop_health::LoopHealthMetrics,
     investigations_in_flight: AtomicI64,
     investigations_queued: AtomicI64,
     investigations_started: AtomicU64,
@@ -596,6 +599,7 @@ impl AgentMetrics {
             "Query-api dependency request duration in seconds.",
             &self.query_api_duration,
         );
+        self.loop_health.render(&mut output);
         output
     }
 }

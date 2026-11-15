@@ -149,6 +149,13 @@ async fn earns_final_report() {
     .await
     .unwrap();
     drop(tx);
+    let metrics = ctx.state.metrics.render();
+    assert!(metrics.contains("sre_agent_investigation_stops_total{reason=\"final\"} 1"));
+    assert!(metrics.contains(&format!(
+        "sre_agent_investigation_llm_calls_sum {}",
+        server.calls()
+    )));
+    assert!(metrics.contains("sre_agent_investigation_llm_calls_count 1"));
 
     assert_eq!(
         kind,
@@ -227,6 +234,13 @@ async fn budget_exhaustion_preliminary() {
     .await
     .unwrap();
     drop(tx);
+    let metrics = ctx.state.metrics.render();
+    assert!(metrics.contains("sre_agent_investigation_stops_total{reason=\"budget_exhausted\"} 1"));
+    assert!(metrics.contains(&format!(
+        "sre_agent_investigation_llm_calls_sum {}",
+        server.calls()
+    )));
+    assert!(metrics.contains("sre_agent_investigation_llm_calls_count 1"));
 
     assert!(
         text.contains("Preliminary Investigation Report"),
@@ -293,6 +307,7 @@ async fn disconnect_abort() {
     let ctx = make_ctx().await;
     let (tx, mut rx) = mpsc::channel::<AgentEvent>(64);
 
+    let metrics = ctx.state.metrics.clone();
     let llm = llm_for(&server);
     let handle = tokio::spawn(async move {
         run_with_config_and_budget(
@@ -317,6 +332,12 @@ async fn disconnect_abort() {
     drop(rx);
 
     let (text, kind, _mem, _, _, _) = handle.await.unwrap().unwrap();
+    assert!(
+        metrics
+            .render()
+            .contains("sre_agent_investigation_stops_total{reason=\"disconnected\"} 1")
+    );
+
     assert!(
         text.contains("Client disconnected"),
         "early-return text mentions the disconnect: {text}"
@@ -688,6 +709,14 @@ async fn sse_oversized_line_errors_gracefully() {
     )
     .await;
     drop(tx);
+    let metrics = ctx.state.metrics.render();
+    assert!(metrics.contains("sre_agent_investigation_stops_total{reason=\"error\"} 1"));
+    assert!(metrics.contains(&format!(
+        "sre_agent_investigation_llm_calls_sum {}",
+        server.calls()
+    )));
+    assert!(metrics.contains("sre_agent_investigation_llm_calls_count 1"));
+
     let _ = collect_events(&mut rx).await;
 
     let err = result.expect_err("oversized line must error, not hang or panic");

@@ -11,6 +11,8 @@ use super::memory::{
 use super::stream::{AgentEvent, ReportKind};
 use super::tools::{ToolContext, ToolRegistry};
 use crate::cancellation::CancellationToken;
+use crate::metrics::loop_health::{Correction, LoopMetricsGuard, StopReason};
+use crate::metrics::streaming::{Channel, EventSender};
 
 /// Default target for real tool calls. The loop shares remaining capacity with
 /// the model so it can converge before the bounded hard stop.
@@ -1139,6 +1141,8 @@ async fn run_inner(
     budget: LoopBudget,
     cancellation: CancellationToken,
 ) -> Result<(String, ReportKind, WorkingMemory, u64, u64, String)> {
+    let mut loop_metrics = LoopMetricsGuard::new(ctx.state.metrics.clone(), cancellation.clone());
+    let tx = EventSender::new(tx, &ctx.state.metrics, Channel::Agent);
     let base_url = llm.base_url;
     let api_key = llm.api_key;
     let model = llm.model;
@@ -1275,6 +1279,7 @@ async fn run_inner(
 
         let llm_started = Instant::now();
         ctx.state.metrics.llm_started();
+        loop_metrics.llm_call();
         let resp = {
             let body = ChatRequest {
                 model: &model,
@@ -1398,6 +1403,7 @@ async fn run_inner(
         // --- Classify response ---
         if tool_calls.is_empty() {
             if content.trim().is_empty() {
+                loop_metrics.correction(Correction::EmptyResponse);
                 // Parse-retry: empty response, no tools — inject retry notice and loop
                 messages.push(serde_json::json!({
                     "role": "system",
@@ -1418,6 +1424,7 @@ async fn run_inner(
             if gate_rejection_count < MAX_GATE_REJECTIONS {
                 if let Some(gap_msg) = root_cause_gate(&memory, &content, tool_steps, min_depth) {
                     gate_rejection_count += 1;
+                    loop_metrics.correction(Correction::CausalGate);
                     if force_final
                         && memory.escalation_level < 3
                         && attempts < hard_llm_calls
@@ -1453,6 +1460,7 @@ async fn run_inner(
                 && (!force_final || tool_calls_dispatched < hard_tool_calls)
             {
                 self_review_done = true;
+                loop_metrics.correction(Correction::SelfReview);
                 if force_final {
                     finishing_overage = true;
                 }
@@ -1490,6 +1498,12 @@ async fn run_inner(
                 ReportKind::Preliminary => "preliminary_report",
             };
             telemetry.log_stop(session_id, stop_reason, tool_steps, attempts);
+            loop_metrics.stop(match kind {
+                ReportKind::Final => StopReason::Final,
+                ReportKind::Question => StopReason::Question,
+                ReportKind::Preliminary if memory.escalation_level >= 3 => StopReason::DeadEnd,
+                ReportKind::Preliminary => StopReason::Preliminary,
+            });
             let display_text = strip_question_prefix(&content);
             ctx.state.metrics.investigation_reported(
                 kind_name,
@@ -1610,6 +1624,7 @@ async fn run_inner(
             };
             let plan = if memory.is_repeat_call(&sig) {
                 ctx.state.metrics.tool_repeat_suppressed(&tc.name);
+                loop_metrics.correction(Correction::RepeatCall);
                 Planned::PrecomputedError(format!(
                     "Error: this exact tool call was already made in this investigation. \
                      Do not repeat identical queries. Options:\n\
@@ -1646,8 +1661,10 @@ async fn run_inner(
             error: bool,
         }
         let metrics = ctx.state.metrics.clone();
+        let work = loop_metrics.work();
         let tool_futures = tool_calls.iter().zip(&planned).map(|(tc, (args, plan))| {
             let metrics = metrics.clone();
+            let work = work.clone();
             async move {
                 let started = Instant::now();
                 match plan {
@@ -1658,6 +1675,7 @@ async fn run_inner(
                         error: false,
                     },
                     Planned::Execute => {
+                        work.tool_call();
                         let tool_guard = metrics.tool_call_for(&tc.name);
                         let (real_work, result, error) =
                             match registry.execute(&tc.name, args.clone(), ctx).await {
@@ -1797,6 +1815,7 @@ async fn run_inner(
         // strategies. Only level 3+ actually withholds tools and forces a
         // preliminary report.
         if memory.consecutive_empty_results >= DEAD_END_THRESHOLD {
+            loop_metrics.correction(Correction::DeadEnd);
             memory.consecutive_empty_results = 0; // reset counter
             memory.escalation_level += 1;
 
@@ -1854,6 +1873,7 @@ async fn run_inner(
             "Exhausted internal investigation budget"
         };
     telemetry.log_stop(session_id, "budget_exhausted", tool_steps, attempts);
+    loop_metrics.stop(StopReason::BudgetExhausted);
 
     let text = format!(
         "## Preliminary Investigation Report\n\n**Status**: {}\n\n{}\n\n\
@@ -1932,11 +1952,12 @@ fn check_stream_size(size: usize, limit: usize) -> Result<()> {
 /// Process one complete SSE line. Forwards content deltas over `tx` as they
 /// arrive and accumulates tool-call fragments and usage. Returns `true` when
 /// the `[DONE]` sentinel is seen. Malformed lines are tolerated (skipped).
-async fn process_sse_line(
+async fn process_sse_line<'a>(
     line: &str,
     accum: &mut StreamAccum,
-    tx: &mpsc::Sender<AgentEvent>,
+    tx: impl Into<EventSender<'a>>,
 ) -> Result<bool> {
+    let tx = tx.into();
     check_stream_size(line.len(), MAX_SSE_LINE_BYTES)?;
     accum.bytes_received = accum.bytes_received.saturating_add(line.len());
     check_stream_size(accum.bytes_received, MAX_RESPONSE_BYTES)?;
@@ -2062,7 +2083,7 @@ async fn process_sse_line(
 /// Returns content, tool calls, usage, and opaque Responses reasoning items.
 async fn parse_streaming_response(
     resp: reqwest::Response,
-    tx: &mpsc::Sender<AgentEvent>,
+    tx: EventSender<'_>,
     cancellation: CancellationToken,
 ) -> Result<(String, Vec<ToolCallAccum>, (u64, u64), Vec<Value>)> {
     use futures_util::StreamExt;

@@ -4,7 +4,6 @@ name: codeql
 
 on:
   pull_request:
-    branches: [main]
   schedule:
     # Weekly, so advisories added after a PR merges still surface.
     - cron: "17 3 * * 1"

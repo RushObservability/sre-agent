@@ -323,8 +323,22 @@ async fn investigate(
         .acquire()
         .await
         .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error.to_string()))?;
-    let investigation_started = std::time::Instant::now();
+    let mut lifecycle = Some(crate::metrics::lifecycle::InvestigationLifecycle::new(
+        state.metrics.clone(),
+    ));
+    let result = investigate_admitted(state, req, permit, &mut lifecycle).await;
+    if let Some(lifecycle) = lifecycle {
+        lifecycle.finish(crate::metrics::lifecycle::Outcome::Failed);
+    }
+    result
+}
 
+async fn investigate_admitted(
+    state: AppState,
+    req: InvestigateRequest,
+    permit: crate::state::InvestigationPermit,
+    lifecycle: &mut Option<crate::metrics::lifecycle::InvestigationLifecycle>,
+) -> Result<Response, (StatusCode, String)> {
     // Build the tenant's unified skill store, cached per tenant for 60s — skill edits show up on
     // the next investigation within a minute, without paying an HTTP fetch to
     // query-api (or a config_db scan) on every single request.
@@ -680,9 +694,10 @@ async fn investigate(
         .await
         .unwrap_or(false)
     {
-        state
-            .metrics
-            .investigation_failed(investigation_started.elapsed());
+        lifecycle
+            .take()
+            .expect("admitted lifecycle")
+            .finish(crate::metrics::lifecycle::Outcome::Failed);
         let _ = tx
             .send(AgentEvent::Error {
                 message: "LLM not configured: add a provider and at least one enabled model in \
@@ -713,6 +728,8 @@ async fn investigate(
     let cancellation = CancellationToken::new();
     let task_cancellation = cancellation.clone();
     let task_metrics = state.metrics.clone();
+    let mut lifecycle = lifecycle.take().expect("admitted lifecycle");
+    lifecycle.begin_execution();
 
     // The browser selects a Rush model ID and effort. query-api validates both,
     // resolves the upstream model, and applies the matching provider secret.
@@ -812,13 +829,13 @@ async fn investigate(
                 tracing::warn!("generated investigation turn could not be persisted");
             }
         }
-        if was_cancelled {
-            task_metrics.investigation_cancelled(investigation_started.elapsed());
+        lifecycle.finish(if was_cancelled {
+            crate::metrics::lifecycle::Outcome::Cancelled
         } else if succeeded {
-            task_metrics.investigation_completed(investigation_started.elapsed());
+            crate::metrics::lifecycle::Outcome::Completed
         } else {
-            task_metrics.investigation_failed(investigation_started.elapsed());
-        }
+            crate::metrics::lifecycle::Outcome::Failed
+        });
     });
 
     // Convert the receiver into an SSE byte stream

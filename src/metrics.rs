@@ -6,6 +6,7 @@
 //! user/tool input as label values.
 
 pub mod dependency;
+pub mod lifecycle;
 pub mod persistence;
 
 use std::fmt::Write as _;
@@ -40,6 +41,7 @@ impl Histogram {
 pub struct AgentMetrics {
     dependency: dependency::DependencyMetrics,
     persistence: persistence::PersistenceMetrics,
+    lifecycle: lifecycle::LifecycleMetrics,
     investigations_in_flight: AtomicI64,
     investigations_queued: AtomicI64,
     investigations_started: AtomicU64,
@@ -603,6 +605,7 @@ impl AgentMetrics {
         );
         self.dependency.render(&mut output);
         self.persistence.render(&mut output);
+        self.lifecycle.render(&mut output);
         output
     }
 }

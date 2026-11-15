@@ -231,3 +231,73 @@ async fn public_session_routes_are_not_exposed_by_the_agent() {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }
+
+#[tokio::test]
+async fn setup_failures_and_cancelled_handlers_get_terminal_outcomes() {
+    for cancelled in [false, true] {
+        let metrics = Arc::new(sre_agent::metrics::AgentMetrics::new());
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let notify = entered.clone();
+        let backend = axum::Router::new().fallback(move |req: axum::extract::Request| {
+            let notify = notify.clone();
+            async move {
+                if req.uri().path().ends_with("/context") {
+                    return axum::response::IntoResponse::into_response(axum::Json(
+                        serde_json::json!({"data":[]}),
+                    ));
+                }
+                notify.notify_one();
+                if cancelled {
+                    std::future::pending::<()>().await;
+                }
+                axum::response::IntoResponse::into_response(StatusCode::SERVICE_UNAVAILABLE)
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, backend).await.unwrap() });
+        let app = router(AppState {
+            query_api: Arc::new(QueryApiClient::new(&url, INTERNAL_TOKEN.into()).unwrap()),
+            internal_auth_token: INTERNAL_TOKEN.into(),
+            caches: Arc::new(Default::default()),
+            metrics: metrics.clone(),
+            admission: Arc::new(sre_agent::state::InvestigationAdmission::new(
+                1,
+                0,
+                metrics.clone(),
+            )),
+        });
+        let handler = tokio::spawn(async move {
+            app.oneshot(
+                Request::post("/api/v1/investigate")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-rush-internal-token", INTERNAL_TOKEN)
+                    .body(Body::from(r#"{"question":"test"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        });
+        entered.notified().await;
+        if cancelled {
+            handler.abort();
+            let _ = handler.await;
+        } else {
+            assert_eq!(
+                handler.await.unwrap().status(),
+                StatusCode::INTERNAL_SERVER_ERROR
+            );
+        }
+        let out = metrics.render();
+        let outcome = if cancelled { "cancelled" } else { "failed" };
+        assert!(
+            out.contains(&format!(
+                "sre_agent_investigation_terminal_total{{stage=\"setup\",outcome=\"{outcome}\"}} 1"
+            )),
+            "{out}"
+        );
+        assert!(out.contains("sre_agent_investigations_in_flight 0"));
+        assert!(out.contains("sre_agent_investigations_started_total 1"));
+        server.abort();
+    }
+}

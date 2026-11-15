@@ -5,6 +5,8 @@
 //! difficult to accidentally add tenant IDs, session IDs, queries, or arbitrary
 //! user/tool input as label values.
 
+pub mod lifecycle;
+
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -35,6 +37,7 @@ impl Histogram {
 
 #[derive(Default)]
 pub struct AgentMetrics {
+    lifecycle: lifecycle::LifecycleMetrics,
     investigations_in_flight: AtomicI64,
     investigations_queued: AtomicI64,
     investigations_started: AtomicU64,
@@ -596,6 +599,7 @@ impl AgentMetrics {
             "Query-api dependency request duration in seconds.",
             &self.query_api_duration,
         );
+        self.lifecycle.render(&mut output);
         output
     }
 }

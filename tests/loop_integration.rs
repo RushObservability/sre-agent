@@ -152,10 +152,10 @@ async fn earns_final_report() {
     let metrics = ctx.state.metrics.render();
     assert!(metrics.contains("sre_agent_investigation_stops_total{reason=\"final\"} 1"));
     assert!(metrics.contains(&format!(
-        "sre_agent_investigation_llm_calls_sum {}",
+        "sre_agent_investigation_llm_calls_per_run_sum {}",
         server.calls()
     )));
-    assert!(metrics.contains("sre_agent_investigation_llm_calls_count 1"));
+    assert!(metrics.contains("sre_agent_investigation_llm_calls_per_run_count 1"));
 
     assert_eq!(
         kind,
@@ -237,10 +237,10 @@ async fn budget_exhaustion_preliminary() {
     let metrics = ctx.state.metrics.render();
     assert!(metrics.contains("sre_agent_investigation_stops_total{reason=\"budget_exhausted\"} 1"));
     assert!(metrics.contains(&format!(
-        "sre_agent_investigation_llm_calls_sum {}",
+        "sre_agent_investigation_llm_calls_per_run_sum {}",
         server.calls()
     )));
-    assert!(metrics.contains("sre_agent_investigation_llm_calls_count 1"));
+    assert!(metrics.contains("sre_agent_investigation_llm_calls_per_run_count 1"));
 
     assert!(
         text.contains("Preliminary Investigation Report"),
@@ -720,10 +720,10 @@ async fn sse_oversized_line_errors_gracefully() {
     let metrics = ctx.state.metrics.render();
     assert!(metrics.contains("sre_agent_investigation_stops_total{reason=\"error\"} 1"));
     assert!(metrics.contains(&format!(
-        "sre_agent_investigation_llm_calls_sum {}",
+        "sre_agent_investigation_llm_calls_per_run_sum {}",
         server.calls()
     )));
-    assert!(metrics.contains("sre_agent_investigation_llm_calls_count 1"));
+    assert!(metrics.contains("sre_agent_investigation_llm_calls_per_run_count 1"));
 
     let _ = collect_events(&mut rx).await;
 

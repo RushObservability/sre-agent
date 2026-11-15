@@ -1,7 +1,12 @@
+use crate::metrics::{
+    AgentMetrics,
+    dependency::{Outcome, RequestGuard},
+};
 use anyhow::{Context, Result, bail};
 use reqwest::{Method, StatusCode, Url};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::models::anomaly::{AnomalyEvent, AnomalyRule, DeployMarker};
@@ -13,6 +18,7 @@ pub struct QueryApiClient {
     base_url: Url,
     internal_token: String,
     http: reqwest::Client,
+    metrics: Option<Arc<AgentMetrics>>,
 }
 
 pub enum ProfileRead<T> {
@@ -52,6 +58,7 @@ impl QueryApiClient {
             base_url,
             internal_token,
             http,
+            metrics: None,
         })
     }
 
@@ -91,28 +98,60 @@ impl QueryApiClient {
             .header("x-rush-tenant", tenant_id))
     }
 
+    /// Attach the process registry. Cloned clients share both connection pools and metrics.
+    pub fn with_metrics(mut self, metrics: Arc<AgentMetrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
+    async fn send(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> Result<(reqwest::Response, RequestGuard)> {
+        let (client, request) = request.build_split();
+        let request = request.context("failed to build query-api request")?;
+        let mut guard = RequestGuard::new(self.metrics.clone(), request.url().path());
+        // Preserve the request builder's client and connection pool without cloning its body.
+        let request = reqwest::RequestBuilder::from_parts(client, request);
+        match request.send().await {
+            Ok(response) => {
+                guard.set_http_status(response.status());
+                Ok((response, guard))
+            }
+            Err(error) => {
+                guard.reqwest_error(&error);
+                Err(error).context("query-api request failed")
+            }
+        }
+    }
+
     async fn send_json<T: DeserializeOwned>(&self, request: reqwest::RequestBuilder) -> Result<T> {
-        let response = request.send().await.context("query-api request failed")?;
+        let (response, mut guard) = self.send(request).await?;
         let status = response.status();
         if !status.is_success() {
             let message = response.text().await.unwrap_or_default();
             let message = crate::agent::memory::truncate_at_char_boundary(&message, 512);
+            guard.finish(Outcome::HttpError);
             bail!("query-api returned {status}: {message}");
         }
-        response
-            .json::<T>()
-            .await
-            .context("query-api returned invalid JSON")
+        let result = response.json::<T>().await;
+        match &result {
+            Ok(_) => guard.finish(Outcome::Success),
+            Err(error) => guard.reqwest_error(error),
+        }
+        result.context("query-api returned invalid JSON")
     }
 
     async fn send_empty(&self, request: reqwest::RequestBuilder) -> Result<()> {
-        let response = request.send().await.context("query-api request failed")?;
+        let (response, mut guard) = self.send(request).await?;
         let status = response.status();
         if !status.is_success() {
             let message = response.text().await.unwrap_or_default();
             let message = crate::agent::memory::truncate_at_char_boundary(&message, 512);
+            guard.finish(Outcome::HttpError);
             bail!("query-api returned {status}: {message}");
         }
+        guard.finish(Outcome::Success);
         Ok(())
     }
 
@@ -179,12 +218,15 @@ impl QueryApiClient {
         tenant_id: &str,
         params: &[(&str, String)],
     ) -> Result<ProfileRead<T>> {
-        let mut response = self
-            .request(Method::GET, tenant_id, "api/v1/profiles")?
-            .query(params)
-            .send()
-            .await
-            .context("profile query request failed")?;
+        let (mut response, mut guard) = self
+            .send(
+                self.request(Method::GET, tenant_id, "api/v1/profiles")?
+                    .query(params),
+            )
+            .await?;
+        if !response.status().is_success() {
+            guard.finish(Outcome::HttpError);
+        }
         match response.status() {
             StatusCode::NOT_FOUND => return Ok(ProfileRead::Unavailable),
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
@@ -195,15 +237,22 @@ impl QueryApiClient {
             _ => {}
         }
         let mut body = Vec::new();
-        while let Some(chunk) = response.chunk().await? {
+        while let Some(chunk) = response.chunk().await.inspect_err(|error| {
+            guard.reqwest_error(error);
+        })? {
             if body.len() + chunk.len() > 4 * 1024 * 1024 {
+                guard.finish(Outcome::InvalidResponse);
                 bail!("profile response exceeds the 4 MiB tool budget; narrow the window or pod");
             }
             body.extend_from_slice(&chunk);
         }
-        Ok(ProfileRead::Data(
-            serde_json::from_slice(&body).context("invalid profile response")?,
-        ))
+        let result = serde_json::from_slice(&body).context("invalid profile response");
+        guard.finish(if result.is_ok() {
+            Outcome::Success
+        } else {
+            Outcome::DecodeError
+        });
+        Ok(ProfileRead::Data(result?))
     }
 
     pub async fn query_span_timeseries<T: DeserializeOwned>(
@@ -231,11 +280,12 @@ impl QueryApiClient {
         if trace_id.len() != 32 || !trace_id.chars().all(|c| c.is_ascii_hexdigit()) {
             bail!("trace_id must be a 32-character hex string");
         }
-        let response = self
-            .request(Method::GET, tenant_id, &format!("api/v1/traces/{trace_id}"))?
-            .send()
-            .await
-            .context("query-api request failed")?;
+        let (response, mut guard) = self
+            .send(self.request(Method::GET, tenant_id, &format!("api/v1/traces/{trace_id}"))?)
+            .await?;
+        if !response.status().is_success() {
+            guard.finish(Outcome::HttpError);
+        }
         if response.status() == StatusCode::NOT_FOUND {
             return Ok(None);
         }
@@ -243,11 +293,13 @@ impl QueryApiClient {
         if !status.is_success() {
             bail!("query-api returned {status}");
         }
+        let result = response.json().await;
+        match &result {
+            Ok(_) => guard.finish(Outcome::Success),
+            Err(error) => guard.reqwest_error(error),
+        }
         Ok(Some(
-            response
-                .json()
-                .await
-                .context("query-api returned invalid trace JSON")?,
+            result.context("query-api returned invalid trace JSON")?,
         ))
     }
 
@@ -451,11 +503,12 @@ impl QueryApiClient {
                 .iter()
                 .map(|(key, value)| (key.as_str(), value.as_str())),
         );
-        let response = self
-            .request(Method::GET, tenant_id, url.as_str())?
-            .send()
-            .await
-            .context("query-api request failed")?;
+        let (response, mut guard) = self
+            .send(self.request(Method::GET, tenant_id, url.as_str())?)
+            .await?;
+        if !response.status().is_success() {
+            guard.finish(Outcome::HttpError);
+        }
         if response.status() == StatusCode::NOT_FOUND {
             return Ok(None);
         }
@@ -467,18 +520,27 @@ impl QueryApiClient {
             .content_length()
             .is_some_and(|bytes| bytes > max_bytes as u64)
         {
+            guard.finish(Outcome::InvalidResponse);
             bail!("query-api response exceeds its size limit");
         }
         let body = response
             .bytes()
             .await
+            .inspect_err(|error| {
+                guard.reqwest_error(error);
+            })
             .context("failed to read query-api response")?;
         if body.len() > max_bytes {
+            guard.finish(Outcome::InvalidResponse);
             bail!("query-api response exceeds its size limit");
         }
-        Ok(Some(
-            serde_json::from_slice(&body).context("query-api returned invalid JSON")?,
-        ))
+        let result = serde_json::from_slice(&body).context("query-api returned invalid JSON");
+        guard.finish(if result.is_ok() {
+            Outcome::Success
+        } else {
+            Outcome::DecodeError
+        });
+        Ok(Some(result?))
     }
 
     pub async fn create_session(
@@ -496,15 +558,16 @@ impl QueryApiClient {
         tenant_id: &str,
         id: &str,
     ) -> Result<Option<InvestigationSession>> {
-        let response = self
-            .request(
+        let (response, mut guard) = self
+            .send(self.request(
                 Method::GET,
                 tenant_id,
                 &format!("api/v1/internal/sre/sessions/{id}"),
-            )?
-            .send()
-            .await
-            .context("query-api request failed")?;
+            )?)
+            .await?;
+        if !response.status().is_success() {
+            guard.finish(Outcome::HttpError);
+        }
         if response.status() == StatusCode::NOT_FOUND {
             return Ok(None);
         }
@@ -512,11 +575,13 @@ impl QueryApiClient {
         if !status.is_success() {
             bail!("query-api returned {status}");
         }
+        let result = response.json().await;
+        match &result {
+            Ok(_) => guard.finish(Outcome::Success),
+            Err(error) => guard.reqwest_error(error),
+        }
         Ok(Some(
-            response
-                .json()
-                .await
-                .context("query-api returned invalid session JSON")?,
+            result.context("query-api returned invalid session JSON")?,
         ))
     }
     pub async fn list_sessions(
@@ -815,5 +880,99 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod dependency_metrics_tests {
+    use super::*;
+    use axum::{Router, body::Body, http::StatusCode, response::Response};
+    use tokio::sync::Notify;
+
+    #[tokio::test]
+    async fn client_accounts_for_status_decode_timeout_and_cancelled_requests() {
+        let entered = Arc::new(Notify::new());
+        let notify = entered.clone();
+        let backend = Router::new().fallback(move |request: axum::extract::Request| {
+            let notify = notify.clone();
+            async move {
+                match request.uri().path() {
+                    "/healthz" => Response::new(Body::from(r#"{"status":"ok"}"#)),
+                    "/invalid" => Response::new(Body::from("invalid JSON")),
+                    "/error" => Response::builder()
+                        .status(StatusCode::SERVICE_UNAVAILABLE)
+                        .body(Body::from("dummy-sensitive-error"))
+                        .unwrap(),
+                    _ => {
+                        notify.notify_one();
+                        std::future::pending::<Response>().await
+                    }
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, backend).await.unwrap() });
+        let metrics = Arc::new(AgentMetrics::new());
+        let api = QueryApiClient::new(&url, "dummy-sensitive-token".into())
+            .unwrap()
+            .with_metrics(metrics.clone());
+        api.ready("tenant-sensitive").await.unwrap();
+        for path in ["invalid", "error"] {
+            assert!(
+                api.send_json::<Value>(api.http.get(api.url(path).unwrap()))
+                    .await
+                    .is_err()
+            );
+        }
+        let request = api
+            .http
+            .get(api.url("timeout").unwrap())
+            .timeout(Duration::from_millis(25));
+        assert!(api.send_json::<Value>(request).await.is_err());
+        // Discard the timeout request notification before observing cancellation.
+        entered.notified().await;
+        let cancellation_api = api.clone();
+        let request = tokio::spawn(async move {
+            cancellation_api
+                .send_json::<Value>(
+                    cancellation_api
+                        .http
+                        .get(cancellation_api.url("cancel").unwrap()),
+                )
+                .await
+        });
+        entered.notified().await;
+        assert!(
+            metrics
+                .render()
+                .contains("sre_agent_query_api_requests_in_flight 1")
+        );
+        request.abort();
+        let _ = request.await;
+        let output = metrics.render();
+        assert!(output.contains("sre_agent_query_api_requests_in_flight 0"));
+        assert!(output.contains("sre_agent_query_api_requests_total 5"));
+        for outcome in [
+            "success",
+            "decode_error",
+            "http_error",
+            "timeout",
+            "cancelled",
+        ] {
+            assert!(
+                output.contains(&format!("outcome=\"{outcome}\"}} 1")),
+                "missing {outcome}: {output}"
+            );
+        }
+        for sensitive in [
+            "tenant-sensitive",
+            "dummy-sensitive",
+            "invalid JSON",
+            "/cancel",
+        ] {
+            assert!(!output.contains(sensitive));
+        }
+        server.abort();
     }
 }

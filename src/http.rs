@@ -31,7 +31,12 @@ use crate::state::AppState;
 /// Build the production router: all API routes plus the CORS and trace
 /// layers, with the given state attached. This is the exact app served by
 /// `main()`.
-pub fn router(state: AppState) -> Router {
+pub fn router(mut state: AppState) -> Router {
+    state.query_api = Arc::new(
+        (*state.query_api)
+            .clone()
+            .with_metrics(state.metrics.clone()),
+    );
     // query-api is the authenticated public boundary. The agent only accepts
     // calls carrying its internal credential, even when reached inside the
     // cluster directly.
@@ -138,16 +143,12 @@ async fn healthz() -> Json<serde_json::Value> {
 }
 
 async fn readyz(State(state): State<AppState>) -> Response {
-    let query_api_started = std::time::Instant::now();
     let query_api_ready = tokio::time::timeout(
         std::time::Duration::from_secs(2),
         state.query_api.ready("default"),
     )
     .await
     .is_ok_and(|result| result.is_ok());
-    state
-        .metrics
-        .query_api_finished(query_api_started.elapsed(), query_api_ready);
     let llm_ready = tokio::time::timeout(
         std::time::Duration::from_secs(2),
         state.query_api.llm_ready("default"),

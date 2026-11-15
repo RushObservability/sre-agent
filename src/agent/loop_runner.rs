@@ -12,6 +12,7 @@ use super::stream::{AgentEvent, ReportKind};
 use super::tools::{ToolContext, ToolRegistry};
 use crate::cancellation::CancellationToken;
 use crate::metrics::loop_health::{Correction, LoopMetricsGuard, StopReason};
+use crate::metrics::streaming::{Channel, EventSender};
 
 /// Default target for real tool calls. The loop shares remaining capacity with
 /// the model so it can converge before the bounded hard stop.
@@ -1141,6 +1142,7 @@ async fn run_inner(
     cancellation: CancellationToken,
 ) -> Result<(String, ReportKind, WorkingMemory, u64, u64, String)> {
     let mut loop_metrics = LoopMetricsGuard::new(ctx.state.metrics.clone(), cancellation.clone());
+    let tx = EventSender::new(tx, &ctx.state.metrics, Channel::Agent);
     let base_url = llm.base_url;
     let api_key = llm.api_key;
     let model = llm.model;
@@ -1950,11 +1952,12 @@ fn check_stream_size(size: usize, limit: usize) -> Result<()> {
 /// Process one complete SSE line. Forwards content deltas over `tx` as they
 /// arrive and accumulates tool-call fragments and usage. Returns `true` when
 /// the `[DONE]` sentinel is seen. Malformed lines are tolerated (skipped).
-async fn process_sse_line(
+async fn process_sse_line<'a>(
     line: &str,
     accum: &mut StreamAccum,
-    tx: &mpsc::Sender<AgentEvent>,
+    tx: impl Into<EventSender<'a>>,
 ) -> Result<bool> {
+    let tx = tx.into();
     check_stream_size(line.len(), MAX_SSE_LINE_BYTES)?;
     accum.bytes_received = accum.bytes_received.saturating_add(line.len());
     check_stream_size(accum.bytes_received, MAX_RESPONSE_BYTES)?;
@@ -2080,7 +2083,7 @@ async fn process_sse_line(
 /// Returns content, tool calls, usage, and opaque Responses reasoning items.
 async fn parse_streaming_response(
     resp: reqwest::Response,
-    tx: &mpsc::Sender<AgentEvent>,
+    tx: EventSender<'_>,
     cancellation: CancellationToken,
 ) -> Result<(String, Vec<ToolCallAccum>, (u64, u64), Vec<Value>)> {
     use futures_util::StreamExt;

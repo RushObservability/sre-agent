@@ -655,6 +655,12 @@ async fn sse_parser_torture() {
     .await
     .unwrap();
     drop(tx);
+    assert!(
+        ctx.state
+            .metrics
+            .render()
+            .contains("sre_agent_event_send_wait_seconds_count{channel=\"agent\"}")
+    );
 
     let events = collect_events(&mut rx).await;
 

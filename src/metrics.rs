@@ -9,6 +9,7 @@ pub mod dependency;
 pub mod lifecycle;
 pub mod loop_health;
 pub mod persistence;
+pub mod streaming;
 pub mod tools;
 
 use std::fmt::Write as _;
@@ -46,6 +47,7 @@ pub struct AgentMetrics {
     lifecycle: lifecycle::LifecycleMetrics,
     tools: tools::ToolMetrics,
     loop_health: loop_health::LoopHealthMetrics,
+    streaming: streaming::StreamingMetrics,
     investigations_in_flight: AtomicI64,
     investigations_queued: AtomicI64,
     investigations_started: AtomicU64,
@@ -640,6 +642,7 @@ impl AgentMetrics {
         self.lifecycle.render(&mut output);
         self.tools.render(&mut output);
         self.loop_health.render(&mut output);
+        self.streaming.render(&mut output);
         output
     }
 }

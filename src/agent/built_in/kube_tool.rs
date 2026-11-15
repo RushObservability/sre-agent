@@ -1,4 +1,4 @@
-use crate::agent::tools::{Tool, ToolContext};
+use crate::agent::tools::{Tool, ToolContext, scope_allows};
 use anyhow::Result;
 use kube::api::DynamicObject;
 use kube::discovery::ApiResource;
@@ -60,8 +60,11 @@ fn cluster_scope_allowed(ctx: &ToolContext) -> bool {
 }
 
 fn cluster_scope_allowed_for(scopes: &[String], enabled: bool) -> bool {
-    enabled && scopes.iter().any(|scope| scope == "kube_cluster")
+    enabled && scope_allows(scopes, "kube_cluster")
 }
+
+const KUBERNETES_SCOPE_DENIED: &str =
+    "Kubernetes reads require the kubernetes scope, which this caller does not have.";
 
 fn namespace_denied(namespace: &str) -> String {
     format!("Access to Kubernetes namespace '{namespace}' is not allowed for this tenant.")
@@ -172,6 +175,9 @@ impl Tool for KubeDescribe {
             "node" | "nodes" | "namespace" | "ns" | "namespaces"
         );
 
+        if !ctx.has_scope("kubernetes") {
+            return Ok(KUBERNETES_SCOPE_DENIED.to_string());
+        }
         if is_cluster_scoped {
             if !cluster_scope_allowed(ctx) {
                 return Ok(
@@ -393,6 +399,9 @@ impl Tool for KubeEvents {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
+        if !ctx.has_scope("kubernetes") {
+            return Ok(KUBERNETES_SCOPE_DENIED.to_string());
+        }
         if namespace.is_empty() {
             return Ok("'namespace' is required.".to_string());
         }
@@ -493,7 +502,13 @@ impl Tool for KubeEvents {
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod policy_tests {
-    use super::{cluster_scope_allowed_for, namespace_allowed_for, parse_namespace_policy};
+    use super::{
+        KUBERNETES_SCOPE_DENIED, KubeDescribe, KubeEvents, cluster_scope_allowed_for,
+        namespace_allowed_for, parse_namespace_policy,
+    };
+    use crate::agent::tools::{Tool, ToolContext};
+    use serde_json::json;
+    use std::sync::Arc;
 
     #[test]
     fn tenant_namespace_policy_is_exact_and_supports_shared_namespaces() {
@@ -515,6 +530,51 @@ mod policy_tests {
             "tenant-a",
             "payments"
         ));
+    }
+
+    fn ctx(scopes: &[&str]) -> ToolContext {
+        let metrics = Arc::new(crate::metrics::AgentMetrics::new());
+        ToolContext {
+            state: crate::AppState {
+                query_api: Arc::new(crate::query_api::QueryApiClient::new_disconnected_for_tests()),
+                internal_auth_token: "test".into(),
+                caches: Arc::new(Default::default()),
+                metrics: metrics.clone(),
+                admission: Arc::new(crate::state::InvestigationAdmission::new(4, 16, metrics)),
+            },
+            skill_store: Arc::new(crate::agent::skill_store::SkillStore::empty()),
+            tenant_id: "acme".into(),
+            scopes: scopes.iter().map(|s| (*s).into()).collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn telemetry_only_callers_cannot_read_kubernetes() {
+        // The scope check runs before the namespace allowlist and any client.
+        let telemetry = ctx(&["logs", "traces", "metrics", "profiles"]);
+        let describe = json!({"kind": "pod", "name": "api", "namespace": "payments"});
+        let node = json!({"kind": "node", "name": "n1"});
+        let events = json!({"namespace": "payments"});
+        for out in [
+            KubeDescribe
+                .execute(describe.clone(), &telemetry)
+                .await
+                .unwrap(),
+            KubeDescribe.execute(node, &telemetry).await.unwrap(),
+            KubeEvents
+                .execute(events.clone(), &telemetry)
+                .await
+                .unwrap(),
+        ] {
+            assert_eq!(out, KUBERNETES_SCOPE_DENIED);
+        }
+        let all = ctx(&["all"]);
+        for out in [
+            KubeDescribe.execute(describe, &all).await.unwrap(),
+            KubeEvents.execute(events, &all).await.unwrap(),
+        ] {
+            assert_ne!(out, KUBERNETES_SCOPE_DENIED);
+        }
     }
 
     #[test]

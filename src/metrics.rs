@@ -5,6 +5,8 @@
 //! difficult to accidentally add tenant IDs, session IDs, queries, or arbitrary
 //! user/tool input as label values.
 
+pub mod tools;
+
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -35,6 +37,7 @@ impl Histogram {
 
 #[derive(Default)]
 pub struct AgentMetrics {
+    tools: tools::ToolMetrics,
     investigations_in_flight: AtomicI64,
     investigations_queued: AtomicI64,
     investigations_started: AtomicU64,
@@ -102,11 +105,22 @@ pub struct ToolCallGuard {
     metrics: Arc<AgentMetrics>,
     started: std::time::Instant,
     finished: bool,
+    tool: &'static str,
 }
 
 impl ToolCallGuard {
     pub fn finish(mut self, error: bool) {
-        self.metrics.tool_finished(self.started.elapsed(), error);
+        let duration = self.started.elapsed();
+        self.metrics.tool_finished(duration, error);
+        self.metrics.tools.observe(
+            self.tool,
+            if error {
+                tools::Outcome::Error
+            } else {
+                tools::Outcome::Success
+            },
+            duration,
+        );
         self.finished = true;
     }
 }
@@ -114,7 +128,11 @@ impl ToolCallGuard {
 impl Drop for ToolCallGuard {
     fn drop(&mut self) {
         if !self.finished {
-            self.metrics.tool_finished(self.started.elapsed(), true);
+            let duration = self.started.elapsed();
+            self.metrics.tool_finished(duration, true);
+            self.metrics
+                .tools
+                .observe(self.tool, tools::Outcome::Cancelled, duration);
         }
     }
 }
@@ -279,12 +297,25 @@ impl AgentMetrics {
     }
 
     pub fn tool_call(self: &Arc<Self>) -> ToolCallGuard {
+        self.tool_call_for("unknown")
+    }
+
+    pub fn tool_call_for(self: &Arc<Self>, name: &str) -> ToolCallGuard {
         self.tool_started();
         ToolCallGuard {
             metrics: self.clone(),
             started: std::time::Instant::now(),
             finished: false,
+            tool: tools::bounded_name(name),
         }
+    }
+
+    pub fn tool_result_observed(&self, name: &str, useful: bool, empty: bool) {
+        self.tools.result(name, useful, empty);
+    }
+
+    pub fn tool_repeat_suppressed(&self, name: &str) {
+        self.tools.repeat(name);
     }
 
     pub fn tool_finished(&self, duration: Duration, error: bool) {
@@ -596,6 +627,7 @@ impl AgentMetrics {
             "Query-api dependency request duration in seconds.",
             &self.query_api_duration,
         );
+        self.tools.render(&mut output);
         output
     }
 }

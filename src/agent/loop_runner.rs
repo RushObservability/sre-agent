@@ -1609,6 +1609,7 @@ async fn run_inner(
                 args_normalized: normalize_args(&super::redact::value(&args)),
             };
             let plan = if memory.is_repeat_call(&sig) {
+                ctx.state.metrics.tool_repeat_suppressed(&tc.name);
                 Planned::PrecomputedError(format!(
                     "Error: this exact tool call was already made in this investigation. \
                      Do not repeat identical queries. Options:\n\
@@ -1657,7 +1658,7 @@ async fn run_inner(
                         error: false,
                     },
                     Planned::Execute => {
-                        let tool_guard = metrics.tool_call();
+                        let tool_guard = metrics.tool_call_for(&tc.name);
                         let (real_work, result, error) =
                             match registry.execute(&tc.name, args.clone(), ctx).await {
                                 Ok(data) => (
@@ -1729,6 +1730,11 @@ async fn run_inner(
                 useful_result,
                 empty_result,
             );
+            if !matches!(plan, Planned::PrecomputedError(_)) && !outcome.error {
+                ctx.state
+                    .metrics
+                    .tool_result_observed(&tc.name, useful_result, empty_result);
+            }
             if empty_result {
                 ctx.state.metrics.tool_result_empty();
             }

@@ -32,14 +32,14 @@ async fn main() -> anyhow::Result<()> {
                 "QUERY_API_URL must be set; the SRE agent does not connect to ClickHouse directly"
             )
         })?;
-    let query_api = Arc::new(QueryApiClient::new(
-        &query_api_url,
-        internal_auth_token.clone(),
-    )?);
+    let metrics = Arc::new(AgentMetrics::new());
+    let query_api = Arc::new(
+        QueryApiClient::new(&query_api_url, internal_auth_token.clone())?
+            .with_metrics(metrics.clone()),
+    );
     query_api.ready("default").await?;
     tracing::info!(query_api = %query_api.base_url(), "sre-agent data plane connected");
 
-    let metrics = Arc::new(AgentMetrics::new());
     sre_agent::process_metrics::sample(&metrics);
     sre_agent::process_metrics::spawn(metrics.clone());
     let state = AppState {

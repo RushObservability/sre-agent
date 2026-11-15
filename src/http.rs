@@ -783,51 +783,34 @@ async fn investigate(
             llm_model_used,
         )) = result
         {
-            // Persist assistant turn and updated working memory
-            let turn_index = query_api
-                .count_turns(&tenant_id_for_task, &session_id_for_task)
-                .await
-                .unwrap_or(0);
-            let turn_id = uuid::Uuid::new_v4().to_string();
             let kind_str = match report_kind {
                 agent::stream::ReportKind::Final => "final",
                 agent::stream::ReportKind::Preliminary => "preliminary",
                 agent::stream::ReportKind::Question => "question",
             };
-            let _ = query_api
-                .add_turn(
-                    &tenant_id_for_task,
-                    &turn_id,
-                    &session_id_for_task,
-                    turn_index,
-                    "assistant",
-                    &summary_text,
-                    &saved_activity_json,
-                    kind_str,
-                )
-                .await;
-
-            // Persist memory + accumulated tokens (+ status for final
-            // reports) in one read + one versioned insert instead of
-            // three read-modify-write cycles.
-            let mem_json =
-                serde_json::to_string(&final_memory).unwrap_or_else(|_| "{}".to_string());
-            let status = if report_kind == agent::stream::ReportKind::Final {
-                Some("completed")
-            } else {
-                None
-            };
-            let _ = query_api
-                .update_session_after_turn(
-                    &tenant_id_for_task,
-                    &session_id_for_task,
-                    &mem_json,
-                    total_prompt,
-                    total_completion,
-                    &llm_model_used,
+            let mem_json = serde_json::to_string(&final_memory)
+                .expect("working memory contains serializable values");
+            let status = (report_kind == agent::stream::ReportKind::Final).then_some("completed");
+            let saved = persist_assistant_turn(
+                &query_api,
+                &task_metrics,
+                GeneratedTurn {
+                    tenant_id: &tenant_id_for_task,
+                    session_id: &session_id_for_task,
+                    content: &summary_text,
+                    activity: &saved_activity_json,
+                    kind: kind_str,
+                    memory: &mem_json,
+                    prompt_tokens: total_prompt,
+                    completion_tokens: total_completion,
+                    model: &llm_model_used,
                     status,
-                )
-                .await;
+                },
+            )
+            .await;
+            if saved.is_err() {
+                tracing::warn!("generated investigation turn could not be persisted");
+            }
         }
         if was_cancelled {
             task_metrics.investigation_cancelled(investigation_started.elapsed());
@@ -856,6 +839,74 @@ async fn list_investigation_templates() -> Json<serde_json::Value> {
     let templates = templates::built_in_templates();
     Json(serde_json::json!({ "templates": templates }))
 }
+
+struct GeneratedTurn<'a> {
+    tenant_id: &'a str,
+    session_id: &'a str,
+    content: &'a str,
+    activity: &'a str,
+    kind: &'a str,
+    memory: &'a str,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    model: &'a str,
+    status: Option<&'a str>,
+}
+
+async fn persist_assistant_turn(
+    query_api: &crate::query_api::QueryApiClient,
+    metrics: &Arc<AgentMetrics>,
+    turn: GeneratedTurn<'_>,
+) -> anyhow::Result<()> {
+    use crate::metrics::persistence::{Operation, TurnGuard, observe};
+    let mut guard = TurnGuard::new(metrics.clone());
+    let result = async {
+        let turn_index = observe(
+            metrics,
+            Operation::CountTurns,
+            query_api.count_turns(turn.tenant_id, turn.session_id),
+        )
+        .await?;
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        observe(
+            metrics,
+            Operation::AddTurn,
+            query_api.add_turn(
+                turn.tenant_id,
+                &turn_id,
+                turn.session_id,
+                turn_index,
+                "assistant",
+                turn.content,
+                turn.activity,
+                turn.kind,
+            ),
+        )
+        .await?;
+        observe(
+            metrics,
+            Operation::UpdateSession,
+            query_api.update_session_after_turn(
+                turn.tenant_id,
+                turn.session_id,
+                turn.memory,
+                turn.prompt_tokens,
+                turn.completion_tokens,
+                turn.model,
+                turn.status,
+            ),
+        )
+        .await?;
+        Ok(())
+    }
+    .await;
+    guard.finish(result.is_ok());
+    result
+}
+
+#[cfg(test)]
+#[path = "http/persistence_tests.rs"]
+mod persistence_tests;
 
 #[cfg(test)]
 mod tests {

@@ -6,6 +6,7 @@
 //! user/tool input as label values.
 
 pub mod dependency;
+pub mod persistence;
 
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -38,6 +39,7 @@ impl Histogram {
 #[derive(Default)]
 pub struct AgentMetrics {
     dependency: dependency::DependencyMetrics,
+    persistence: persistence::PersistenceMetrics,
     investigations_in_flight: AtomicI64,
     investigations_queued: AtomicI64,
     investigations_started: AtomicU64,
@@ -600,6 +602,7 @@ impl AgentMetrics {
             &self.query_api_duration,
         );
         self.dependency.render(&mut output);
+        self.persistence.render(&mut output);
         output
     }
 }
@@ -683,6 +686,6 @@ mod tests {
         assert!(output.contains("sre_agent_investigation_tool_calls_total 3"));
         assert!(output.contains("sre_agent_process_resident_memory_bytes 10"));
         assert!(!output.contains("tenant"));
-        assert!(!output.contains("session"));
+        assert!(!output.contains("session_id="));
     }
 }

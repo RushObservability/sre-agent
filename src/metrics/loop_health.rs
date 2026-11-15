@@ -115,11 +115,11 @@ impl LoopHealthMetrics {
         self.llm_work
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .render(out, "sre_agent_investigation_llm_calls");
+            .render(out, "sre_agent_investigation_llm_calls_per_run");
         self.tool_work
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .render(out, "sre_agent_investigation_tool_calls");
+            .render(out, "sre_agent_investigation_tool_calls_per_run");
     }
 }
 #[derive(Default)]
@@ -217,9 +217,9 @@ mod tests {
         for expected in [
             "sre_agent_investigation_stops_total{reason=\"error\"} 1",
             "sre_agent_investigation_stops_total{reason=\"disconnected\"} 1",
-            "sre_agent_investigation_llm_calls_sum 2",
-            "sre_agent_investigation_tool_calls_sum 1",
-            "sre_agent_investigation_llm_calls_count 2",
+            "sre_agent_investigation_llm_calls_per_run_sum 2",
+            "sre_agent_investigation_tool_calls_per_run_sum 1",
+            "sre_agent_investigation_llm_calls_per_run_count 2",
             "sre_agent_loop_corrections_total{reason=\"repeat_call\"} 1",
         ] {
             assert!(out.contains(expected), "{expected}: {out}");

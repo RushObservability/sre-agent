@@ -8,6 +8,7 @@
 pub mod dependency;
 pub mod lifecycle;
 pub mod persistence;
+pub mod tools;
 
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -42,6 +43,7 @@ pub struct AgentMetrics {
     dependency: dependency::DependencyMetrics,
     persistence: persistence::PersistenceMetrics,
     lifecycle: lifecycle::LifecycleMetrics,
+    tools: tools::ToolMetrics,
     investigations_in_flight: AtomicI64,
     investigations_queued: AtomicI64,
     investigations_started: AtomicU64,
@@ -109,11 +111,22 @@ pub struct ToolCallGuard {
     metrics: Arc<AgentMetrics>,
     started: std::time::Instant,
     finished: bool,
+    tool: &'static str,
 }
 
 impl ToolCallGuard {
     pub fn finish(mut self, error: bool) {
-        self.metrics.tool_finished(self.started.elapsed(), error);
+        let duration = self.started.elapsed();
+        self.metrics.tool_finished(duration, error);
+        self.metrics.tools.observe(
+            self.tool,
+            if error {
+                tools::Outcome::Error
+            } else {
+                tools::Outcome::Success
+            },
+            duration,
+        );
         self.finished = true;
     }
 }
@@ -121,7 +134,11 @@ impl ToolCallGuard {
 impl Drop for ToolCallGuard {
     fn drop(&mut self) {
         if !self.finished {
-            self.metrics.tool_finished(self.started.elapsed(), true);
+            let duration = self.started.elapsed();
+            self.metrics.tool_finished(duration, true);
+            self.metrics
+                .tools
+                .observe(self.tool, tools::Outcome::Cancelled, duration);
         }
     }
 }
@@ -286,12 +303,25 @@ impl AgentMetrics {
     }
 
     pub fn tool_call(self: &Arc<Self>) -> ToolCallGuard {
+        self.tool_call_for("unknown")
+    }
+
+    pub fn tool_call_for(self: &Arc<Self>, name: &str) -> ToolCallGuard {
         self.tool_started();
         ToolCallGuard {
             metrics: self.clone(),
             started: std::time::Instant::now(),
             finished: false,
+            tool: tools::bounded_name(name),
         }
+    }
+
+    pub fn tool_result_observed(&self, name: &str, useful: bool, empty: bool) {
+        self.tools.result(name, useful, empty);
+    }
+
+    pub fn tool_repeat_suppressed(&self, name: &str) {
+        self.tools.repeat(name);
     }
 
     pub fn tool_finished(&self, duration: Duration, error: bool) {
@@ -606,6 +636,7 @@ impl AgentMetrics {
         self.dependency.render(&mut output);
         self.persistence.render(&mut output);
         self.lifecycle.render(&mut output);
+        self.tools.render(&mut output);
         output
     }
 }

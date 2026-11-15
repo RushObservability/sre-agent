@@ -497,6 +497,14 @@ async fn parallel_round_ordering() {
     drop(tx);
 
     let events = collect_events(&mut rx).await;
+    let metrics = ctx.state.metrics.render();
+    for tool in ["search_logs", "query_metrics"] {
+        assert!(metrics.contains(&format!(
+            "sre_agent_tool_outcomes_total{{tool=\"{tool}\",outcome=\"success\"}} 1"
+        )));
+        assert!(metrics.contains(&format!("sre_agent_tool_operation_duration_seconds_count{{tool=\"{tool}\",outcome=\"success\"}} 1")));
+    }
+    assert!(!metrics.contains("sess-parallel"));
 
     // Extract the positions of the four round-1 events.
     let pos = |pred: &dyn Fn(&AgentEvent) -> bool| {

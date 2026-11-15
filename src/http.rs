@@ -26,6 +26,7 @@ use crate::agent::templates;
 use crate::agent::tools::{ToolContext, ToolRegistry};
 use crate::cancellation::CancellationToken;
 use crate::metrics::AgentMetrics;
+use crate::metrics::streaming::{Channel, EventSender, StreamObservation};
 use crate::state::AppState;
 
 /// Build the production router: all API routes plus the CORS and trace
@@ -195,6 +196,7 @@ async fn metrics(State(state): State<AppState>) -> Response {
 struct SseCancellationGuard {
     cancellation: CancellationToken,
     metrics: Arc<AgentMetrics>,
+    observation: StreamObservation,
 }
 
 impl Drop for SseCancellationGuard {
@@ -208,10 +210,12 @@ fn sse_body(
     rx: mpsc::Receiver<AgentEvent>,
     cancellation: CancellationToken,
     metrics: Arc<AgentMetrics>,
+    started: std::time::Instant,
 ) -> Body {
     metrics.sse_opened();
     let guard = SseCancellationGuard {
         cancellation,
+        observation: StreamObservation::new(metrics.clone(), started),
         metrics,
     };
     let heartbeat = tokio::time::interval_at(
@@ -220,14 +224,15 @@ fn sse_body(
     );
     let stream = futures_util::stream::unfold(
         (rx, heartbeat, guard),
-        |(mut rx, mut heartbeat, guard)| async move {
+        |(mut rx, mut heartbeat, mut guard)| async move {
             tokio::select! {
-                event = rx.recv() => event.map(|event| {
-                    (
-                        Ok::<_, std::convert::Infallible>(Bytes::from(event.to_sse_bytes())),
-                        (rx, heartbeat, guard),
-                    )
-                }),
+                event = rx.recv() => match event {
+                    Some(event) => {
+                        guard.observation.observe(&event);
+                        Some((Ok::<_, std::convert::Infallible>(Bytes::from(event.to_sse_bytes())), (rx, heartbeat, guard)))
+                    }
+                    None => { guard.observation.channel_closed(); None }
+                },
                 _ = heartbeat.tick() => Some((
                     Ok::<_, std::convert::Infallible>(Bytes::from_static(b": keep-alive\n\n")),
                     (rx, heartbeat, guard),
@@ -323,6 +328,7 @@ async fn investigate(
         .await
         .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error.to_string()))?;
     let investigation_started = std::time::Instant::now();
+    let stream_started = std::time::Instant::now();
 
     // Build the tenant's unified skill store, cached per tenant for 60s — skill edits show up on
     // the next investigation within a minute, without paying an HTTP fetch to
@@ -700,6 +706,7 @@ async fn investigate(
                 rx,
                 CancellationToken::new(),
                 state.metrics.clone(),
+                stream_started,
             ))
             .unwrap());
     }
@@ -731,7 +738,9 @@ async fn investigate(
     let saved_activity = Arc::new(Mutex::new(SavedActivityLog::default()));
     let activity_for_forwarder = saved_activity.clone();
     let client_tx = tx.clone();
+    let forwarder_metrics = state.metrics.clone();
     let activity_forwarder = tokio::spawn(async move {
+        let client_tx = EventSender::new(&client_tx, &forwarder_metrics, Channel::Client);
         while let Some(event) = agent_rx.recv().await {
             if let Ok(mut activity) = activity_for_forwarder.lock() {
                 activity.push(&event);
@@ -838,7 +847,7 @@ async fn investigate(
     });
 
     // Convert the receiver into an SSE byte stream
-    let body = sse_body(rx, cancellation, state.metrics.clone());
+    let body = sse_body(rx, cancellation, state.metrics.clone(), stream_started);
 
     Ok(Response::builder()
         .status(200)
@@ -855,6 +864,10 @@ async fn list_investigation_templates() -> Json<serde_json::Value> {
     let templates = templates::built_in_templates();
     Json(serde_json::json!({ "templates": templates }))
 }
+
+#[cfg(test)]
+#[path = "http/streaming_tests.rs"]
+mod streaming_tests;
 
 #[cfg(test)]
 mod tests {

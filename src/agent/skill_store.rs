@@ -64,24 +64,14 @@ impl SkillStore {
     pub async fn load_with_metrics(
         query_api: &Arc<QueryApiClient>,
         tenant_id: &str,
-        metrics: Option<&AgentMetrics>,
+        _metrics: Option<&AgentMetrics>,
     ) -> Self {
         let mut store = Self::with_built_ins();
-        let started = std::time::Instant::now();
-        if let Some(metrics) = metrics {
-            metrics.query_api_started();
-        }
         match query_api.list_enabled_custom_skills(tenant_id).await {
             Ok(custom) => {
-                if let Some(metrics) = metrics {
-                    metrics.query_api_finished(started.elapsed(), true);
-                }
                 store.extend_with_custom(custom);
             }
             Err(e) => {
-                if let Some(metrics) = metrics {
-                    metrics.query_api_finished(started.elapsed(), false);
-                }
                 tracing::warn!(
                     "failed to load custom skills from query-api; continuing with built-ins: {e}"
                 );

@@ -231,3 +231,30 @@ async fn public_session_routes_are_not_exposed_by_the_agent() {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }
+
+#[tokio::test]
+async fn readiness_probes_balance_dependency_gauges() {
+    let metrics = Arc::new(sre_agent::metrics::AgentMetrics::new());
+    let state = AppState {
+        query_api: Arc::new(QueryApiClient::new_disconnected_for_tests()),
+        internal_auth_token: INTERNAL_TOKEN.into(),
+        caches: Arc::new(Default::default()),
+        admission: Arc::new(sre_agent::state::InvestigationAdmission::new(
+            1,
+            0,
+            metrics.clone(),
+        )),
+        metrics: metrics.clone(),
+    };
+    let app = router(state);
+    for _ in 0..3 {
+        let _ = app
+            .clone()
+            .oneshot(Request::get("/readyz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+    }
+    let output = metrics.render();
+    assert!(output.contains("sre_agent_query_api_requests_in_flight 0"));
+    assert!(output.contains("sre_agent_query_api_requests_total 6"));
+}

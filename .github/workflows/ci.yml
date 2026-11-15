@@ -2,8 +2,9 @@ name: ci
 
 on:
   pull_request:
-    branches: [main]
-    types: [opened, synchronize]
+    # Stacked PRs need the same checks as PRs targeting main. Include edited so
+    # retargeting a PR also validates its new merge result.
+    types: [opened, synchronize, reopened, edited, ready_for_review]
 
 env:
   CARGO_TERM_COLOR: always

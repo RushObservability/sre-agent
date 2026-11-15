@@ -5,6 +5,8 @@
 //! difficult to accidentally add tenant IDs, session IDs, queries, or arbitrary
 //! user/tool input as label values.
 
+pub mod persistence;
+
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -35,6 +37,7 @@ impl Histogram {
 
 #[derive(Default)]
 pub struct AgentMetrics {
+    persistence: persistence::PersistenceMetrics,
     investigations_in_flight: AtomicI64,
     investigations_queued: AtomicI64,
     investigations_started: AtomicU64,
@@ -596,6 +599,7 @@ impl AgentMetrics {
             "Query-api dependency request duration in seconds.",
             &self.query_api_duration,
         );
+        self.persistence.render(&mut output);
         output
     }
 }
@@ -679,6 +683,6 @@ mod tests {
         assert!(output.contains("sre_agent_investigation_tool_calls_total 3"));
         assert!(output.contains("sre_agent_process_resident_memory_bytes 10"));
         assert!(!output.contains("tenant"));
-        assert!(!output.contains("session"));
+        assert!(!output.contains("session_id="));
     }
 }

@@ -108,11 +108,12 @@ impl QueryApiClient {
         &self,
         request: reqwest::RequestBuilder,
     ) -> Result<(reqwest::Response, RequestGuard)> {
-        let request = request
-            .build()
-            .context("failed to build query-api request")?;
+        let (client, request) = request.build_split();
+        let request = request.context("failed to build query-api request")?;
         let mut guard = RequestGuard::new(self.metrics.clone(), request.url().path());
-        match self.http.execute(request).await {
+        // Preserve the request builder's client and connection pool without cloning its body.
+        let request = reqwest::RequestBuilder::from_parts(client, request);
+        match request.send().await {
             Ok(response) => {
                 guard.set_http_status(response.status());
                 Ok((response, guard))

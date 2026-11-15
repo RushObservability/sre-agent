@@ -21,7 +21,6 @@ use tower_http::trace::TraceLayer;
 use crate::agent;
 use crate::agent::contracts::InvestigationWindow;
 use crate::agent::memory::WorkingMemory;
-use crate::agent::skill_store::SkillStore;
 use crate::agent::stream::AgentEvent;
 use crate::agent::templates;
 use crate::agent::tools::{ToolContext, ToolRegistry};
@@ -325,32 +324,17 @@ async fn investigate(
         .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error.to_string()))?;
     let investigation_started = std::time::Instant::now();
 
-    // Build the unified skill store, cached for 60s — skill edits show up on
+    // Build the tenant's unified skill store, cached per tenant for 60s — skill edits show up on
     // the next investigation within a minute, without paying an HTTP fetch to
     // query-api (or a config_db scan) on every single request.
-    const SKILL_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
-    let cached_skills = {
-        let guard = state.caches.skills.read().await;
-        guard
-            .as_ref()
-            .filter(|(built_at, _)| built_at.elapsed() < SKILL_CACHE_TTL)
-            .map(|(_, store)| store.clone())
-    };
-    let skill_store = match cached_skills {
-        Some(store) => store,
-        None => {
-            let store = Arc::new(
-                SkillStore::load_with_metrics(
-                    &state.query_api,
-                    &req.tenant_id,
-                    Some(state.metrics.as_ref()),
-                )
-                .await,
-            );
-            *state.caches.skills.write().await = Some((std::time::Instant::now(), store.clone()));
-            store
-        }
-    };
+    let skill_store = state
+        .caches
+        .skill_store(
+            &state.query_api,
+            &req.tenant_id,
+            Some(state.metrics.as_ref()),
+        )
+        .await;
 
     // Determine whether this is a new or existing session.
     let is_new_session = req.session_id.is_empty();
@@ -661,15 +645,7 @@ async fn investigate(
     // untrusted strings either way — LoopBudget::from_overrides clamps them.
     // Cached for 30s — saves two `config_settings FINAL` scans per request;
     // operator changes to the budget take effect within half a minute.
-    const BUDGET_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
-    let cached_budget = {
-        let guard = state.caches.budget.read().await;
-        guard
-            .as_ref()
-            .filter(|(read_at, _)| read_at.elapsed() < BUDGET_CACHE_TTL)
-            .map(|(_, b)| *b)
-    };
-    let budget = match cached_budget {
+    let budget = match state.caches.budget.get(&req.tenant_id).await {
         Some(b) => b,
         None => {
             let read = |key: &'static str, env: &'static str| {
@@ -688,7 +664,7 @@ async fn investigate(
                 read("sre_agent_max_tool_steps", "SRE_AGENT_MAX_TOOL_STEPS").await,
                 read("sre_agent_max_llm_calls", "SRE_AGENT_MAX_LLM_CALLS").await,
             );
-            *state.caches.budget.write().await = Some((std::time::Instant::now(), b));
+            state.caches.budget.insert(&req.tenant_id, b).await;
             b
         }
     };

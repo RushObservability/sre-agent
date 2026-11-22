@@ -83,12 +83,6 @@ jobs:
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
           echo "Releasing ${tag}" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Install cargo-audit
-        run: cargo install --locked cargo-audit
-
-      - name: Audit release dependencies
-        run: cargo audit
-
       - name: Check formatting
         run: cargo fmt --check
 

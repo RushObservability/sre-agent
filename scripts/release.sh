@@ -136,6 +136,16 @@ if ! gh auth status >/dev/null 2>&1; then
   exit 1
 fi
 
+if ! cargo audit --version >/dev/null 2>&1; then
+  echo "Install cargo-audit with cargo install --locked cargo-audit." >&2
+  exit 1
+fi
+
+if ! cargo audit; then
+  echo "Release dependency audit failed. Fix any vulnerabilities on main before retrying." >&2
+  exit 1
+fi
+
 git switch -c "$release_branch"
 
 toml_tmp="$(mktemp "${TMPDIR:-/tmp}/sre-agent-Cargo.toml.XXXXXX")"

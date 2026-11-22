@@ -47,7 +47,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # "query" is required from reqwest 0.13 on: RequestBuilder::query moved behind
 # an opt-in feature, and it is not in the default set.
 reqwest = { version = "0.13", features = ["json", "query", "stream"] }
-jsonwebtoken = "11"
+jsonwebtoken = "12"
 flate2 = "1"
 tar = "0.4"
 walkdir = "2"

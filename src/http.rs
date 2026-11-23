@@ -96,8 +96,11 @@ fn default_context_turns() -> usize {
     10
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct InvestigateRequest {
+    /// Opaque notebook access from the authenticated query-api proxy. Never persist or prompt it.
+    #[serde(default)]
+    notebook_access: Option<String>,
     /// If non-empty, continue this session. If empty, create a new session.
     #[serde(default)]
     session_id: String,
@@ -640,8 +643,16 @@ async fn investigate_admitted(
     let mut registry = ToolRegistry::new();
     agent::built_in::register_all(&mut registry);
 
+    let mut tool_state = state.clone();
+    tool_state.query_api = Arc::new(
+        state
+            .query_api
+            .as_ref()
+            .clone()
+            .with_notebook_access(req.notebook_access),
+    );
     let tool_ctx = ToolContext {
-        state: state.clone(),
+        state: tool_state,
         skill_store,
         tenant_id: req.tenant_id.clone(),
         scopes: req.scopes,

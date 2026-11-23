@@ -12,6 +12,7 @@ enum Operation {
     Profiles,
     Context,
     Session,
+    Notebook,
     Kubernetes,
     Audit,
     Other,
@@ -22,6 +23,8 @@ impl Operation {
             Self::Probe
         } else if path.starts_with("/api/v1/internal/sre/sessions") {
             Self::Session
+        } else if path.starts_with("/api/v1/internal/sre/notebooks") {
+            Self::Notebook
         } else if path == "/api/v1/internal/sre/context" {
             Self::Context
         } else if path == "/api/v1/profiles" {
@@ -47,6 +50,7 @@ impl Operation {
             Self::Profiles => "profiles",
             Self::Context => "context",
             Self::Session => "session",
+            Self::Notebook => "notebook",
             Self::Kubernetes => "kubernetes",
             Self::Audit => "audit",
             Self::Other => "other",

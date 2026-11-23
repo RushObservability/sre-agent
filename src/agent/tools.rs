@@ -47,6 +47,9 @@ pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> &str;
     fn parameters(&self) -> Value;
+    fn mutates_state(&self) -> bool {
+        false
+    }
     async fn execute(&self, args: Value, ctx: &ToolContext) -> Result<String>;
 }
 
@@ -54,6 +57,7 @@ pub trait Tool: Send + Sync {
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
     order: Vec<String>,
+    writes: tokio::sync::Mutex<()>,
 }
 
 impl Default for ToolRegistry {
@@ -67,6 +71,7 @@ impl ToolRegistry {
         Self {
             tools: HashMap::new(),
             order: Vec::new(),
+            writes: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -104,7 +109,13 @@ impl ToolRegistry {
             .tools
             .get(name)
             .ok_or_else(|| anyhow::anyhow!("unknown tool: {name}"))?;
-        tool.execute(args, ctx).await
+        if tool.mutates_state() {
+            // Preserve the order of additions in a parallel model tool batch.
+            let _guard = self.writes.lock().await;
+            tool.execute(args, ctx).await
+        } else {
+            tool.execute(args, ctx).await
+        }
     }
 }
 

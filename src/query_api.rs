@@ -19,6 +19,7 @@ pub struct QueryApiClient {
     internal_token: String,
     http: reqwest::Client,
     metrics: Option<Arc<AgentMetrics>>,
+    notebook_access: Option<String>,
 }
 
 pub enum ProfileRead<T> {
@@ -59,6 +60,7 @@ impl QueryApiClient {
             internal_token,
             http,
             metrics: None,
+            notebook_access: None,
         })
     }
 
@@ -69,6 +71,60 @@ impl QueryApiClient {
 
     pub fn base_url(&self) -> &Url {
         &self.base_url
+    }
+
+    /// Access issued by query-api for this turn, kept outside messages and tool arguments.
+    pub fn with_notebook_access(mut self, access: Option<String>) -> Self {
+        self.notebook_access = access;
+        self
+    }
+
+    fn notebook_request(
+        &self,
+        method: Method,
+        tenant: &str,
+        path: &str,
+    ) -> Result<reqwest::RequestBuilder> {
+        let access = self.notebook_access.as_deref().filter(|s| !s.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("Notebook access is unavailable. Start this investigation through an updated Rush query-api."))?;
+        Ok(self
+            .request(method, tenant, path)?
+            .header(
+                "user-agent",
+                concat!("rush-sre-agent/", env!("CARGO_PKG_VERSION")),
+            )
+            .header("x-rush-notebook-access", access))
+    }
+
+    pub async fn notebooks(&self, tenant: &str, id: Option<&str>) -> Result<Value> {
+        let mut path = "api/v1/internal/sre/notebooks".to_string();
+        if let Some(id) = id {
+            let id = uuid::Uuid::parse_str(id).context("notebook_id must be a UUID")?;
+            path.push_str(&format!("/{id}"));
+        }
+        self.send_json(self.notebook_request(Method::GET, tenant, &path)?)
+            .await
+    }
+
+    pub async fn create_notebook(&self, tenant: &str, body: &Value) -> Result<Value> {
+        self.send_json(
+            self.notebook_request(Method::POST, tenant, "api/v1/internal/sre/notebooks")?
+                .json(body),
+        )
+        .await
+    }
+
+    pub async fn add_notebook_cell(&self, tenant: &str, id: &str, body: &Value) -> Result<Value> {
+        let id = uuid::Uuid::parse_str(id).context("notebook_id must be a UUID")?;
+        self.send_json(
+            self.notebook_request(
+                Method::POST,
+                tenant,
+                &format!("api/v1/internal/sre/notebooks/{id}/cells"),
+            )?
+            .json(body),
+        )
+        .await
     }
 
     fn url(&self, path: &str) -> Result<Url> {

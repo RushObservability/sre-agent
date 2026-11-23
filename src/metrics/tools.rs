@@ -3,6 +3,10 @@ use super::{HISTOGRAM_BUCKETS, Histogram};
 use std::{collections::BTreeMap, fmt::Write, sync::Mutex, time::Duration};
 pub(super) fn bounded_name(name: &str) -> &'static str {
     match name {
+        "list_notebooks" => "list_notebooks",
+        "get_notebook" => "get_notebook",
+        "create_notebook" => "create_notebook",
+        "add_notebook_cell" => "add_notebook_cell",
         "analyze_trace_critical_path" => "analyze_trace_critical_path",
         "compare_service_windows" => "compare_service_windows",
         "detect_service_silence" => "detect_service_silence",

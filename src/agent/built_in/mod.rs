@@ -10,6 +10,7 @@ mod kubernetes_access;
 mod logs;
 mod metrics;
 mod mysql;
+mod notebooks;
 mod past_incidents;
 mod postgres;
 mod profiles;
@@ -25,6 +26,10 @@ use std::sync::Arc;
 /// Register all built-in tools.
 pub fn register_all(registry: &mut ToolRegistry) {
     let tools: Vec<Arc<dyn Tool>> = vec![
+        Arc::new(notebooks::NotebookTool(notebooks::Action::List)),
+        Arc::new(notebooks::NotebookTool(notebooks::Action::Get)),
+        Arc::new(notebooks::NotebookTool(notebooks::Action::Create)),
+        Arc::new(notebooks::NotebookTool(notebooks::Action::AddCell)),
         Arc::new(traces::QueryTraces),
         Arc::new(traces::GetTrace),
         Arc::new(logs::SearchLogs),

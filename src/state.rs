@@ -103,9 +103,10 @@ pub struct AppState {
     /// Sole data-plane dependency. Telemetry and configuration are both read
     /// through query-api, which owns tenant enforcement and ClickHouse access.
     pub query_api: Arc<QueryApiClient>,
-    /// Shared secret required on every non-health HTTP request. Only query-api
-    /// receives this value in a production deployment.
+    /// Shared credential for investigation API calls from query-api.
     pub internal_auth_token: String,
+    /// Optional credential authorized only for the metrics route.
+    pub metrics_auth_token: Option<String>,
     /// Short-TTL caches for per-request setup (skill store, loop budget).
     pub caches: Arc<RuntimeCaches>,
     /// Process-local Prometheus registry and counters.

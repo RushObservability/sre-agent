@@ -24,6 +24,14 @@ async fn main() -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!(
             "SRE_AGENT_INTERNAL_TOKEN must be set; refusing to expose the SRE agent without internal authentication"
         ))?;
+    let metrics_auth_token = std::env::var("SRE_AGENT_METRICS_TOKEN")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    anyhow::ensure!(
+        metrics_auth_token.as_deref().map(str::trim) != Some(internal_auth_token.trim()),
+        "SRE_AGENT_METRICS_TOKEN must differ from SRE_AGENT_INTERNAL_TOKEN"
+    );
     let query_api_url = std::env::var("QUERY_API_URL")
         .ok()
         .filter(|value| !value.trim().is_empty())
@@ -45,6 +53,7 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState {
         query_api,
         internal_auth_token,
+        metrics_auth_token,
         caches: Arc::new(Default::default()),
         admission: Arc::new(InvestigationAdmission::from_env(metrics.clone())),
         metrics,

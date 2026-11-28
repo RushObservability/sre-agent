@@ -493,6 +493,7 @@ async fn build_app_state() -> Result<AppState> {
     Ok(AppState {
         query_api,
         internal_auth_token,
+        metrics_auth_token: None,
         caches: Arc::new(Default::default()),
         metrics: Arc::new(sre_agent::metrics::AgentMetrics::new()),
         admission: Arc::new(sre_agent::state::InvestigationAdmission::new(

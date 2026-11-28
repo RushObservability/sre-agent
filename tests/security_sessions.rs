@@ -90,6 +90,7 @@ async fn server_owned_sessions_preserve_history_and_redact_saved_activity() {
     let app = router(AppState {
         query_api: Arc::new(QueryApiClient::new(&url, "test-internal".into()).unwrap()),
         internal_auth_token: "test-internal".into(),
+        metrics_auth_token: None,
         caches: Arc::new(Default::default()),
         metrics: metrics.clone(),
         admission: Arc::new(sre_agent::state::InvestigationAdmission::new(

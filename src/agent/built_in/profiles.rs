@@ -378,6 +378,7 @@ mod tests {
             state: crate::AppState {
                 query_api: Arc::new(client),
                 internal_auth_token: "test".into(),
+                metrics_auth_token: None,
                 caches: Arc::new(Default::default()),
                 metrics: metrics.clone(),
                 admission: Arc::new(crate::state::InvestigationAdmission::new(4, 16, metrics)),

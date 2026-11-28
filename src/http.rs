@@ -48,7 +48,6 @@ pub fn router(mut state: AppState) -> Router {
             "/api/v1/investigation-templates",
             get(list_investigation_templates),
         )
-        .route("/metrics", get(metrics))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             require_internal_token,
@@ -56,6 +55,7 @@ pub fn router(mut state: AppState) -> Router {
 
     Router::new()
         .merge(protected)
+        .route("/metrics", get(metrics))
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .layer(TraceLayer::new_for_http())
@@ -68,18 +68,18 @@ async fn require_internal_token(
     req: axum::extract::Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    use subtle::ConstantTimeEq;
-
-    let supplied = headers
-        .get("x-rush-internal-token")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("");
-    let expected = state.internal_auth_token.as_bytes();
-    let valid = supplied.len() == expected.len() && supplied.as_bytes().ct_eq(expected).into();
-    if !valid {
+    if !valid_token(&headers, &state.internal_auth_token) {
         return Err(StatusCode::UNAUTHORIZED);
     }
     Ok(next.run(req).await)
+}
+
+fn valid_token(headers: &HeaderMap, expected: &str) -> bool {
+    use subtle::ConstantTimeEq;
+
+    headers.get("x-rush-internal-token").is_some_and(|value| {
+        !expected.is_empty() && bool::from(value.as_bytes().ct_eq(expected.as_bytes()))
+    })
 }
 
 fn default_tenant() -> String {
@@ -182,7 +182,14 @@ async fn readyz(State(state): State<AppState>) -> Response {
         .into_response()
 }
 
-async fn metrics(State(state): State<AppState>) -> Response {
+async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !state
+        .metrics_auth_token
+        .as_deref()
+        .is_some_and(|token| valid_token(&headers, token))
+    {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
     Response::builder()
         .status(StatusCode::OK)
         .header(

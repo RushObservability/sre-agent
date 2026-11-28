@@ -336,6 +336,7 @@ pub async fn make_ctx() -> ToolContext {
         state: sre_agent::AppState {
             query_api,
             internal_auth_token: "test-not-an-http-server".to_string(),
+            metrics_auth_token: None,
             caches: Arc::new(Default::default()),
             metrics: Arc::new(sre_agent::metrics::AgentMetrics::new()),
             admission: Arc::new(sre_agent::state::InvestigationAdmission::new(

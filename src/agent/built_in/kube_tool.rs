@@ -538,6 +538,7 @@ mod policy_tests {
             state: crate::AppState {
                 query_api: Arc::new(crate::query_api::QueryApiClient::new_disconnected_for_tests()),
                 internal_auth_token: "test".into(),
+                metrics_auth_token: None,
                 caches: Arc::new(Default::default()),
                 metrics: metrics.clone(),
                 admission: Arc::new(crate::state::InvestigationAdmission::new(4, 16, metrics)),

@@ -13,6 +13,7 @@ use sre_agent::http::router;
 use sre_agent::query_api::QueryApiClient;
 
 const INTERNAL_TOKEN: &str = "test-internal-token";
+const METRICS_TOKEN: &str = "test-metrics-token";
 
 /// Build the production router on a fully disconnected AppState — the same
 /// pattern as tests/common::make_ctx (no live backends, fail-fast queries).
@@ -24,6 +25,7 @@ fn router_with_api(api: QueryApiClient) -> axum::Router {
     let state = AppState {
         query_api: Arc::new(api),
         internal_auth_token: INTERNAL_TOKEN.to_string(),
+        metrics_auth_token: Some(METRICS_TOKEN.into()),
         caches: Arc::new(Default::default()),
         metrics: Arc::new(sre_agent::metrics::AgentMetrics::new()),
         admission: Arc::new(sre_agent::state::InvestigationAdmission::new(
@@ -70,19 +72,27 @@ async fn readyz_reports_unavailable_dependency_without_leaking_secrets() {
 }
 
 #[tokio::test]
-async fn metrics_preserves_internal_token_protection() {
+async fn metrics_requires_its_own_credential() {
     let app = test_router();
-    let unauthorized = app
-        .clone()
-        .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
-        .await
-        .unwrap();
-    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+    for request in [
+        Request::get("/metrics"),
+        Request::get("/metrics").header("x-rush-internal-token", INTERNAL_TOKEN),
+        Request::get("/api/v1/investigation-templates")
+            .header("x-rush-internal-token", METRICS_TOKEN),
+        Request::post("/api/v1/investigate").header("x-rush-internal-token", METRICS_TOKEN),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
 
     let authorized = app
         .oneshot(
             Request::get("/metrics")
-                .header("x-rush-internal-token", INTERNAL_TOKEN)
+                .header("x-rush-internal-token", METRICS_TOKEN)
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -290,6 +300,7 @@ async fn readiness_probes_balance_dependency_gauges() {
     let state = AppState {
         query_api: Arc::new(QueryApiClient::new_disconnected_for_tests()),
         internal_auth_token: INTERNAL_TOKEN.into(),
+        metrics_auth_token: None,
         caches: Arc::new(Default::default()),
         admission: Arc::new(sre_agent::state::InvestigationAdmission::new(
             1,
@@ -338,6 +349,7 @@ async fn setup_failures_and_cancelled_handlers_get_terminal_outcomes() {
         let app = router(AppState {
             query_api: Arc::new(QueryApiClient::new(&url, INTERNAL_TOKEN.into()).unwrap()),
             internal_auth_token: INTERNAL_TOKEN.into(),
+            metrics_auth_token: None,
             caches: Arc::new(Default::default()),
             metrics: metrics.clone(),
             admission: Arc::new(sre_agent::state::InvestigationAdmission::new(

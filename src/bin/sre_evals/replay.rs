@@ -5,6 +5,8 @@
 //! with captured tool results and a captured report. This makes the suite
 //! suitable for every pull request and gives release comparisons stable input.
 
+use jiff::Timestamp;
+use sre_agent::timestamps::TimestampFormat;
 use std::collections::HashSet;
 
 use anyhow::{Context, Result};
@@ -214,7 +216,7 @@ pub fn evaluate(run_id: &str, cases: &[EvalCase], scorer: &Scorer) -> Result<Rep
         schema_version: REPLAY_SCHEMA_VERSION,
         run_id: run_id.into(),
         suite: "sre-agent-pr6-replay".into(),
-        started_at: chrono::Utc::now().to_rfc3339(),
+        started_at: Timestamp::now().to_rfc3339(),
         metrics,
         cases: results,
         artifacts,
@@ -379,12 +381,11 @@ fn detect_report_kind(report: &str) -> String {
 fn parse_confidence(report: &str) -> Option<f64> {
     for token in report.split_whitespace() {
         let candidate = token.trim_matches(|c: char| !c.is_ascii_digit() && c != '.');
-        if candidate.contains('.') {
-            if let Ok(value) = candidate.parse::<f64>() {
-                if (0.0..=1.0).contains(&value) {
-                    return Some(value);
-                }
-            }
+        if candidate.contains('.')
+            && let Ok(value) = candidate.parse::<f64>()
+            && (0.0..=1.0).contains(&value)
+        {
+            return Some(value);
         }
     }
     None
@@ -584,7 +585,7 @@ mod tests {
     #[test]
     fn suite_has_at_least_twenty_cases_and_all_are_replayable() {
         let cases: CasesFile =
-            serde_yaml::from_str(include_str!("../../../evals/replay_cases.yaml"))
+            serde_saphyr::from_str(include_str!("../../../evals/replay_cases.yaml"))
                 .expect("replay suite YAML must parse");
         assert!(cases.cases.len() >= 20);
         for case in &cases.cases {
@@ -610,7 +611,7 @@ mod tests {
     #[test]
     fn replay_suite_meets_pr6_quality_gate() {
         let cases: CasesFile =
-            serde_yaml::from_str(include_str!("../../../evals/replay_cases.yaml"))
+            serde_saphyr::from_str(include_str!("../../../evals/replay_cases.yaml"))
                 .expect("replay suite YAML must parse");
         let run = evaluate("test", &cases.cases, &scorer()).expect("suite should evaluate");
         let gate = release_gate(&run, None);

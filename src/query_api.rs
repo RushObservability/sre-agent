@@ -2,7 +2,10 @@ use crate::metrics::{
     AgentMetrics,
     dependency::{Outcome, RequestGuard},
 };
+use crate::timestamps::TimestampFormat;
+pub use crate::timestamps::format_nanos_timestamp;
 use anyhow::{Context, Result, bail};
+use jiff::{SignedDuration, Timestamp};
 use reqwest::{Method, StatusCode, Url};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
@@ -792,31 +795,27 @@ pub fn bounded_time_range(
     minutes: u64,
 ) -> Result<(String, String)> {
     let to = if around.trim().is_empty() {
-        chrono::Utc::now()
+        Timestamp::now()
     } else {
-        chrono::DateTime::parse_from_rfc3339(around)
+        around
+            .parse::<Timestamp>()
             .context("around must be an RFC3339 timestamp")?
-            .with_timezone(&chrono::Utc)
     };
     let from = if around.trim().is_empty() {
-        to - chrono::Duration::minutes(minutes.clamp(1, 1440) as i64)
+        to.checked_sub(SignedDuration::from_mins(minutes.clamp(1, 1440) as i64))?
     } else {
-        to - chrono::Duration::minutes(around_minutes.clamp(1, 720) as i64)
+        to.checked_sub(SignedDuration::from_mins(
+            around_minutes.clamp(1, 720) as i64
+        ))?
     };
     let to = if around.trim().is_empty() {
         to
     } else {
-        to + chrono::Duration::minutes(around_minutes.clamp(1, 720) as i64)
+        to.checked_add(SignedDuration::from_mins(
+            around_minutes.clamp(1, 720) as i64
+        ))?
     };
     Ok((from.to_rfc3339(), to.to_rfc3339()))
-}
-
-pub fn format_nanos_timestamp(nanos: i64) -> String {
-    let seconds = nanos.div_euclid(1_000_000_000);
-    let subsecond = nanos.rem_euclid(1_000_000_000) as u32;
-    chrono::DateTime::from_timestamp(seconds, subsecond)
-        .map(|value| value.to_rfc3339())
-        .unwrap_or_else(|| nanos.to_string())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

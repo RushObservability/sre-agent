@@ -29,10 +29,10 @@ futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # YAML for the eval harness case files (src/bin/sre_evals.rs).
-serde_yaml = "0.9"
+serde-saphyr = "0.0.29"
 
 # Kubernetes client (for argocd + kube tools)
-kube = { version = "4.0", features = ["client", "runtime", "derive"] }
+kube = { version = "4.2.1", default-features = false, features = ["client", "runtime", "derive", "rustls-tls", "ring"] }
 k8s-openapi = { version = "0.28", features = ["v1_32"] }
 
 # Error handling
@@ -55,7 +55,7 @@ sha2 = "0.11"
 
 # Utilities
 async-trait = "0.1"
-chrono = { version = "0.4", features = ["serde"] }
+jiff = { version = "0.2", features = ["serde"] }
 dotenvy = "0.15"
 uuid = { version = "1", features = ["v4"] }
 subtle = "2"

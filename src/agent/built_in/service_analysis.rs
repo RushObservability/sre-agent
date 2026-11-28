@@ -9,7 +9,9 @@ use crate::agent::contracts::{
     require_window_from_args, serialize_tool_output,
 };
 use crate::agent::tools::{Tool, ToolContext};
+use crate::timestamps::TimestampFormat;
 use anyhow::Result;
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
@@ -180,8 +182,8 @@ async fn fetch_detail_periods(
     ctx: &ToolContext,
     services: &[String],
     period: &str,
-    start: chrono::DateTime<chrono::Utc>,
-    end: chrono::DateTime<chrono::Utc>,
+    start: Timestamp,
+    end: Timestamp,
     seconds: f64,
 ) -> Result<(Vec<EndpointPeriodRow>, Vec<ClientWaitPeriodRow>, bool)> {
     const DETAIL_LIMIT: usize = 1000;
@@ -332,8 +334,8 @@ async fn fetch_service_periods(
 }
 
 #[cfg(test)]
-fn sql_timestamp(value: chrono::DateTime<chrono::Utc>) -> String {
-    value.format("%Y-%m-%d %H:%M:%S.%f").to_string()
+fn sql_timestamp(value: Timestamp) -> String {
+    value.strftime("%Y-%m-%d %H:%M:%S%.9f").to_string()
 }
 
 #[cfg(test)]
@@ -387,7 +389,7 @@ fn period_predicate(window: &InvestigationWindow, period: &str, column: &str) ->
 }
 
 fn duration_seconds(window: &InvestigationWindow) -> f64 {
-    (window.incident_duration().num_milliseconds() as f64 / 1_000.0).max(0.001)
+    (window.incident_duration().as_millis() as f64 / 1_000.0).max(0.001)
 }
 
 #[cfg(test)]
@@ -922,8 +924,8 @@ struct DependencySpan {
 async fn fetch_dependency_period(
     ctx: &ToolContext,
     period: &str,
-    start: chrono::DateTime<chrono::Utc>,
-    end: chrono::DateTime<chrono::Utc>,
+    start: Timestamp,
+    end: Timestamp,
     seconds: f64,
 ) -> Result<Vec<DependencyPeriodRow>> {
     let response: DependencySpanResponse = ctx
@@ -1258,14 +1260,13 @@ impl Tool for RankSlowDependencies {
 mod tests {
     use super::*;
     use crate::agent::contracts::WindowSelectionReason;
-    use chrono::{Duration, TimeZone, Utc};
 
     fn window() -> InvestigationWindow {
         InvestigationWindow::new(
-            Utc.with_ymd_and_hms(2026, 8, 1, 10, 0, 0).unwrap(),
-            Utc.with_ymd_and_hms(2026, 8, 1, 11, 0, 0).unwrap(),
-            Utc.with_ymd_and_hms(2026, 8, 1, 9, 0, 0).unwrap(),
-            Utc.with_ymd_and_hms(2026, 8, 1, 10, 0, 0).unwrap(),
+            "2026-08-01T10:00:00Z".parse().unwrap(),
+            "2026-08-01T11:00:00Z".parse().unwrap(),
+            "2026-08-01T09:00:00Z".parse().unwrap(),
+            "2026-08-01T10:00:00Z".parse().unwrap(),
             WindowSelectionReason::UserProvidedRange,
         )
         .unwrap()
@@ -1375,6 +1376,5 @@ mod tests {
         assert_eq!(service_list(&args), vec!["api", "media"]);
         args["service"] = json!("gateway");
         assert_eq!(service_list(&args), vec!["api", "gateway", "media"]);
-        let _ = Duration::seconds(1); // keep chrono import explicit for contract parity
     }
 }

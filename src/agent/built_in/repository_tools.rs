@@ -3,6 +3,7 @@ use crate::models::anomaly::DeployMarker;
 use crate::models::service_link::ServiceLink;
 use crate::repository::{Comparison, compare_revisions, ensure_snapshot, resolve_under};
 use anyhow::{Context, Result, bail};
+use jiff::Timestamp;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
@@ -663,12 +664,9 @@ impl ListChanges {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(|value| {
-                chrono::DateTime::parse_from_rfc3339(value)
-                    .map(|time| {
-                        time.with_timezone(&chrono::Utc)
-                            .format("%Y-%m-%dT%H:%M:%SZ")
-                            .to_string()
-                    })
+                value
+                    .parse::<Timestamp>()
+                    .map(|time| time.strftime("%Y-%m-%dT%H:%M:%SZ").to_string())
                     .context("around must be an ISO 8601 timestamp")
             })
             .transpose()?;

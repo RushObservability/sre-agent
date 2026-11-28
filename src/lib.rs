@@ -13,5 +13,6 @@ pub mod query_api;
 mod query_contract;
 pub mod repository;
 pub mod state;
+pub mod timestamps;
 
 pub use state::AppState;

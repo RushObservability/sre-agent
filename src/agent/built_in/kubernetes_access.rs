@@ -7,7 +7,7 @@
 
 use crate::agent::tools::{Tool, ToolContext};
 use anyhow::{Result, bail};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde_json::{Value, json};
 
 const MAX_RESPONSE_BYTES: usize = 512 * 1024;
@@ -21,7 +21,7 @@ fn required_timestamp(args: &Value, name: &str) -> Result<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| anyhow::anyhow!("{name} is required"))?;
-    DateTime::parse_from_rfc3339(raw)
+    raw.parse::<Timestamp>()
         .map_err(|_| anyhow::anyhow!("{name} must be an RFC3339 timestamp"))?;
     Ok(raw.to_string())
 }
@@ -89,12 +89,12 @@ impl Tool for SearchKubernetesAccess {
         }
         let from = required_timestamp(&args, "from")?;
         let to = required_timestamp(&args, "to")?;
-        let from_time = DateTime::parse_from_rfc3339(&from)?.with_timezone(&Utc);
-        let to_time = DateTime::parse_from_rfc3339(&to)?.with_timezone(&Utc);
+        let from_time = from.parse::<Timestamp>()?;
+        let to_time = to.parse::<Timestamp>()?;
         if to_time <= from_time {
             bail!("to must be later than from")
         }
-        if to_time.signed_duration_since(from_time) > chrono::Duration::days(7) {
+        if to_time.duration_since(from_time) > jiff::SignedDuration::from_hours(7 * 24) {
             bail!("Kubernetes access searches are limited to a seven-day window")
         }
 

@@ -9,7 +9,10 @@ use crate::agent::contracts::{
     ToolResultEnvelope, require_window_from_args, serialize_tool_output,
 };
 use crate::agent::tools::{Tool, ToolContext};
+use crate::timestamps::TimestampFormat;
 use anyhow::Result;
+#[cfg(test)]
+use jiff::Timestamp;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -24,15 +27,12 @@ fn sql_quote(value: &str) -> String {
 }
 
 #[cfg(test)]
-fn sql_timestamp(value: chrono::DateTime<chrono::Utc>) -> String {
-    value.format("%Y-%m-%d %H:%M:%S.%f").to_string()
+fn sql_timestamp(value: Timestamp) -> String {
+    value.strftime("%Y-%m-%d %H:%M:%S%.9f").to_string()
 }
 
 #[cfg(test)]
-fn period_bounds(
-    window: &InvestigationWindow,
-    period: &str,
-) -> (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>) {
+fn period_bounds(window: &InvestigationWindow, period: &str) -> (Timestamp, Timestamp) {
     if period == "incident" {
         (window.incident_start, window.incident_end)
     } else {
@@ -155,9 +155,10 @@ struct CriticalApiSpan {
 }
 
 fn trace_timestamp_nanos(value: &str) -> Option<i64> {
-    chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f")
+    jiff::civil::DateTime::strptime("%Y-%m-%d %H:%M:%S%.f", value)
+        .and_then(|time| jiff::tz::Offset::UTC.to_timestamp(time))
         .ok()
-        .map(|time| time.and_utc().timestamp_nanos_opt().unwrap_or(0))
+        .and_then(|time| time.as_nanosecond().try_into().ok())
 }
 
 fn flatten_critical_spans(
@@ -173,16 +174,8 @@ fn flatten_critical_spans(
     ) {
         let timestamp = trace_timestamp_nanos(&span.timestamp);
         if timestamp.is_some_and(|value| {
-            value
-                >= window
-                    .incident_start
-                    .timestamp_nanos_opt()
-                    .unwrap_or(i64::MIN)
-                && value
-                    < window
-                        .incident_end
-                        .timestamp_nanos_opt()
-                        .unwrap_or(i64::MAX)
+            i128::from(value) >= window.incident_start.as_nanosecond()
+                && i128::from(value) < window.incident_end.as_nanosecond()
         }) {
             rows.push(CriticalSpanRow {
                 trace_id: trace_id.to_string(),
@@ -680,8 +673,8 @@ impl Tool for GetResourceSaturation {
             Ok(value) => value,
             Err(message) => return Ok(format!("Tool error: {message}")),
         };
-        let catalog_start = window.baseline_start.min(window.incident_start).timestamp();
-        let catalog_end = window.baseline_end.max(window.incident_end).timestamp();
+        let catalog_start = window.baseline_start.min(window.incident_start).as_second();
+        let catalog_end = window.baseline_end.max(window.incident_end).as_second();
         let names = ctx
             .state
             .query_api
@@ -715,13 +708,13 @@ impl Tool for GetResourceSaturation {
             for (period, start, end) in [
                 (
                     "incident",
-                    window.incident_start.timestamp(),
-                    window.incident_end.timestamp(),
+                    window.incident_start.as_second(),
+                    window.incident_end.as_second(),
                 ),
                 (
                     "baseline",
-                    window.baseline_start.timestamp(),
-                    window.baseline_end.timestamp(),
+                    window.baseline_start.as_second(),
+                    window.baseline_end.as_second(),
                 ),
             ] {
                 let response: PromApiResponse = ctx
@@ -907,8 +900,8 @@ impl Tool for ListMetricCatalog {
             .prom_label_values(
                 &ctx.tenant_id,
                 "__name__",
-                window.incident_start.timestamp(),
-                window.incident_end.timestamp(),
+                window.incident_start.as_second(),
+                window.incident_end.as_second(),
             )
             .await?
             .into_iter()
@@ -1216,14 +1209,13 @@ impl Tool for DetectServiceSilence {
 mod tests {
     use super::*;
     use crate::agent::contracts::WindowSelectionReason;
-    use chrono::{TimeZone, Utc};
 
     fn window() -> InvestigationWindow {
         InvestigationWindow::new(
-            Utc.with_ymd_and_hms(2026, 8, 1, 10, 0, 0).unwrap(),
-            Utc.with_ymd_and_hms(2026, 8, 1, 11, 0, 0).unwrap(),
-            Utc.with_ymd_and_hms(2026, 8, 1, 9, 0, 0).unwrap(),
-            Utc.with_ymd_and_hms(2026, 8, 1, 10, 0, 0).unwrap(),
+            "2026-08-01T10:00:00Z".parse().unwrap(),
+            "2026-08-01T11:00:00Z".parse().unwrap(),
+            "2026-08-01T09:00:00Z".parse().unwrap(),
+            "2026-08-01T10:00:00Z".parse().unwrap(),
             WindowSelectionReason::UserProvidedRange,
         )
         .unwrap()

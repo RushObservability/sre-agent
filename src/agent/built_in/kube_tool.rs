@@ -622,11 +622,7 @@ fn extract_ready_status(data: &Value) -> String {
 fn extract_age(meta: &kube::api::ObjectMeta) -> String {
     if let Some(ts) = &meta.creation_timestamp {
         // Compare epoch seconds rather than the wrapped datetime value.
-        // k8s-openapi 0.28 changed Time's inner type from chrono::DateTime to
-        // jiff::Timestamp; going through seconds keeps this independent of
-        // whichever time crate k8s-openapi wraps, and jiff is not a direct
-        // dependency of ours.
-        let secs = chrono::Utc::now().timestamp() - ts.0.as_second();
+        let secs = jiff::Timestamp::now().as_second() - ts.0.as_second();
         if secs >= 86_400 {
             return format!("{}d", secs / 86_400);
         }
@@ -836,16 +832,15 @@ mod tests {
     use super::*;
 
     fn meta_created_secs_ago(secs: i64) -> kube::api::ObjectMeta {
-        let created = chrono::Utc::now() - chrono::Duration::seconds(secs);
-        serde_json::from_value(serde_json::json!({
-            "creationTimestamp": created.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-        }))
-        .expect("ObjectMeta should deserialize")
+        let created = jiff::Timestamp::now() - jiff::SignedDuration::from_secs(secs);
+        kube::api::ObjectMeta {
+            creation_timestamp: Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                created,
+            )),
+            ..Default::default()
+        }
     }
 
-    // Guards the k8s-openapi 0.28 migration: Time's inner type moved from
-    // chrono::DateTime to jiff::Timestamp. Build ObjectMeta by deserializing so
-    // the test does not name either time crate.
     #[test]
     fn extract_age_buckets_by_largest_unit() {
         // Values sit well inside their bucket, so the assertion cannot flake on

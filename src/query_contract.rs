@@ -1,5 +1,6 @@
 //! Generated from query-api/contracts/client.rs. Run query-api/scripts/sync-query-contract.py.
 //! Transport adapter only. Validation, authorization and query execution belong to the API.
+use jiff::Timestamp;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
@@ -47,15 +48,16 @@ pub fn prom_request(path: &str, params: &[(&str, String)]) -> Option<Value> {
     } else {
         "time"
     })
-    .unwrap_or_else(|| (chrono::Utc::now().timestamp_millis() as f64 / 1000.0).to_string());
+    .unwrap_or_else(|| (Timestamp::now().as_millisecond() as f64 / 1000.0).to_string());
     let start = get("start").unwrap_or_else(|| end.clone());
     let timestamp = |s: &str| {
         let seconds = s.parse::<f64>().ok()?;
         if !seconds.is_finite() {
             return None;
         }
-        chrono::DateTime::from_timestamp_millis((seconds * 1000.0) as i64)
-            .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+        Timestamp::from_millisecond((seconds * 1000.0) as i64)
+            .ok()
+            .map(|t| t.strftime("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
     };
     let mut options = json!({"query": get("query")?});
     if let Some(step) = get("step") {

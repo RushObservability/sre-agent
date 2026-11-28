@@ -17,26 +17,24 @@ env:
   IMAGE_NAME: rushobservability/sre-agent
 
 permissions:
-  contents: write
-  packages: write
-  id-token: write
-  attestations: write
+  contents: read
 
 jobs:
-  build-and-push:
+  validate:
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
-          toolchain: 1.88.0
+          toolchain: 1.89.0
           components: rustfmt, clippy
-
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Read and validate package version
         id: version
@@ -75,22 +73,45 @@ jobs:
 
           tag="v${version}"
           if git rev-parse --verify --quiet "refs/tags/${tag}" >/dev/null; then
+            if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+              echo "Tag ${tag} already exists. Skipping the release." >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
             echo "Tag ${tag} already exists. Bump the Cargo package version before releasing." >&2
             exit 1
           fi
 
-          echo "version=${version}" >> "$GITHUB_OUTPUT"
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
           echo "Releasing ${tag}" >> "$GITHUB_STEP_SUMMARY"
 
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        if: steps.version.outputs.tag != ''
+
       - name: Check formatting
+        if: steps.version.outputs.tag != ''
         run: cargo fmt --check
 
       - name: Clippy
-        run: cargo clippy -- -D warnings
+        if: steps.version.outputs.tag != ''
+        run: cargo clippy --locked -- -D warnings
 
       - name: Test
-        run: cargo test
+        if: steps.version.outputs.tag != ''
+        run: cargo test --locked
+
+  build-and-push:
+    needs: validate
+    if: needs.validate.outputs.tag != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
@@ -111,9 +132,9 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=semver,pattern={{version}},value=${{ steps.version.outputs.tag }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ steps.version.outputs.tag }}
-            type=semver,pattern={{major}},value=${{ steps.version.outputs.tag }}
+            type=semver,pattern={{version}},value=${{ needs.validate.outputs.tag }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.validate.outputs.tag }}
+            type=semver,pattern={{major}},value=${{ needs.validate.outputs.tag }}
             type=sha,prefix=
 
       - name: Build and push
@@ -154,7 +175,7 @@ jobs:
         if: ${{ always() && steps.push.outcome == 'success' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: sre-agent-${{ steps.version.outputs.tag }}-security-report
+          name: sre-agent-${{ needs.validate.outputs.tag }}-security-report
           path: |
             vulnerability-report.json
             vulnerability-summary.md
@@ -185,8 +206,8 @@ jobs:
           registry-username: ${{ github.actor }}
           registry-password: ${{ secrets.GITHUB_TOKEN }}
           format: spdx-json
-          output-file: sre-agent-${{ steps.version.outputs.tag }}.spdx.json
-          artifact-name: sre-agent-${{ steps.version.outputs.tag }}-sbom
+          output-file: sre-agent-${{ needs.validate.outputs.tag }}.spdx.json
+          artifact-name: sre-agent-${{ needs.validate.outputs.tag }}-sbom
           upload-artifact: true
           upload-artifact-retention: 90
           upload-release-assets: false
@@ -196,7 +217,7 @@ jobs:
         with:
           subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           subject-digest: ${{ steps.push.outputs.digest }}
-          sbom-path: sre-agent-${{ steps.version.outputs.tag }}.spdx.json
+          sbom-path: sre-agent-${{ needs.validate.outputs.tag }}.spdx.json
           push-to-registry: true
 
       - name: Find previous release
@@ -221,9 +242,9 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
           PREVIOUS_TAG: ${{ steps.previous-release.outputs.tag }}
-          SBOM_PATH: sre-agent-${{ steps.version.outputs.tag }}.spdx.json
+          SBOM_PATH: sre-agent-${{ needs.validate.outputs.tag }}.spdx.json
         run: |
           default_branch_sha="$(
             gh api "repos/${GITHUB_REPOSITORY}/commits/${DEFAULT_BRANCH}" --jq .sha

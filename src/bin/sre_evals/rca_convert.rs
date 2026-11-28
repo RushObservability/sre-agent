@@ -39,6 +39,8 @@
 //! We accept a JSON array of `{datetime, component, reason}` objects, and also
 //! a CSV with those three columns.
 
+use jiff::Timestamp;
+use sre_agent::timestamps::TimestampFormat;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -85,7 +87,7 @@ fn emit(cases: Vec<OutCase>) -> Result<String> {
                   # observability.* ClickHouse tables (see evals/README.md, Source C).\n\
                   # Review every case before use: verify service names match your stack and\n\
                   # the synthesized `reason` is accurate.\n";
-    let yaml = serde_yaml::to_string(&OutFile { cases }).context("serializing cases to YAML")?;
+    let yaml = serde_saphyr::to_string(&OutFile { cases }).context("serializing cases to YAML")?;
     Ok(format!("{banner}{yaml}"))
 }
 
@@ -316,10 +318,10 @@ fn build_openrca_case(
 /// First non-empty string value among the given keys.
 fn str_field(obj: &Value, keys: &[&str]) -> Option<String> {
     for k in keys {
-        if let Some(s) = obj.get(*k).and_then(|v| v.as_str()) {
-            if !s.trim().is_empty() {
-                return Some(s.trim().to_string());
-            }
+        if let Some(s) = obj.get(*k).and_then(|v| v.as_str())
+            && !s.trim().is_empty()
+        {
+            return Some(s.trim().to_string());
         }
     }
     None
@@ -329,15 +331,15 @@ fn str_field(obj: &Value, keys: &[&str]) -> Option<String> {
 /// an RFC3339 string. Returns None when it can't be interpreted.
 fn unix_or_string_to_rfc3339(v: &Value) -> Option<String> {
     if let Some(secs) = v.as_i64() {
-        return chrono::DateTime::from_timestamp(secs, 0).map(|dt| dt.to_rfc3339());
+        return Timestamp::from_second(secs).ok().map(|dt| dt.to_rfc3339());
     }
     if let Some(s) = v.as_str() {
         let s = s.trim();
         if let Ok(secs) = s.parse::<i64>() {
-            return chrono::DateTime::from_timestamp(secs, 0).map(|dt| dt.to_rfc3339());
+            return Timestamp::from_second(secs).ok().map(|dt| dt.to_rfc3339());
         }
         // Already a datetime string — try RFC3339, else the OpenRCA format.
-        if chrono::DateTime::parse_from_rfc3339(s).is_ok() {
+        if s.parse::<Timestamp>().is_ok() {
             return Some(s.to_string());
         }
         return parse_openrca_datetime(s);
@@ -348,12 +350,13 @@ fn unix_or_string_to_rfc3339(v: &Value) -> Option<String> {
 /// Parse OpenRCA's `YYYY-MM-DD HH:MM:SS` (treated as UTC) into RFC3339.
 fn parse_openrca_datetime(s: &str) -> Option<String> {
     let s = s.trim();
-    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+    if let Ok(dt) = s.parse::<Timestamp>() {
         return Some(dt.to_rfc3339());
     }
-    chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
+    jiff::civil::DateTime::strptime("%Y-%m-%d %H:%M:%S", s)
+        .and_then(|time| jiff::tz::Offset::UTC.to_timestamp(time))
         .ok()
-        .map(|ndt| ndt.and_utc().to_rfc3339())
+        .map(|time| time.to_rfc3339())
 }
 
 #[cfg(test)]

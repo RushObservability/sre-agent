@@ -1425,29 +1425,29 @@ async fn run_inner(
             // agent has gathered sufficient multi-signal evidence, or until
             // the gate has rejected MAX_GATE_REJECTIONS times (at which point
             // we surface a Preliminary report rather than looping forever).
-            if gate_rejection_count < MAX_GATE_REJECTIONS {
-                if let Some(gap_msg) = root_cause_gate(&memory, &content, tool_steps, min_depth) {
-                    gate_rejection_count += 1;
-                    loop_metrics.correction(Correction::CausalGate);
-                    if force_final
-                        && memory.escalation_level < 3
-                        && attempts < hard_llm_calls
-                        && tool_calls_dispatched < hard_tool_calls
-                        && tool_steps < hard_tool_steps
-                    {
-                        finishing_overage = true;
-                        force_summary = false;
-                    }
-                    messages.push(serde_json::json!({
-                        "role": "assistant",
-                        "content": content.clone(),
-                    }));
-                    messages.push(serde_json::json!({
-                        "role": "system",
-                        "content": gap_msg,
-                    }));
-                    continue;
+            if gate_rejection_count < MAX_GATE_REJECTIONS
+                && let Some(gap_msg) = root_cause_gate(&memory, &content, tool_steps, min_depth)
+            {
+                gate_rejection_count += 1;
+                loop_metrics.correction(Correction::CausalGate);
+                if force_final
+                    && memory.escalation_level < 3
+                    && attempts < hard_llm_calls
+                    && tool_calls_dispatched < hard_tool_calls
+                    && tool_steps < hard_tool_steps
+                {
+                    finishing_overage = true;
+                    force_summary = false;
                 }
+                messages.push(serde_json::json!({
+                    "role": "assistant",
+                    "content": content.clone(),
+                }));
+                messages.push(serde_json::json!({
+                    "role": "system",
+                    "content": gap_msg,
+                }));
+                continue;
             }
 
             // Self-review pass: the first time a conclusion clears the gate
@@ -1784,11 +1784,11 @@ async fn run_inner(
                 }
                 if let Some(summary) = facts.summary {
                     memory.add_fact(format!("{}: {}", tc.name, summary.clone()));
-                    if facts.has_data {
-                        if let Some(sig_type) = tool_signal_type(&tc.name) {
-                            memory.record_signal(sig_type);
-                            let _ = memory.add_evidence_from_envelope(&tc.name, &provenance);
-                        }
+                    if facts.has_data
+                        && let Some(sig_type) = tool_signal_type(&tc.name)
+                    {
+                        memory.record_signal(sig_type);
+                        let _ = memory.add_evidence_from_envelope(&tc.name, &provenance);
                     }
                 }
                 if facts.empty_result {
@@ -2139,7 +2139,6 @@ async fn parse_streaming_response(
 mod tests {
     use super::*;
     use crate::agent::contracts::{InvestigationWindow, WindowSelectionReason};
-    use chrono::{TimeZone, Utc};
     use serde_json::json;
 
     #[tokio::test]
@@ -2353,10 +2352,10 @@ mod tests {
             "Found 12 error spans at 10:30".to_string(),
         );
         let window = InvestigationWindow::new(
-            Utc.with_ymd_and_hms(2026, 8, 1, 10, 0, 0).unwrap(),
-            Utc.with_ymd_and_hms(2026, 8, 1, 11, 0, 0).unwrap(),
-            Utc.with_ymd_and_hms(2026, 8, 1, 9, 0, 0).unwrap(),
-            Utc.with_ymd_and_hms(2026, 8, 1, 10, 0, 0).unwrap(),
+            "2026-08-01T10:00:00Z".parse().unwrap(),
+            "2026-08-01T11:00:00Z".parse().unwrap(),
+            "2026-08-01T09:00:00Z".parse().unwrap(),
+            "2026-08-01T10:00:00Z".parse().unwrap(),
             WindowSelectionReason::UserProvidedRange,
         )
         .unwrap();

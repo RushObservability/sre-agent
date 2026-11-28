@@ -13,7 +13,8 @@
 
 #![allow(dead_code)] // shared module — not every test file uses every helper
 
-use axum::{Router, extract::State, response::Response, routing::post};
+use axum::{Json, Router, extract::State, response::Response, routing::post};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -78,10 +79,22 @@ impl MockServer {
     }
 }
 
-async fn mock_completions(State(state): State<MockState>, body: String) -> Response {
-    // Record the request body for assertions (tolerate non-JSON defensively).
-    let parsed: Value = serde_json::from_str(&body).unwrap_or(Value::String(body));
-    state.requests.lock().unwrap().push(parsed);
+#[derive(Deserialize)]
+struct CompletionRequest {
+    messages: Vec<Value>,
+    #[serde(flatten)]
+    other: serde_json::Map<String, Value>,
+}
+
+async fn mock_completions(
+    State(state): State<MockState>,
+    Json(CompletionRequest {
+        messages,
+        mut other,
+    }): Json<CompletionRequest>,
+) -> Response {
+    other.insert("messages".into(), Value::Array(messages));
+    state.requests.lock().unwrap().push(Value::Object(other));
 
     let idx = {
         let mut c = state.call_count.lock().unwrap();

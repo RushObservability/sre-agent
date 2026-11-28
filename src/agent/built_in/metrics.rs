@@ -1,5 +1,7 @@
 use crate::agent::tools::{Tool, ToolContext};
+use crate::timestamps::TimestampFormat;
 use anyhow::Result;
+use jiff::Timestamp;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -269,8 +271,8 @@ impl Tool for QueryMetrics {
             return Ok("Provide either 'service' + 'metric' or 'metric_name'.".to_string());
         }
         let (from, to) = crate::query_api::bounded_time_range(around, around_minutes, minutes)?;
-        let from_dt = chrono::DateTime::parse_from_rfc3339(&from)?;
-        let to_dt = chrono::DateTime::parse_from_rfc3339(&to)?;
+        let from_dt = &from.parse::<Timestamp>()?;
+        let to_dt = &to.parse::<Timestamp>()?;
         let (rows, label) = if !metric_name.is_empty() {
             let response: PromResponse = ctx
                 .state
@@ -278,8 +280,8 @@ impl Tool for QueryMetrics {
                 .prom_query_range(
                     &ctx.tenant_id,
                     metric_name,
-                    from_dt.timestamp(),
-                    to_dt.timestamp(),
+                    from_dt.as_second(),
+                    to_dt.as_second(),
                     60,
                 )
                 .await?;
@@ -290,9 +292,9 @@ impl Tool for QueryMetrics {
                 .flat_map(|series| series.values)
                 .filter_map(|(timestamp, value)| {
                     value.parse::<f64>().ok().map(|value| MetricRow {
-                        bucket: chrono::DateTime::from_timestamp(timestamp as i64, 0)
+                        bucket: Timestamp::from_second(timestamp as i64)
                             .map(|time| time.to_rfc3339())
-                            .unwrap_or_else(|| timestamp.to_string()),
+                            .unwrap_or_else(|_| timestamp.to_string()),
                         value,
                     })
                 })

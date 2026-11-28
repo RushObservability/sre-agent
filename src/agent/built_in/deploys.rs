@@ -1,5 +1,6 @@
 use crate::agent::tools::{Tool, ToolContext};
 use anyhow::Result;
+use jiff::{SignedDuration, Timestamp};
 use serde_json::{Value, json};
 
 pub struct ListDeploys;
@@ -40,18 +41,18 @@ impl Tool for ListDeploys {
         let around = args.get("around").and_then(|v| v.as_str()).unwrap_or("");
 
         let end = if around.is_empty() {
-            chrono::Utc::now()
+            Timestamp::now()
         } else {
-            chrono::DateTime::parse_from_rfc3339(around)
-                .map(|dt| dt.with_timezone(&chrono::Utc))
-                .unwrap_or_else(|_| chrono::Utc::now())
+            around
+                .parse::<Timestamp>()
+                .unwrap_or_else(|_| Timestamp::now())
         };
-        let cutoff = end - chrono::Duration::hours(hours.min(24 * 30) as i64);
-        let from_str = cutoff.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let cutoff = end.checked_sub(SignedDuration::from_hours(hours.min(24 * 30) as i64))?;
+        let from_str = cutoff.strftime("%Y-%m-%dT%H:%M:%SZ").to_string();
         let until_str = if around.is_empty() {
             None
         } else {
-            Some(end.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+            Some(end.strftime("%Y-%m-%dT%H:%M:%SZ").to_string())
         };
 
         let svc_filter = if service.is_empty() {

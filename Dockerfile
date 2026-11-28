@@ -1,5 +1,5 @@
-# 1.88+ required: the agent uses `let`-chains (if let … && …), stabilized in Rust 1.88.
-FROM rust:1.100-slim AS builder
+# Match or exceed the Rust version in rust-toolchain.toml.
+FROM rust:1.100-slim@sha256:24516ae4487ab804e3db145c93f7240e58e225587ab9b7c62ea31a218727bf67 AS builder
 
 RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
 

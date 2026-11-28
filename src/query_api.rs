@@ -79,21 +79,25 @@ impl QueryApiClient {
         self
     }
 
+    pub fn notebook_access(&self) -> Option<&str> {
+        self.notebook_access.as_deref().filter(|s| !s.is_empty())
+    }
+
     fn notebook_request(
         &self,
         method: Method,
         tenant: &str,
         path: &str,
     ) -> Result<reqwest::RequestBuilder> {
-        let access = self.notebook_access.as_deref().filter(|s| !s.is_empty())
-            .ok_or_else(|| anyhow::anyhow!("Notebook access is unavailable. Start this investigation through an updated Rush query-api."))?;
-        Ok(self
-            .request(method, tenant, path)?
-            .header(
-                "user-agent",
-                concat!("rush-sre-agent/", env!("CARGO_PKG_VERSION")),
-            )
-            .header("x-rush-notebook-access", access))
+        if self.notebook_access().is_none() {
+            bail!(
+                "Notebook access is unavailable. Start this investigation through an updated Rush query-api."
+            );
+        }
+        Ok(self.request(method, tenant, path)?.header(
+            "user-agent",
+            concat!("rush-sre-agent/", env!("CARGO_PKG_VERSION")),
+        ))
     }
 
     pub async fn notebooks(&self, tenant: &str, id: Option<&str>) -> Result<Value> {
@@ -147,11 +151,16 @@ impl QueryApiClient {
         if url.origin() != self.base_url.origin() {
             bail!("query-api request URL escaped the configured origin");
         }
-        Ok(self
+        let request = self
             .http
             .request(method, url)
             .header("x-rush-internal-token", &self.internal_token)
-            .header("x-rush-tenant", tenant_id))
+            .header("x-rush-tenant", tenant_id);
+        // query-api binds the tenant and caller to this investigation access.
+        Ok(match self.notebook_access() {
+            Some(access) => request.header("x-rush-notebook-access", access),
+            None => request,
+        })
     }
 
     /// Attach the process registry. Cloned clients share both connection pools and metrics.

@@ -1,6 +1,7 @@
 use crate::agent::contracts::{
     EvidencePolarity, InvestigationWindow, ResultQuality, ResultStatus, ToolResultEnvelope,
 };
+use crate::timestamps::TimestampFormat;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
@@ -1604,21 +1605,20 @@ mod tests {
     #[test]
     fn follow_up_partitions_changed_scope_and_resets_transient_state() {
         use crate::agent::contracts::WindowSelectionReason;
-        use chrono::{TimeZone, Utc};
 
         let first_window = InvestigationWindow::new(
-            Utc.with_ymd_and_hms(2026, 8, 1, 10, 0, 0).unwrap(),
-            Utc.with_ymd_and_hms(2026, 8, 1, 11, 0, 0).unwrap(),
-            Utc.with_ymd_and_hms(2026, 8, 1, 9, 0, 0).unwrap(),
-            Utc.with_ymd_and_hms(2026, 8, 1, 10, 0, 0).unwrap(),
+            "2026-08-01T10:00:00Z".parse().unwrap(),
+            "2026-08-01T11:00:00Z".parse().unwrap(),
+            "2026-08-01T09:00:00Z".parse().unwrap(),
+            "2026-08-01T10:00:00Z".parse().unwrap(),
             WindowSelectionReason::UserProvidedRange,
         )
         .unwrap();
         let second_window = InvestigationWindow::new(
-            Utc.with_ymd_and_hms(2026, 8, 1, 12, 0, 0).unwrap(),
-            Utc.with_ymd_and_hms(2026, 8, 1, 13, 0, 0).unwrap(),
-            Utc.with_ymd_and_hms(2026, 8, 1, 11, 0, 0).unwrap(),
-            Utc.with_ymd_and_hms(2026, 8, 1, 12, 0, 0).unwrap(),
+            "2026-08-01T12:00:00Z".parse().unwrap(),
+            "2026-08-01T13:00:00Z".parse().unwrap(),
+            "2026-08-01T11:00:00Z".parse().unwrap(),
+            "2026-08-01T12:00:00Z".parse().unwrap(),
             WindowSelectionReason::UserProvidedRange,
         )
         .unwrap();

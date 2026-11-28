@@ -4,8 +4,9 @@ use crate::agent::contracts::{
     ToolResultEnvelope, WindowSelectionReason, serialize_tool_output,
 };
 use crate::agent::tools::{Tool, ToolContext};
+use crate::timestamps::TimestampFormat;
 use anyhow::Result;
-use chrono::{Duration, Utc};
+use jiff::{SignedDuration, Timestamp};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -134,8 +135,8 @@ fn time_window(args: &Value) -> Result<(String, Option<InvestigationWindow>, Str
         return Ok((
             format!(
                 "timestamp >= toDateTime64('{}', 9, 'UTC') AND timestamp < toDateTime64('{}', 9, 'UTC')",
-                window.incident_start.format("%Y-%m-%d %H:%M:%S%.f"),
-                window.incident_end.format("%Y-%m-%d %H:%M:%S%.f")
+                window.incident_start.strftime("%Y-%m-%d %H:%M:%S%.f"),
+                window.incident_end.strftime("%Y-%m-%d %H:%M:%S%.f")
             ),
             Some(window),
             "incident window".into(),
@@ -147,8 +148,8 @@ fn time_window(args: &Value) -> Result<(String, Option<InvestigationWindow>, Str
         .unwrap_or(30)
         .clamp(1, 1440);
     let window = InvestigationWindow::recent(
-        Utc::now(),
-        Duration::minutes(minutes as i64),
+        Timestamp::now(),
+        SignedDuration::from_mins(minutes as i64),
         WindowSelectionReason::Fallback,
     )
     .ok();
@@ -460,8 +461,8 @@ impl Tool for InspectMysql {
                     .prom_query_range(
                         &ctx.tenant_id,
                         name,
-                        effective_window.incident_start.timestamp(),
-                        effective_window.incident_end.timestamp(),
+                        effective_window.incident_start.as_second(),
+                        effective_window.incident_end.as_second(),
                         60,
                     )
                     .await?;
@@ -478,9 +479,9 @@ impl Tool for InspectMysql {
                     rows.push(MetricRow {
                         name: (*name).into(),
                         value,
-                        timestamp: chrono::DateTime::from_timestamp(timestamp as i64, 0)
+                        timestamp: Timestamp::from_second(timestamp as i64)
                             .map(|time| time.to_rfc3339())
-                            .unwrap_or_else(|| timestamp.to_string()),
+                            .unwrap_or_else(|_| timestamp.to_string()),
                     });
                 }
             }

@@ -23,6 +23,8 @@
 //! the crate's public APIs (loop_runner, prompt, built_in, tools, state) and
 //! never mutates the agent's prompts or behavior.
 
+use jiff::Timestamp;
+use sre_agent::timestamps::TimestampFormat;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -237,7 +239,7 @@ fn replay_command(args: &[String]) -> Result<()> {
         .unwrap_or_else(|| "evals/out".to_string());
     let raw = std::fs::read_to_string(&cases_path)
         .with_context(|| format!("reading replay cases file {cases_path}"))?;
-    let parsed: CasesFile = serde_yaml::from_str(&raw)
+    let parsed: CasesFile = serde_saphyr::from_str(&raw)
         .with_context(|| format!("parsing replay cases file {cases_path}"))?;
     if parsed.cases.is_empty() {
         anyhow::bail!("no replay cases found in {cases_path}");
@@ -245,7 +247,7 @@ fn replay_command(args: &[String]) -> Result<()> {
     let run_id = std::env::var("SRE_EVALS_RUN_ID")
         .ok()
         .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string());
+        .unwrap_or_else(|| Timestamp::now().strftime("%Y%m%dT%H%M%SZ").to_string());
     let scorer = Scorer::new(LlmConfig {
         base_url: "http://replay.invalid".into(),
         api_key: "replay".into(),
@@ -364,7 +366,7 @@ async fn run_command(args: &[String]) -> Result<()> {
     let raw = std::fs::read_to_string(&cases_path)
         .with_context(|| format!("reading cases file {cases_path}"))?;
     let parsed: CasesFile =
-        serde_yaml::from_str(&raw).with_context(|| format!("parsing YAML {cases_path}"))?;
+        serde_saphyr::from_str(&raw).with_context(|| format!("parsing YAML {cases_path}"))?;
     let mut cases = parsed.cases;
     if let Some(n) = limit {
         cases.truncate(n);
@@ -382,8 +384,8 @@ async fn run_command(args: &[String]) -> Result<()> {
     let run_id = std::env::var("SRE_EVALS_RUN_ID")
         .ok()
         .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string());
-    let started_at = chrono::Utc::now().to_rfc3339();
+        .unwrap_or_else(|| Timestamp::now().strftime("%Y%m%dT%H%M%SZ").to_string());
+    let started_at = Timestamp::now().to_rfc3339();
 
     let scorer = Scorer::new(llm.clone());
 
@@ -740,11 +742,11 @@ fn extract_section(report: &str, heading: &str) -> Option<String> {
     let mut start: Option<usize> = None;
     for (i, line) in lines.iter().enumerate() {
         let t = line.trim();
-        if let Some(rest) = t.strip_prefix("##") {
-            if rest.trim().to_lowercase().starts_with(&lower_heading) {
-                start = Some(i + 1);
-                break;
-            }
+        if let Some(rest) = t.strip_prefix("##")
+            && rest.trim().to_lowercase().starts_with(&lower_heading)
+        {
+            start = Some(i + 1);
+            break;
         }
     }
     let start = start?;

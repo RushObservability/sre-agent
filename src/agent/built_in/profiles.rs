@@ -5,8 +5,9 @@ use super::super::contracts::{
 };
 use crate::agent::tools::{Tool, ToolContext};
 use crate::query_api::{ProfileRead, QueryApiClient};
+use crate::timestamps::TimestampFormat;
 use anyhow::{Result, anyhow, ensure};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -23,10 +24,10 @@ struct Args {
     pod: Option<String>,
     #[serde(default = "auto")]
     profile_type: String,
-    incident_start: DateTime<Utc>,
-    incident_end: DateTime<Utc>,
-    baseline_start: DateTime<Utc>,
-    baseline_end: DateTime<Utc>,
+    incident_start: Timestamp,
+    incident_end: Timestamp,
+    baseline_start: Timestamp,
+    baseline_end: Timestamp,
 }
 
 fn auto() -> String {
@@ -224,11 +225,11 @@ impl Tool for InspectProfiles {
             .map_err(|_| anyhow!("invalid inspect_profiles arguments"))?;
         let window = require_window_from_args(&value).map_err(|e| anyhow!(e))?;
         ensure!(
-            window.incident_duration().num_milliseconds() > 0,
+            window.incident_duration().as_millis() > 0,
             "profile windows must span at least one millisecond"
         );
         ensure!(
-            window.incident_duration() <= chrono::Duration::days(31),
+            window.incident_duration() <= jiff::SignedDuration::from_hours(31 * 24),
             "profile windows cannot exceed 31 days"
         );
         for time in [
@@ -238,7 +239,7 @@ impl Tool for InspectProfiles {
             args.baseline_end,
         ] {
             ensure!(
-                (0..=i64::MAX / 1_000_000).contains(&time.timestamp_millis()),
+                (0..=i64::MAX / 1_000_000).contains(&time.as_millisecond()),
                 "profile bounds out of range"
             );
         }
@@ -296,7 +297,7 @@ impl Tool for InspectProfiles {
             Ok(ProfileRead::Data(p)) if p.total() > 0.0 => (Some(p), "available"),
             other => (None, gap(&other).0),
         };
-        let duration = window.incident_duration().num_milliseconds() as f64 / 1000.0;
+        let duration = window.incident_duration().as_millis() as f64 / 1000.0;
         result.status = if baseline.is_some() {
             ResultStatus::Ok
         } else {

@@ -187,12 +187,12 @@ impl Tool for NotebookTool {
                 "notebooks"
             };
             let rows = result.get_mut(field).and_then(Value::as_array_mut);
-            if let Some(rows) = rows {
-                if !rows.is_empty() {
-                    rows.truncate(rows.len() / 2);
-                    result["truncated"] = true.into();
-                    continue;
-                }
+            if let Some(rows) = rows
+                && !rows.is_empty()
+            {
+                rows.truncate(rows.len() / 2);
+                result["truncated"] = true.into();
+                continue;
             }
             break;
         }

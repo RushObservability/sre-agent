@@ -5,7 +5,7 @@
 //! strings so later causal tools can use the same windows and provenance
 //! without inventing their own formats.
 
-use chrono::{DateTime, Duration, Utc};
+use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
@@ -25,13 +25,13 @@ pub enum WindowSelectionReason {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InvestigationWindow {
     /// Inclusive incident start, always serialized as UTC.
-    pub incident_start: DateTime<Utc>,
+    pub incident_start: Timestamp,
     /// Exclusive incident end, always serialized as UTC.
-    pub incident_end: DateTime<Utc>,
+    pub incident_end: Timestamp,
     /// Inclusive baseline start, always serialized as UTC.
-    pub baseline_start: DateTime<Utc>,
+    pub baseline_start: Timestamp,
     /// Exclusive baseline end, always serialized as UTC.
-    pub baseline_end: DateTime<Utc>,
+    pub baseline_end: Timestamp,
     pub selection_reason: WindowSelectionReason,
     #[serde(default = "utc_timezone")]
     pub timezone: String,
@@ -51,19 +51,21 @@ pub enum WindowError {
     UnequalDurations,
     #[error("incident timestamp {timestamp} is in the future relative to {as_of}")]
     FutureTimestamp {
-        timestamp: DateTime<Utc>,
-        as_of: DateTime<Utc>,
+        timestamp: Timestamp,
+        as_of: Timestamp,
     },
     #[error("window timezone must be UTC")]
     NonUtcTimezone,
+    #[error("window is outside the supported timestamp range")]
+    TimestampOutOfRange,
 }
 
 impl InvestigationWindow {
     pub fn new(
-        incident_start: DateTime<Utc>,
-        incident_end: DateTime<Utc>,
-        baseline_start: DateTime<Utc>,
-        baseline_end: DateTime<Utc>,
+        incident_start: Timestamp,
+        incident_end: Timestamp,
+        baseline_start: Timestamp,
+        baseline_end: Timestamp,
         selection_reason: WindowSelectionReason,
     ) -> Result<Self, WindowError> {
         let window = Self {
@@ -82,12 +84,12 @@ impl InvestigationWindow {
         if self.timezone != UTC_TIMEZONE {
             return Err(WindowError::NonUtcTimezone);
         }
-        let incident_duration = self.incident_end - self.incident_start;
-        if incident_duration <= Duration::zero() {
+        let incident_duration = self.incident_end.duration_since(self.incident_start);
+        if incident_duration <= SignedDuration::ZERO {
             return Err(WindowError::EmptyIncident);
         }
-        let baseline_duration = self.baseline_end - self.baseline_start;
-        if baseline_duration <= Duration::zero() {
+        let baseline_duration = self.baseline_end.duration_since(self.baseline_start);
+        if baseline_duration <= SignedDuration::ZERO {
             return Err(WindowError::EmptyBaseline);
         }
         if incident_duration != baseline_duration {
@@ -100,22 +102,28 @@ impl InvestigationWindow {
     /// the immediately preceding equal-duration baseline. `as_of` is explicit
     /// so replayed investigations never depend on the wall clock.
     pub fn centered_on(
-        timestamp: DateTime<Utc>,
-        duration: Duration,
-        as_of: DateTime<Utc>,
+        timestamp: Timestamp,
+        duration: SignedDuration,
+        as_of: Timestamp,
         reason: WindowSelectionReason,
     ) -> Result<Self, WindowError> {
         if timestamp > as_of {
             return Err(WindowError::FutureTimestamp { timestamp, as_of });
         }
-        if duration <= Duration::zero() {
+        if duration <= SignedDuration::ZERO {
             return Err(WindowError::EmptyIncident);
         }
         let half = duration / 2;
-        let incident_start = timestamp - half;
-        let incident_end = incident_start + duration;
+        let incident_start = timestamp
+            .checked_sub(half)
+            .map_err(|_| WindowError::TimestampOutOfRange)?;
+        let incident_end = incident_start
+            .checked_add(duration)
+            .map_err(|_| WindowError::TimestampOutOfRange)?;
         let baseline_end = incident_start;
-        let baseline_start = baseline_end - duration;
+        let baseline_start = baseline_end
+            .checked_sub(duration)
+            .map_err(|_| WindowError::TimestampOutOfRange)?;
         Self::new(
             incident_start,
             incident_end,
@@ -126,17 +134,21 @@ impl InvestigationWindow {
     }
 
     pub fn recent(
-        now: DateTime<Utc>,
-        duration: Duration,
+        now: Timestamp,
+        duration: SignedDuration,
         reason: WindowSelectionReason,
     ) -> Result<Self, WindowError> {
-        if duration <= Duration::zero() {
+        if duration <= SignedDuration::ZERO {
             return Err(WindowError::EmptyIncident);
         }
         let incident_end = now;
-        let incident_start = incident_end - duration;
+        let incident_start = incident_end
+            .checked_sub(duration)
+            .map_err(|_| WindowError::TimestampOutOfRange)?;
         let baseline_end = incident_start;
-        let baseline_start = baseline_end - duration;
+        let baseline_start = baseline_end
+            .checked_sub(duration)
+            .map_err(|_| WindowError::TimestampOutOfRange)?;
         Self::new(
             incident_start,
             incident_end,
@@ -146,12 +158,12 @@ impl InvestigationWindow {
         )
     }
 
-    pub fn incident_duration(&self) -> Duration {
-        self.incident_end - self.incident_start
+    pub fn incident_duration(&self) -> SignedDuration {
+        self.incident_end.duration_since(self.incident_start)
     }
 
-    pub fn baseline_duration(&self) -> Duration {
-        self.baseline_end - self.baseline_start
+    pub fn baseline_duration(&self) -> SignedDuration {
+        self.baseline_end.duration_since(self.baseline_start)
     }
 }
 
@@ -303,19 +315,19 @@ impl ToolResultEnvelope {
         // bounded `data` field. Accept that shape here so the streaming layer
         // exposes the exact structured provenance rather than reconstructing
         // it as a legacy string result.
-        if result.trim_start().starts_with('{') {
-            if let Ok(mut structured) = serde_json::from_str::<Self>(result) {
-                if structured.window.is_none() {
-                    structured.window = try_window_from_args(args);
-                }
-                if structured.service.is_empty() {
-                    structured.service = service_from_args(args);
-                }
-                if structured.query_fingerprint.is_empty() {
-                    structured.query_fingerprint = fingerprint_args(args);
-                }
-                return structured;
+        if result.trim_start().starts_with('{')
+            && let Ok(mut structured) = serde_json::from_str::<Self>(result)
+        {
+            if structured.window.is_none() {
+                structured.window = try_window_from_args(args);
             }
+            if structured.service.is_empty() {
+                structured.service = service_from_args(args);
+            }
+            if structured.query_fingerprint.is_empty() {
+                structured.query_fingerprint = fingerprint_args(args);
+            }
+            return structured;
         }
         let lower = result.trim_start().to_ascii_lowercase();
         let status = if lower.starts_with("access denied") {
@@ -382,11 +394,8 @@ impl ToolResultEnvelope {
     }
 }
 
-fn utc_datetime(value: &serde_json::Value) -> Option<DateTime<Utc>> {
-    value
-        .as_str()
-        .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
-        .map(|dt| dt.with_timezone(&Utc))
+fn utc_datetime(value: &serde_json::Value) -> Option<Timestamp> {
+    value.as_str().and_then(|raw| raw.parse::<Timestamp>().ok())
 }
 
 fn try_window_from_args(args: &serde_json::Value) -> Option<InvestigationWindow> {
@@ -604,20 +613,17 @@ fn fingerprint_args(args: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
     use serde_json::json;
 
-    fn ts(hour: i64) -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 8, 1, hour as u32, 0, 0)
-            .single()
-            .unwrap()
+    fn ts(hour: i64) -> Timestamp {
+        format!("2026-08-01T{hour:02}:00:00Z").parse().unwrap()
     }
 
     #[test]
     fn centered_window_is_utc_and_has_equal_adjacent_baseline() {
         let window = InvestigationWindow::centered_on(
             ts(12),
-            Duration::hours(2),
+            SignedDuration::from_hours(2),
             ts(13),
             WindowSelectionReason::InferredOnset,
         )
@@ -633,12 +639,18 @@ mod tests {
     #[test]
     fn recent_window_is_deterministic_without_wall_clock() {
         let now = ts(12);
-        let first =
-            InvestigationWindow::recent(now, Duration::hours(1), WindowSelectionReason::Fallback)
-                .unwrap();
-        let second =
-            InvestigationWindow::recent(now, Duration::hours(1), WindowSelectionReason::Fallback)
-                .unwrap();
+        let first = InvestigationWindow::recent(
+            now,
+            SignedDuration::from_hours(1),
+            WindowSelectionReason::Fallback,
+        )
+        .unwrap();
+        let second = InvestigationWindow::recent(
+            now,
+            SignedDuration::from_hours(1),
+            WindowSelectionReason::Fallback,
+        )
+        .unwrap();
         assert_eq!(first, second);
     }
 
@@ -671,7 +683,7 @@ mod tests {
         assert!(matches!(
             InvestigationWindow::centered_on(
                 ts(14),
-                Duration::hours(1),
+                SignedDuration::from_hours(1),
                 ts(13),
                 WindowSelectionReason::AlertWindow
             ),
@@ -771,7 +783,7 @@ mod tests {
             vec!["logs".into()],
             InvestigationWindow::recent(
                 ts(12),
-                Duration::hours(1),
+                SignedDuration::from_hours(1),
                 WindowSelectionReason::Fallback,
             )
             .unwrap(),
@@ -788,7 +800,7 @@ mod tests {
             vec!["logs".into()],
             InvestigationWindow::recent(
                 ts(12),
-                Duration::hours(1),
+                SignedDuration::from_hours(1),
                 WindowSelectionReason::Fallback,
             )
             .unwrap(),
@@ -804,7 +816,7 @@ mod tests {
     fn structured_tool_output_round_trips_with_provenance() {
         let window = InvestigationWindow::recent(
             ts(12),
-            Duration::hours(1),
+            SignedDuration::from_hours(1),
             WindowSelectionReason::Fallback,
         )
         .unwrap();

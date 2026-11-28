@@ -1,0 +1,22 @@
+[package]
+name = "sre-agent-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+jiff = "0.2"
+libfuzzer-sys = "0.4"
+
+[[bin]]
+name = "timestamp_roundtrip"
+path = "fuzz_targets/timestamp_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

@@ -188,6 +188,58 @@ async fn investigate_without_tenant_llm_streams_not_configured_error() {
     server.abort();
 }
 
+/// query-api takes the tenant from the investigation access, so session and
+/// setup calls must carry it, not only notebook calls.
+#[tokio::test]
+async fn investigate_forwards_investigation_access_on_session_calls() {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<(String, Option<String>)>::new()));
+    let record = seen.clone();
+    let backend = axum::Router::new().fallback(move |req: axum::extract::Request| {
+        let record = record.clone();
+        async move {
+            let access = req
+                .headers()
+                .get("x-rush-notebook-access")
+                .map(|v| v.to_str().unwrap().to_string());
+            record
+                .lock()
+                .unwrap()
+                .push((req.uri().path().to_string(), access));
+            axum::Json(serde_json::json!({"count": 0, "data": null, "configured": false}))
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, backend).await.unwrap() });
+
+    let app = router_with_api(QueryApiClient::new(&url, INTERNAL_TOKEN.into()).unwrap());
+    let resp = app
+        .oneshot(
+            Request::post("/api/v1/investigate")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-rush-internal-token", INTERNAL_TOKEN)
+                .body(Body::from(
+                    serde_json::json!({"question": "why?", "notebook_access": "grant-1"})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    resp.into_body().collect().await.unwrap();
+
+    let seen = seen.lock().unwrap();
+    assert!(
+        seen.iter()
+            .any(|(path, _)| path.starts_with("/api/v1/internal/sre/sessions")),
+        "{seen:?}"
+    );
+    for (path, access) in seen.iter() {
+        assert_eq!(access.as_deref(), Some("grant-1"), "{path}");
+    }
+    server.abort();
+}
+
 #[tokio::test]
 async fn client_history_is_rejected_with_or_without_a_session() {
     for session_id in ["", "existing-session"] {

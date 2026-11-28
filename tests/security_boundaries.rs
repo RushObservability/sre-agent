@@ -81,6 +81,55 @@ async fn internal_clients_never_follow_redirects() {
 }
 
 #[tokio::test]
+async fn llm_chat_carries_the_investigation_access() {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<Option<String>>::new()));
+    let record = seen.clone();
+    let (url, server) = serve(Router::new().route(
+        "/api/v1/internal/sre/llm/chat",
+        axum::routing::post(move |headers: axum::http::HeaderMap| {
+            let record = record.clone();
+            async move {
+                record.lock().unwrap().push(
+                    headers
+                        .get("x-rush-notebook-access")
+                        .map(|v| v.to_str().unwrap().to_string()),
+                );
+                (
+                    [("content-type", "text/event-stream")],
+                    common::build_stream_body(&Script::Final("Done.".into())),
+                )
+            }
+        }),
+    ))
+    .await;
+    let mut ctx = make_ctx().await;
+    ctx.state.query_api = Arc::new(
+        QueryApiClient::new_disconnected_for_tests().with_notebook_access(Some("grant-1".into())),
+    );
+    let (tx, _rx) = mpsc::channel(256);
+    let _ = run_with_config(
+        initial_messages("Inspect"),
+        &make_registry(vec![]),
+        &ctx,
+        &tx,
+        LlmConfig {
+            base_url: format!("{url}/api/v1/internal/sre/llm"),
+            api_key: "dummy-internal-token".into(),
+            model: "test".into(),
+            reasoning_effort: None,
+        },
+    )
+    .await;
+    let seen = seen.lock().unwrap();
+    assert!(!seen.is_empty());
+    assert!(
+        seen.iter().all(|a| a.as_deref() == Some("grant-1")),
+        "{seen:?}"
+    );
+    server.abort();
+}
+
+#[tokio::test]
 async fn secrets_do_not_reach_provider_events_or_memory() {
     let mock = start_mock(vec![
         Script::ToolCall {

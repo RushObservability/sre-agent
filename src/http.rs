@@ -342,12 +342,20 @@ async fn investigate(
 }
 
 async fn investigate_admitted(
-    state: AppState,
-    req: InvestigateRequest,
+    mut state: AppState,
+    mut req: InvestigateRequest,
     permit: crate::state::InvestigationPermit,
     lifecycle: &mut Option<crate::metrics::lifecycle::InvestigationLifecycle>,
 ) -> Result<Response, (StatusCode, String)> {
     let stream_started = std::time::Instant::now();
+    // Every query-api call this turn, including sessions and LLM chat, carries the caller's access.
+    state.query_api = Arc::new(
+        state
+            .query_api
+            .as_ref()
+            .clone()
+            .with_notebook_access(req.notebook_access.take()),
+    );
     // Build the tenant's unified skill store, cached per tenant for 60s — skill edits show up on
     // the next investigation within a minute, without paying an HTTP fetch to
     // query-api (or a config_db scan) on every single request.
@@ -643,16 +651,8 @@ async fn investigate_admitted(
     let mut registry = ToolRegistry::new();
     agent::built_in::register_all(&mut registry);
 
-    let mut tool_state = state.clone();
-    tool_state.query_api = Arc::new(
-        state
-            .query_api
-            .as_ref()
-            .clone()
-            .with_notebook_access(req.notebook_access),
-    );
     let tool_ctx = ToolContext {
-        state: tool_state,
+        state: state.clone(),
         skill_store,
         tenant_id: req.tenant_id.clone(),
         scopes: req.scopes,

@@ -46,6 +46,7 @@ export OPENAI_API_KEY=sk-...       # required (agent + judge)
 export OPENAI_BASE_URL=https://... # optional, default https://api.openai.com
 export QUERY_API_URL=http://localhost:8080
 export SRE_AGENT_INTERNAL_TOKEN=dev-local-agent-token
+export SRE_EVALS_INVESTIGATION_ACCESS=...  # access query-api issued for an investigation; recent query-api requires it
 
 cargo run --bin sre_evals -- run --cases evals/cases.yaml --out evals/out
 cargo run --bin sre_evals -- run --limit 1            # smoke test a single case

@@ -1317,9 +1317,13 @@ async fn run_inner(
                     .header("Content-Type", "application/json")
                     .json(&body);
                     let request = if internal_transport {
-                        request
+                        let request = request
                             .header("x-rush-internal-token", &api_key)
-                            .header("x-rush-tenant", &ctx.tenant_id)
+                            .header("x-rush-tenant", &ctx.tenant_id);
+                        match ctx.state.query_api.notebook_access() {
+                            Some(access) => request.header("x-rush-notebook-access", access),
+                            None => request,
+                        }
                     } else {
                         request.bearer_auth(&api_key)
                     };

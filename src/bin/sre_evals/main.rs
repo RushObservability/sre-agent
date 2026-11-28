@@ -484,10 +484,11 @@ async fn build_app_state() -> Result<AppState> {
         std::env::var("QUERY_API_URL").unwrap_or_else(|_| "http://localhost:8080".into());
     let internal_auth_token = std::env::var("SRE_AGENT_INTERNAL_TOKEN")
         .unwrap_or_else(|_| "dev-local-agent-token".into());
-    let query_api = Arc::new(QueryApiClient::new(
-        &query_api_url,
-        internal_auth_token.clone(),
-    )?);
+    // Recent query-api only answers agent calls that carry an investigation access token.
+    let query_api = Arc::new(
+        QueryApiClient::new(&query_api_url, internal_auth_token.clone())?
+            .with_notebook_access(std::env::var("SRE_EVALS_INVESTIGATION_ACCESS").ok()),
+    );
 
     Ok(AppState {
         query_api,

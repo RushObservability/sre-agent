@@ -49,16 +49,14 @@ fn current_resident_memory(fallback: u64) -> u64 {
     #[cfg(target_os = "linux")]
     {
         let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-        if page_size > 0 {
-            if let Ok(statm) = std::fs::read_to_string("/proc/self/statm") {
-                if let Some(pages) = statm
-                    .split_whitespace()
-                    .nth(1)
-                    .and_then(|value| value.parse::<u64>().ok())
-                {
-                    return pages.saturating_mul(page_size as u64);
-                }
-            }
+        if page_size > 0
+            && let Ok(statm) = std::fs::read_to_string("/proc/self/statm")
+            && let Some(pages) = statm
+                .split_whitespace()
+                .nth(1)
+                .and_then(|value| value.parse::<u64>().ok())
+        {
+            return pages.saturating_mul(page_size as u64);
         }
     }
     fallback
